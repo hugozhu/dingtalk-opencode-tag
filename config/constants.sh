@@ -37,3 +37,12 @@ export VISION_MODEL="${VISION_MODEL:-gemini-3.1-flash-image}"
 export DWS_EVENT_KEY="${DWS_EVENT_KEY:-user_im_message_receive_group}"
 export DWS_EVENT_GROUP="${DWS_EVENT_GROUP:-}"   # 群 openConversationId（敏感，勿提交）
 export DWS_PROFILE="${DWS_PROFILE:-}"           # 组织 profile（敏感，勿提交）
+
+# --- 数字员工大脑 / 回复（src/custom/brain.py + replier.py）---
+# 大脑后端: echo(默认,零依赖) | opencode(本机 opencode run) | proxy(LLM API)
+export AGENT_BRAIN="${AGENT_BRAIN:-echo}"
+export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-free}"
+# 回复模式: log(默认,只记日志不真发) | bot(机器人 send-by-bot) | user(当前用户 send)
+export AGENT_REPLY_MODE="${AGENT_REPLY_MODE:-log}"
+# 防回环：数字员工自己的发送名（逗号分隔），过滤掉避免自问自答
+export AGENT_SELF_NAMES="${AGENT_SELF_NAMES:-数字员工,Claude Code}"

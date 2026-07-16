@@ -9,11 +9,12 @@
 不依赖网络/钉钉：proxy 后端和真实发送用 mock/默认 log 模式。
 """
 
+import json
 import os
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
@@ -41,6 +42,36 @@ class TestBrainEcho(unittest.TestCase):
             out = brain.generate_reply("u", "x" * 100)
             self.assertLessEqual(len(out), 10 + len("…（已截断）"))
             self.assertTrue(out.endswith("…（已截断）"))
+
+
+class TestBrainOpencode(unittest.TestCase):
+    """opencode 后端：mock subprocess，验证 JSON 事件解析（不依赖真实 opencode）。"""
+
+    def _events(self, *texts):
+        lines = [json.dumps({"type": "step_start", "part": {}})]
+        for t in texts:
+            lines.append(json.dumps({"type": "text", "part": {"text": t}}))
+        lines.append(json.dumps({"type": "step_finish", "part": {}}))
+        return "\n".join(lines)
+
+    def test_concatenates_text_events(self):
+        fake = MagicMock(returncode=0, stdout=self._events("苹果,", "香蕉,", "橙子"), stderr="")
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch("subprocess.run", return_value=fake):
+            self.assertEqual(brain.generate_reply("u", "列水果"), "苹果,香蕉,橙子")
+
+    def test_nonzero_rc_returns_empty(self):
+        fake = MagicMock(returncode=1, stdout="", stderr="boom")
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch("subprocess.run", return_value=fake):
+            self.assertEqual(brain.generate_reply("u", "hi"), "")
+
+    def test_ignores_non_text_events(self):
+        fake = MagicMock(returncode=0,
+                         stdout=self._events("答案") + "\nnot-json-line", stderr="")
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch("subprocess.run", return_value=fake):
+            self.assertEqual(brain.generate_reply("u", "q"), "答案")
 
 
 class TestReplierLogMode(unittest.TestCase):
