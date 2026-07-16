@@ -37,6 +37,10 @@ import urllib.request
 
 _CONFIG_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config")
+# 项目根（运行时状态文件 .serve.port/.serve.pwd 等所在目录）
+_PROJECT_ROOT = os.environ.get(
+    "PROJECT_DIR",
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 def _load_config_file():
@@ -195,7 +199,26 @@ def invalidate_serve_credentials():
 
 
 def _discover_serve_credentials():
-    """实际扫描进程表定位 serve（无缓存）。返回 (pid, port, password)。"""
+    """定位 serve 凭据。返回 (pid, port, password)。
+
+    单一真相源：优先读 .serve.port / .serve.pwd 文件（start_serve 写、healthcheck 读），
+    避免与进程表扫描出现两套真相导致漂移。文件缺失/不完整时回退到 ps 扫描，
+    并把扫描结果写回文件，让 healthcheck 与本模块看到一致的凭据。
+    """
+    # 1. 优先从状态文件读（与 healthcheck check_serve_http 同源）
+    port = _read_state_file(".serve.port")
+    pwd = _read_state_file(".serve.pwd")
+    if port and pwd:
+        try:
+            pid = int(_read_state_file(".serve.pid") or 0) or None
+        except ValueError:
+            pid = None
+        try:
+            return pid, int(port), pwd
+        except ValueError:
+            pass  # port 文件损坏，回退扫描
+
+    # 2. 回退：进程表扫描
     try:
         result = subprocess.run(
             ["ps", "-ax", "-o", "pid,args"],
@@ -213,10 +236,35 @@ def _discover_serve_credentials():
                 pm = re.search(r"AGENT_SERVER_PASSWORD=(\S+)", pr.stdout)
                 pwd = pm.group(1) if pm else None
                 if pwd:
+                    # 写回状态文件，保持与 healthcheck 同源
+                    _write_state_file(".serve.pid", str(pid))
+                    _write_state_file(".serve.port", str(port))
+                    _write_state_file(".serve.pwd", pwd)
                     return int(pid), port, pwd
     except Exception as e:
         log(f"find serve err: {e}")
     return None, None, None
+
+
+def _read_state_file(basename):
+    """读 PROJECT_ROOT 下的运行时状态文件，返回 strip 后内容或 None。"""
+    path = os.path.join(_PROJECT_ROOT, basename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            return v or None
+    except Exception:
+        return None
+
+
+def _write_state_file(basename, value):
+    """写运行时状态文件（best-effort，失败仅记日志）。"""
+    path = os.path.join(_PROJECT_ROOT, basename)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(value)
+    except Exception as e:
+        log(f"write state {basename} err: {e}")
 
 
 def _find_bot_session():
