@@ -35,6 +35,13 @@ def send_reply(conv_id, conv_type, text, *, at_user_id=None):
         log(f"reply skip: 无 conv_id (mode={_REPLY_MODE})")
         return False
 
+    # fail-fast：真发模式下 PROFILE 仍是占位值 → dws 会报"未登录"，提前给出可操作提示
+    if _REPLY_MODE in ("bot", "user") and (not PROFILE or PROFILE == "your-profile"):
+        log("reply skip: AGENT_PROFILE 未配置（仍为占位 'your-profile'）。"
+            "请在 config/constants.local.sh 设 AGENT_PROFILE=<真实 profile>，"
+            "否则 dws 报未登录。见 constants.sh 顶部坑#2。")
+        return False
+
     if _REPLY_MODE == "bot":
         return _reply_bot(conv_id, text, at_user_id)
     if _REPLY_MODE == "user":

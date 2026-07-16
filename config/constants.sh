@@ -3,10 +3,19 @@
 #
 # 用户在这里覆盖所有可配置常量，被 bin/core/*.sh 引用
 # 复制本文件为 constants.local.sh（被 .gitignore 忽略）填入真实值
+#
+# ⚠️ 两个部署必踩坑（后台/launchd/systemd 托管时；前台交互式 shell 不明显）：
+#   1. PATH：托管进程的 PATH 极简，找不到 dws(~/.local/bin)、opencode(~/.opencode/bin)。
+#      必须在 constants.local.sh 里把这两个目录加进 PATH（见文件末尾 PATH 行）。
+#      症状：replier 报 "No such file or directory: 'dws'"。
+#   2. AGENT_PROFILE：回复/CLI 路径读 agent_common.PROFILE（来自 AGENT_PROFILE），
+#      **必须**与 DWS_PROFILE 填成同一个真实 profile。留占位 'your-profile' 会导致
+#      dws 用不存在的 profile → "未登录，请先执行 dws auth login"。
 
 # --- 数字员工身份 ---
 export AGENT_ROBOT_CODE="${AGENT_ROBOT_CODE:-your-robot-code}"
 export AGENT_USER_ID="${AGENT_USER_ID:-your-user-id}"
+# ⚠️ AGENT_PROFILE 必须 = DWS_PROFILE（真实 profile），否则回复报未登录。见文件顶部坑#2。
 export AGENT_PROFILE="${AGENT_PROFILE:-your-profile}"
 
 # --- 路径 ---
@@ -44,5 +53,10 @@ export AGENT_BRAIN="${AGENT_BRAIN:-echo}"
 export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-free}"
 # 回复模式: log(默认,只记日志不真发) | bot(机器人 send-by-bot) | user(当前用户 send)
 export AGENT_REPLY_MODE="${AGENT_REPLY_MODE:-log}"
-# 防回环：数字员工自己的发送名（逗号分隔），过滤掉避免自问自答
+# 防回环：数字员工自己的发送名（逗号分隔），过滤掉避免自问自答。
+# ⚠️ user 模式：回复以你本人身份发出，必须把你的真实显示名加进来（如 hugozhu）。
 export AGENT_SELF_NAMES="${AGENT_SELF_NAMES:-数字员工,Claude Code}"
+
+# --- PATH（部署坑#1）---
+# 托管进程 PATH 极简，子进程调 dws/opencode 会找不到。取消注释并按实际路径填：
+# export PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin"

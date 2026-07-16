@@ -91,6 +91,15 @@ class TestReplierLogMode(unittest.TestCase):
     def test_bot_mode_skips_without_robot_code(self):
         with patch.object(replier, "_REPLY_MODE", "bot"), \
              patch.object(replier, "ROBOT_CODE", "your-robot-code"), \
+             patch.object(replier, "PROFILE", "real-profile"), \
+             patch("subprocess.run") as mock_run:
+            self.assertFalse(replier.send_reply("cid", 2, "hi"))
+            mock_run.assert_not_called()
+
+    def test_user_mode_failfast_on_placeholder_profile(self):
+        # 真发模式下 PROFILE 仍是占位值 → 提前跳过，不调 dws
+        with patch.object(replier, "_REPLY_MODE", "user"), \
+             patch.object(replier, "PROFILE", "your-profile"), \
              patch("subprocess.run") as mock_run:
             self.assertFalse(replier.send_reply("cid", 2, "hi"))
             mock_run.assert_not_called()
