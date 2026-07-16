@@ -346,6 +346,8 @@ def render_prompt(body, senders, attachments, sender):
     messages = body.get("messages") or []
     if not messages:
         return None
+    # 拷贝，避免就地改调用方传入的 list（保持纯函数语义）
+    senders = list(senders)
     while len(senders) < len(messages):
         senders.append("未知发送人")
 
