@@ -20,11 +20,10 @@
    - 匹配后 spawn 业务 handler daemon thread
 
 3. 状态机 cleanup（处理 spurious 多余轮次）：
-   - awaiting_spurious → cleaning
+   - core 只做 TTL 过期兜底（CLEANUP_TTL=40s）+ 提供 route_cleanup_state hook
+   - 具体 awaiting_spurious → cleaning 状态机由 custom.routes 实现（业务特定）
    - DELETE + abort 多余 user/assistant 消息
    - 多选/连发场景下累积删除 expected_count 条
-   - TTL 兜底防僵死（CLEANUP_TTL=40s）
-   - idle 时不立即 pop，比较 deleted_user vs expected_count
 
 4. 撤回空回复尝试（监听 "agent 已生成回复" + "普通消息已发送"）：
    - 检测到空 finalizer（"本地 agent 无文本输出"）→ 主动 list + recall
@@ -67,7 +66,12 @@ from core.agent_common import (
     log,
     send_notification,
 )
-from custom.routes import route_reply, route_business_line, route_sse_event
+from custom.routes import (
+    route_reply,
+    route_business_line,
+    route_sse_event,
+    route_cleanup_state,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -177,14 +181,18 @@ def format_and_forward(event, port=None, password=None):
     full_sid = props.get("sessionID", "") or ""
     sid = full_sid[:12]
 
-    # ---- 状态机 cleanup 处理（与 question/forward 多余轮次清理共用）----
+    # ---- 状态机 cleanup 处理（spurious 多余轮次清理）----
+    # core 只做 TTL 过期兜底 + 提供 hook；具体 awaiting_spurious → cleaning 状态机
+    # 由 custom.routes.route_cleanup_state 实现（业务特定，FDE 在 custom 层写）。
     with cleanup_lock:
         cs = cleanup_state.get(sid)
         if cs and time.time() > cs.get("expires", 0):
             cleanup_state.pop(sid, None)
             log(f"cleanup 过期清理 sid={sid}")
             cs = None
-    # 用户实现 cleanup 处理逻辑（参考 dingtalk-opencode-agent/event-watcher.py 的 cleanup_state 状态机）
+    # 下放给 custom：返回 True 表示 custom 已消费该事件（core 不再默认转发）
+    if route_cleanup_state(event, cleanup_state, cleanup_lock):
+        return True
 
     # ---- 收到新请求：session 变 busy 时第一时间通知 ----
     if etype == "session.status" and sid:
