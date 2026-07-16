@@ -388,6 +388,9 @@ def connect_sse():
                     log(f"format_and_forward err: {e}")
         except Exception as e:
             log(f"SSE 连接失败: {e}，{interval}s 后重试")
+            # 连接失败可能是 serve 重启换了端口/密码，清缓存下次重新发现
+            from core.agent_common import invalidate_serve_credentials
+            invalidate_serve_credentials()
             time.sleep(interval)
             interval = min(interval * 2, MAX_RECONNECT_INTERVAL)
 

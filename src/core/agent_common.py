@@ -23,6 +23,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -90,6 +91,11 @@ _BOT_DIR_SUBSTR = _cfg("AGENT_BOT_DIR_SUBSTR", "paths", "agent_workdir_basename"
 # 注入模板轮询参数（测试 patch 为 0）
 _INJECT_POLL_MAX_SECONDS = 60
 _INJECT_POLL_INTERVAL = 5
+
+# serve 凭据发现缓存（避免每次访问都全表 ps 扫描）
+_CREDS_CACHE_TTL = float(os.environ.get("AGENT_CREDS_CACHE_TTL", "10"))
+_creds_cache = {}
+_creds_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +168,34 @@ def find_serve_credentials():
     """从进程表定位 opencode serve 进程，返回 (pid, port, password) 或 (None, None, None)。
 
     通用思路: ps -ax 找 "<serve-cmd>" 进程 → 提取 --port + OPENCODE_SERVER_PASSWORD 环境变量
+
+    带短 TTL 缓存（_CREDS_CACHE_TTL 秒）：agent_common 里 8 个函数各自调用本函数，
+    一次 inject_and_forward 会触发 ≥3 次全表 ps。缓存命中时跳过 subprocess，
+    大幅降低进程表扫描频率。缓存的是成功结果；失败不缓存（下次立即重试）。
     """
+    now = time.time()
+    with _creds_lock:
+        cached = _creds_cache.get("value")
+        if cached and (now - _creds_cache.get("ts", 0)) < _CREDS_CACHE_TTL:
+            return cached
+
+    creds = _discover_serve_credentials()
+    if creds[1]:  # 只缓存成功结果（port 非空）
+        with _creds_lock:
+            _creds_cache["value"] = creds
+            _creds_cache["ts"] = now
+    return creds
+
+
+def invalidate_serve_credentials():
+    """清除凭据缓存（端口/密码变更、连接失败重连前调用）。"""
+    with _creds_lock:
+        _creds_cache.pop("value", None)
+        _creds_cache.pop("ts", None)
+
+
+def _discover_serve_credentials():
+    """实际扫描进程表定位 serve（无缓存）。返回 (pid, port, password)。"""
     try:
         result = subprocess.run(
             ["ps", "-ax", "-o", "pid,args"],
