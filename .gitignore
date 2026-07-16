@@ -227,3 +227,9 @@ config/constants.local.sh
 agent-connect.log
 monitor.log
 start-digital-employee.sh
+
+# 运行时状态文件（含 serve 明文密码 .serve.pwd —— 绝不提交）
+.serve.pwd
+.serve.port
+.next-check
+.opencode-connect-status.json

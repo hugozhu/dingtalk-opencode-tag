@@ -183,7 +183,7 @@ main() {
         log "已有 monitor 实例在跑（PID=$(cat "$LOCK_FILE")），退出"
         exit 0
     fi
-    log "监控开始 (pid=$$, interval=${CHECK_INTERVAL}s, 由 launchd 托管)"
+    log "监控开始 (pid=$$, interval=${CHECK_INTERVAL}s, 由 supervisor 托管)"
     cleanup_stale_state
     trap cleanup SIGTERM SIGINT
 
@@ -191,7 +191,7 @@ main() {
     sleep 3
     warmup
     bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
-    date -v+${CHECK_INTERVAL}S '+%s' > "$SCRIPT_DIR/.next-check"
+    future_epoch "$CHECK_INTERVAL" > "$SCRIPT_DIR/.next-check"
 
     case "${1:---foreground}" in
         --foreground) run_forever ;;

@@ -88,6 +88,33 @@ else
 fi
 assert_eq "reboot.sh LAUNCHD_LABEL 存在" "1" "$([ -n "$LAUNCHD_VAL" ] && echo 1 || echo 0)"
 
+# reboot.sh 跨平台 supervisor 重启：SYSTEMD_UNIT 默认 + harness_os 分派
+SYSTEMD_LINE=$(grep 'SYSTEMD_UNIT' "$SCRIPT_DIR/bin/core/reboot.sh" | grep '=' | head -1)
+if [[ "$SYSTEMD_LINE" =~ SYSTEMD_UNIT:=[[:space:]]*\"?([a-zA-Z0-9._-]+) ]]; then
+    SYSTEMD_VAL="${BASH_REMATCH[1]}"
+else
+    SYSTEMD_VAL=""
+fi
+assert_eq "reboot.sh SYSTEMD_UNIT 默认存在" "1" "$([ -n "$SYSTEMD_VAL" ] && echo 1 || echo 0)"
+
+# harness_os 在本机（Linux CI/容器）应返回 linux；macOS 返回 macos
+HARNESS_OS_LINUX=$(bash -c 'OSTYPE="linux-gnu"; source "'"$SCRIPT_DIR"'/bin/core/lib.sh"; harness_os')
+assert_eq "harness_os linux-gnu => linux" "linux" "$HARNESS_OS_LINUX"
+HARNESS_OS_MAC=$(bash -c 'OSTYPE="darwin23"; source "'"$SCRIPT_DIR"'/bin/core/lib.sh"; harness_os')
+assert_eq "harness_os darwin => macos" "macos" "$HARNESS_OS_MAC"
+
+# SUPERVISOR_RESTART_CMD 覆盖：非空时 restart_supervisor 原样执行（不碰 launchctl/systemctl）
+OVERRIDE_OUT=$(SUPERVISOR_RESTART_CMD='echo OVERRIDE_RAN' bash -c '
+    source "'"$SCRIPT_DIR"'/bin/core/lib.sh"
+    : "${SUPERVISOR_RESTART_CMD:=}"; : "${LAUNCHD_LABEL:=x}"; : "${SYSTEMD_UNIT:=y}"
+    restart_supervisor() {
+        if [[ -n "$SUPERVISOR_RESTART_CMD" ]]; then eval "$SUPERVISOR_RESTART_CMD"
+        elif [[ "$(harness_os)" == macos ]]; then launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"
+        else systemctl --user restart "$SYSTEMD_UNIT"; fi
+    }
+    restart_supervisor')
+assert_eq "SUPERVISOR_RESTART_CMD 覆盖生效" "OVERRIDE_RAN" "$OVERRIDE_OUT"
+
 # 测试 README 不硬编码版本号（应指向 VERSION，避免漂移）
 echo ""
 echo "Testing version consistency..."

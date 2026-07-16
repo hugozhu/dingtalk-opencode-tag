@@ -5,11 +5,16 @@
 # 原作者: hugozhu
 #
 # 用途: 用户通过聊天发 /reboot 指令时，主进程派生本脚本（脱离进程组）+ os._exit(0)，
-# 本脚本 1s 后 pkill 四组件 + 清状态 + launchctl kickstart 重启 launchd agent。
+# 本脚本 1s 后 pkill 四组件 + 清状态 + 重启 supervisor（macOS=launchctl / Linux=systemctl）。
+#
+# 跨平台 (supervisor 重启按 harness_os 分派):
+#   - macOS: launchctl kickstart -k gui/$(id -u)/$LAUNCHD_LABEL
+#   - Linux: systemctl --user restart $SYSTEMD_UNIT
+#   - 覆盖: $SUPERVISOR_RESTART_CMD 非空则原样执行（容器 restart / 自托管等场景）
 #
 # 失败传播 (v4.1):
-#   - launchctl kickstart 失败 → 退避 KICKSTART_RETRY_INTERVAL 重试一次
-#   - 仍失败 → notify_alert 发告警 + exit 1（非零让 launchd 拉起，双保险）
+#   - supervisor 重启失败 → 退避 KICKSTART_RETRY_INTERVAL 重试一次
+#   - 仍失败 → notify_alert 发告警 + exit 1（非零让 supervisor 拉起，双保险）
 #   - 旧实现仅记 rc、脚本仍 exit 0，组件全死时无人知晓
 
 set -euo pipefail
@@ -21,6 +26,32 @@ COMPONENT_NAME="reboot"
 
 : "${KICKSTART_RETRY_INTERVAL:=10}"
 : "${LAUNCHD_LABEL:=com.example.agent-connect}"
+: "${SYSTEMD_UNIT:=agent-connect.service}"
+: "${SUPERVISOR_RESTART_CMD:=}"   # 非空则原样执行，覆盖平台默认（容器/自托管场景）
+
+# restart_supervisor: 按平台重启 supervisor，返回其退出码
+#   SUPERVISOR_RESTART_CMD 非空 → 原样 eval（容器 restart / 自托管等）
+#   macOS → launchctl kickstart；Linux → systemctl --user restart
+restart_supervisor() {
+    if [[ -n "$SUPERVISOR_RESTART_CMD" ]]; then
+        eval "$SUPERVISOR_RESTART_CMD"
+    elif [[ "$(harness_os)" == macos ]]; then
+        launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"
+    else
+        systemctl --user restart "$SYSTEMD_UNIT"
+    fi
+}
+
+# supervisor_hint: 告警里给出的人工重启命令（跟随 restart_supervisor 的分派）
+supervisor_hint() {
+    if [[ -n "$SUPERVISOR_RESTART_CMD" ]]; then
+        echo "$SUPERVISOR_RESTART_CMD"
+    elif [[ "$(harness_os)" == macos ]]; then
+        echo "launchctl kickstart -k gui/$(id -u)/$LAUNCHD_LABEL"
+    else
+        echo "systemctl --user restart $SYSTEMD_UNIT"
+    fi
+}
 
 notify_alert() {
     local msg="$1"
@@ -47,19 +78,19 @@ done
 
 sleep 2
 
-# launchctl kickstart 重启 launchd agent（带退避重试）
-log "launchctl kickstart 重启 launchd agent ($LAUNCHD_LABEL)..."
-if launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" 2>&1; then
-    log "kickstart 成功，主进程会重新拉起全部组件"
+# 重启 supervisor（带退避重试）
+log "重启 supervisor ($(supervisor_hint))..."
+if restart_supervisor 2>&1; then
+    log "重启成功，主进程会重新拉起全部组件"
     exit 0
 fi
 
-log "kickstart 第一次失败，${KICKSTART_RETRY_INTERVAL}s 后重试..."
+log "重启第一次失败，${KICKSTART_RETRY_INTERVAL}s 后重试..."
 sleep "$KICKSTART_RETRY_INTERVAL"
-if launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" 2>&1; then
-    log "kickstart 第二次成功"
+if restart_supervisor 2>&1; then
+    log "重启第二次成功"
     exit 0
 fi
 
-notify_alert "⚠️ launchctl kickstart 重启失败两次，请人工介入：launchctl kickstart -k gui/$(id -u)/$LAUNCHD_LABEL"
-exit 1  # 非零让 launchd 拉起（双保险）
+notify_alert "⚠️ supervisor 重启失败两次，请人工介入：$(supervisor_hint)"
+exit 1  # 非零让 supervisor 拉起（双保险）

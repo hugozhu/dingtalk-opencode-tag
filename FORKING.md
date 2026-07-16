@@ -81,13 +81,27 @@ def route_business_line(line):
 
 如果通知后端的 bug 在 core 的 `send_notification` 里（如 dws CLI 调用参数错误），请走 PR 贡献回 upstream。
 
-### Step 6: 装 launchd agent
+### Step 6: 装守护 agent
+
+macOS（launchd）:
 
 ```bash
 cp bin/custom/agent-template.plist ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
 # 编辑 plist：Label / ProgramArguments / StandardOutPath / PATH
 launchctl load -w ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
 ```
+
+Linux（systemd --user，如 Raspberry Pi）:
+
+```bash
+cp bin/custom/agent-template.service ~/.config/systemd/user/agent-connect.service
+# 编辑 service：ExecStart 路径 / PATH / 环境变量
+loginctl enable-linger "$USER"          # headless 无登录也开机自启（关键）
+systemctl --user daemon-reload
+systemctl --user enable --now agent-connect.service
+```
+
+`reboot.sh` 按 `harness_os` 自动选择重启方式（macOS=launchctl / Linux=`systemctl --user restart $SYSTEMD_UNIT`）。要用 system 级 unit 或容器 restart，把 `SUPERVISOR_RESTART_CMD` 设成对应命令即可（见 `config/constants.sh`）。
 
 ### Step 7: 跑测试
 
@@ -131,5 +145,5 @@ templates 保持纯净，是 FDE diff 的稳定基线。
   用户，请改用 unix socket + 文件权限（`chmod 600 .serve.pwd`）或短期令牌。同理 `PROXY_KEY`
   默认 `sk-1234` 只是占位，务必在 `config.local.json` 换成真实密钥且勿提交。
 - **空回复撤回**：依赖服务触发 abort 后返回空 finalizer 被发到通知渠道时，event-watcher 无法用机器人身份撤回（钉钉 API "仅消息发送者可撤回" + 缺 processQueryKey）。需要依赖服务端配合过滤空回复。
-- **macOS 限定**：launchd 托管是 macOS 特性。Linux 用 systemd、Windows 用服务/任务计划器，需自己适配 `bin/core/monitor.sh`。
+- **跨平台守护（macOS + Linux）**：launchd（macOS）与 systemd user unit（Linux）均支持，`bin/core/*.sh` 已按 `harness_os` 分派平台差异。Windows 仍需自己适配 `bin/core/monitor.sh`。
 - **依赖 dws CLI**：`send_notification` / `_run_cli` 默认用 dws。其他平台在 custom 层覆盖。

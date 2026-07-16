@@ -1,0 +1,60 @@
+# agent-template.service — systemd (Linux) user service 模板
+#
+# launchd (macOS) plist 的 Linux 对应物，见同目录 agent-template.plist。
+# 供 fork 到 Linux（如 Raspberry Pi）时使用；reboot.sh 在 Linux 上通过
+# `systemctl --user restart $SYSTEMD_UNIT` 触发本 unit 重启。
+#
+# 字段映射 (plist → systemd):
+#   KeepAlive{SuccessfulExit:false} → Restart=on-failure
+#       （exit 0 不拉起=等人工；崩溃/被杀=非零退出码触发拉起。与 monitor.sh 熔断
+#         exit 0 / cleanup exit 1 的约定一致）
+#   RunAtLoad=true                  → [Install] WantedBy=default.target（enable 后开机自启）
+#   ThrottleInterval=10             → RestartSec=10（防崩溃循环）
+#   StandardOutPath/ErrorPath       → StandardOutput/Error=append:<file>
+#   EnvironmentVariables.PATH       → Environment=PATH=...
+#
+# 安装 (user service，对应 launchd gui/$(id -u)):
+#   mkdir -p ~/.config/systemd/user
+#   cp agent-template.service ~/.config/systemd/user/agent-connect.service
+#   # 编辑下面的路径 / PATH / 环境变量
+#   loginctl enable-linger "$USER"          # 关键：无需登录也能开机自启（headless）
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agent-connect.service
+#
+# 卸载:
+#   systemctl --user disable --now agent-connect.service
+#
+# 手动重启（reboot.sh 用的就是这条；SYSTEMD_UNIT 默认 agent-connect.service）:
+#   systemctl --user restart agent-connect.service
+#
+# 查看日志:
+#   journalctl --user -u agent-connect.service -f   # 若未设 StandardOutput，走 journald
+#
+# 注：若要 system 级（root，无需 enable-linger、开机即启），把本文件放到
+#   /etc/systemd/system/，加 User=<youruser>，用 `sudo systemctl ...`，并把
+#   reboot.sh 的 SUPERVISOR_RESTART_CMD 设为 "sudo systemctl restart agent-connect"。
+
+[Unit]
+Description=DingTalk digital-employee monitor (opencode connect)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# monitor.sh --foreground：守护循环，对应 plist 的 ProgramArguments
+ExecStart=/bin/bash /path/to/your/project/bin/core/monitor.sh --foreground
+
+# exit 0 = 熔断/正常退出，不再拉起（等人工）；非零 = 崩溃/被杀，拉起
+Restart=on-failure
+RestartSec=10
+
+# 托管进程 PATH 极简，子进程调 dws/opencode 会找不到（部署坑#1，见 config/constants.sh）
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:%h/.local/bin:%h/.opencode/bin
+Environment=AGENT_TIMEOUT_MS=1800000
+
+# 日志落盘（与 monitor.log 一致）；不设则进 journald，用 journalctl --user 查看
+StandardOutput=append:/path/to/your/project/monitor.log
+StandardError=append:/path/to/your/project/monitor.log
+
+[Install]
+WantedBy=default.target

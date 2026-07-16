@@ -27,7 +27,10 @@ export CHECK_INTERVAL="${CHECK_INTERVAL:-1800}"          # 健康检查间隔（
 export MAX_FAILURES="${MAX_FAILURES:-3}"                  # 连续失败熔断阈值
 export WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-60}"             # warmup 超时
 export KICKSTART_RETRY_INTERVAL="${KICKSTART_RETRY_INTERVAL:-10}"
-export LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.example.agent-connect}"
+export LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.example.agent-connect}"   # macOS: launchctl kickstart 目标
+export SYSTEMD_UNIT="${SYSTEMD_UNIT:-agent-connect.service}"         # Linux: systemctl --user restart 目标
+# 覆盖平台默认的 supervisor 重启命令（容器 restart / 自托管等），非空则 reboot.sh 原样执行：
+# export SUPERVISOR_RESTART_CMD="docker restart agent-connect"
 
 # --- 健康检查 ---
 export LOG_INACTIVITY_THRESHOLD="${LOG_INACTIVITY_THRESHOLD:-2100}"   # 35 分钟

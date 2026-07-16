@@ -48,7 +48,34 @@ fi
 # 不把敏感 group/profile 打进日志（只记事件类型）
 echo "[connect] dws-connect 启动: event=$DWS_EVENT_KEY" >> "$CONNECT_LOG"
 
+# 递归杀掉子孙进程（管道两端 dws/bridge 及其后代）。用 pgrep -P 遍历而非进程组 kill，
+# 因为两种启动方式进程组不同：launcher 用 setsid（本脚本是组长），monitor 用 nohup
+# （本脚本与 monitor 同组，杀组会误伤 monitor）。深度优先：先杀后代再杀该子进程，
+# 避免子进程先死、后代 reparent 到 init 后 pgrep -P 找不到。
+_kill_tree() {
+    local sig="$1" parent="$2" child
+    for child in $(pgrep -P "$parent" 2>/dev/null); do
+        _kill_tree "$sig" "$child"
+        kill "-$sig" "$child" 2>/dev/null || true
+    done
+}
+
+# 收到 TERM/INT（pkill / systemd stop / launchctl / reboot.sh）→ 连带清理子进程再退出，
+# 否则 dws event consume 会被留成孤儿继续消费群消息。
+cleanup() {
+    trap - TERM INT
+    echo "[connect] 收到停止信号，清理 dws/bridge 子进程…" >> "$CONNECT_LOG"
+    _kill_tree TERM $$
+    sleep 1
+    _kill_tree KILL $$   # 顽固者补刀
+    exit 0
+}
+trap cleanup TERM INT
+
 # dws event consume 的 stderr（[event] ready / 状态）汇入 CONNECT_LOG 便于健康检查看活跃度
 # bridge 的 stdout（connect-log 行）追加到 CONNECT_LOG，stderr（诊断）也进同一文件
-exec dws "${consume_args[@]}" 2>>"$CONNECT_LOG" \
-    | python3 "$BRIDGE" >> "$CONNECT_LOG" 2>>"$CONNECT_LOG"
+# 后台跑 + wait：前台管道会阻塞信号处理，只有 wait 被信号打断才能立即触发 cleanup。
+# （不能用 exec：exec 替换本 shell 后 trap 失效，子进程照旧成孤儿。）
+dws "${consume_args[@]}" 2>>"$CONNECT_LOG" \
+    | python3 "$BRIDGE" >> "$CONNECT_LOG" 2>>"$CONNECT_LOG" &
+wait $!

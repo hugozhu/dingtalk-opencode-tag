@@ -8,6 +8,27 @@
 # 避免 pgrep -f 误匹配（如 send-by-bot 转发进程 cmdline 含被转发命令文本）
 # 共享给 monitor + healthcheck，消除两处逻辑漂移
 
+# harness_os: 输出 macos | linux（reboot.sh 选择 supervisor 重启方式：
+# macOS=launchctl / Linux=systemctl；后续 monitor.sh 的 date、lib.sh 的 shlock 也可复用）
+harness_os() {
+    case "${OSTYPE:-$(uname -s)}" in
+        darwin*|Darwin) echo macos ;;
+        linux*|Linux)   echo linux ;;
+        *)              echo "${OSTYPE:-unknown}" ;;
+    esac
+}
+
+# future_epoch <seconds>: 输出「当前时间 + N 秒」的 unix 时间戳
+#   macOS(BSD date): date -v+Ns；Linux(GNU date): date -d "+N seconds"
+future_epoch() {
+    local secs="$1"
+    if [[ "$(harness_os)" == macos ]]; then
+        date -v+"${secs}"S '+%s'
+    else
+        date -d "+${secs} seconds" '+%s'
+    fi
+}
+
 # verify_pid <pid_file> <cmdline_pattern> [pgrep_fallback_pattern]
 # 返回 0 = 进程存活, 1 = 不存活
 verify_pid() {
@@ -64,14 +85,10 @@ _cleanup_pidfile() {
     fi
 }
 
-# acquire_lock <lock_file>：单实例锁（shlock 无 unlock，释放直接 rm -f 锁文件）
+# acquire_lock <lock_file>：单实例锁（跨平台，纯文件存在性 + kill -0 判断，无 shlock 依赖）
 acquire_lock() {
     local lock_file="$1"
-    if /usr/bin/shlock -u "$lock_file" 2>/dev/null; then
-        # shlock -u 是 UUCP 二进制 pid 格式，不是 unlock
-        :
-    fi
-    # 用文件存在性判断（最简）
+    # 用文件存在性判断（最简，跨平台）
     if [[ -f "$lock_file" ]]; then
         local old_pid
         old_pid=$(cat "$lock_file" 2>/dev/null)
@@ -100,12 +117,14 @@ log() {
 # 组件清单单一真相源 — monitor.sh / reboot.sh / healthcheck.sh 共享，避免命名漂移
 #   COMP_NAMES：组件名（下划线，对应 start_<name> 函数）
 #   COMP_PID_BASENAMES：对应 PID 文件名（相对 SCRIPT_DIR）
-#   COMP_PATTERNS：cmdline 签名（verify_pid / pkill 用）
+# COMP_PATTERNS：cmdline 签名（verify_pid / pkill 用）。
+#   注意用**字面点** '.'，不要写 '\.'：verify_pid 步骤3 是字面子串匹配，'\.' 会当字面
+#   反斜杠永远匹配不到；'.' 在子串与 pgrep/pkill 正则里都能命中真实的 '.'。
 # 顺序一一对应。改这里三个脚本同步生效。
 # ---------------------------------------------------------------------------
 HARNESS_COMP_NAMES=("serve" "connect" "watcher" "event_watcher")
 HARNESS_COMP_PID_BASENAMES=(".serve.pid" ".connect.pid" ".watcher.pid" ".event-watcher.pid")
-HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "serve-watcher\.sh" "event-watcher\.py")
+HARNESS_COMP_PATTERNS=("opencode serve" "dws-connect.sh" "serve-watcher.sh" "event_watcher.py")
 
 # monitor 自身的运行时状态文件（reboot 清理时用）
 HARNESS_MONITOR_LOCK="${LOCK_FILE:-/tmp/agent-monitor.lock}"

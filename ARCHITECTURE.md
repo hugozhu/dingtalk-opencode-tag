@@ -3,7 +3,7 @@
 ## 整体架构图
 
 ```
-launchd agent (com.example.agent-connect)
+supervisor（macOS: launchd com.example.agent-connect / Linux: systemd --user agent-connect.service）
   └── monitor.sh --foreground (守护进程，KeepAlive={SuccessfulExit:false} + RunAtLoad=true)
         ├── cleanup_stale_state: 启动时清理失效的 PID 文件
         ├── start_all: 拉起 3 个组件（nohup+disown，脱离进程树独立存活；已有同种进程则跳过）
@@ -64,14 +64,14 @@ handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在
 
 ## 13 个最佳实践提炼
 
-### 1. launchd 守护（KeepAlive + RunAtLoad + 熔断）
-**文件**: `bin/core/monitor.sh` + `bin/custom/agent-template.plist`
+### 1. supervisor 守护（KeepAlive + RunAtLoad + 熔断，跨平台）
+**文件**: `bin/core/monitor.sh` + `bin/custom/agent-template.plist`（macOS）/ `agent-template.service`（Linux）
 **关键设计**:
-- `KeepAlive={SuccessfulExit:false}` — exit 0 不拉起（等人工），崩溃/被杀会拉起
-- `RunAtLoad=true` — 开机/登录自启
-- `ThrottleInterval=10` — 10 秒内不重复拉起（防崩溃循环）
+- `KeepAlive={SuccessfulExit:false}`（launchd）≈ `Restart=on-failure`（systemd）— exit 0 不拉起（等人工），崩溃/被杀会拉起
+- `RunAtLoad=true` ≈ `systemctl --user enable`（+ `enable-linger` headless 自启）— 开机/登录自启
+- `ThrottleInterval=10` ≈ `RestartSec=10` — 防崩溃循环
 - 连续 `MAX_FAILURES` 次失败 → 熔断：发告警 + exit 0
-- SIGTERM/SIGINT → cleanup exit 1（非零让 launchd 拉起，覆盖系统重启场景）
+- SIGTERM/SIGINT → cleanup exit 1（非零让 supervisor 拉起，覆盖系统重启场景）
 
 ### 2. N 项健康检查（硬失败/告警分级）
 **文件**: `bin/core/healthcheck.sh`

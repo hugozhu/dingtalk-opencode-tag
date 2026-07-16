@@ -30,7 +30,7 @@ COMPONENT_NAME="healthcheck"
 
 # 检查1: connect 进程存活（硬失败）
 check_connect() {
-    if verify_pid "$CONNECT_PID_FILE" "agent-connect.*--unified-app-id"; then
+    if verify_pid "$CONNECT_PID_FILE" "dws-connect.sh"; then
         echo "OK"
     else
         echo "FAIL: connect 进程不存活"
@@ -45,7 +45,12 @@ check_log_activity() {
     fi
     local now mtime diff
     now=$(date +%s)
-    mtime=$(stat -f %m "$LOG_FILE" 2>/dev/null || echo 0)
+    # 跨平台取文件 mtime（epoch）：Linux GNU stat -c %Y / macOS BSD stat -f %m
+    if [[ "$(harness_os)" == macos ]]; then
+        mtime=$(stat -f %m "$LOG_FILE" 2>/dev/null || echo 0)
+    else
+        mtime=$(stat -c %Y "$LOG_FILE" 2>/dev/null || echo 0)
+    fi
     diff=$((now - mtime))
     if [[ "$diff" -gt "$LOG_INACTIVITY_THRESHOLD" ]]; then
         echo "WARN: 日志 ${diff}s 无活动"
@@ -69,7 +74,7 @@ check_log_fatal() {
 
 # 检查4: event-watcher 进程活跃（仅告警）
 check_event_watcher() {
-    if verify_pid "$EVENT_WATCHER_PID_FILE" "event-watcher\.py"; then
+    if verify_pid "$EVENT_WATCHER_PID_FILE" "event_watcher.py"; then
         echo "OK"
     else
         echo "WARN: event-watcher 不活跃"
