@@ -226,3 +226,4 @@ config/constants.local.sh
 *.pid
 agent-connect.log
 monitor.log
+start-digital-employee.sh
