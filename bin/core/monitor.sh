@@ -188,7 +188,7 @@ main() {
     sleep 3
     warmup
     bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
-    date -v+${CHECK_INTERVAL}M '+%s' > "$SCRIPT_DIR/.next-check"
+    date -v+${CHECK_INTERVAL}S '+%s' > "$SCRIPT_DIR/.next-check"
 
     case "${1:---foreground}" in
         --foreground) run_forever ;;
