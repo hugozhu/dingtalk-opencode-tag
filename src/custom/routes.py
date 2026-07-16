@@ -17,10 +17,54 @@ SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+import re
 import threading
 
 from core.agent_common import log, submit_handler
 from custom.handler import handle_message, match_business_line
+from custom.brain import generate_reply
+from custom.replier import send_reply
+
+# 从 raw_line 提取 convId / msgId（bridge 写的格式：... convId=X msgId=Y)）
+_CONVID_RE = re.compile(r"convId=([^\s)]+)")
+_MSGID_RE = re.compile(r"msgId=([^\s)]+)")
+
+# 防回环：数字员工自己的发送名（sender 展示名）。订阅的是群消息，机器人/自己发的
+# 回复也会被再次消费，必须过滤掉，否则无限自问自答。逗号分隔，可多个。
+_SELF_NAMES = {
+    n.strip() for n in os.environ.get("AGENT_SELF_NAMES", "数字员工,Claude Code").split(",")
+    if n.strip()
+}
+
+# 文本消息去重（同一 msgId 只处理一次）—— 有界 FIFO，避免长驻内存泄漏
+from collections import OrderedDict
+_reply_seen = OrderedDict()
+_reply_seen_lock = threading.Lock()
+_REPLY_SEEN_MAX = 2048
+
+
+def _seen_before(msg_id):
+    """msgId 去重：见过返回 True。空 msgId 不去重（放行）。"""
+    if not msg_id:
+        return False
+    with _reply_seen_lock:
+        if msg_id in _reply_seen:
+            return True
+        _reply_seen[msg_id] = None
+        if len(_reply_seen) > _REPLY_SEEN_MAX:
+            _reply_seen.popitem(last=False)
+    return False
+
+
+def _handle_text_reply(user, text, conv_type, conv_id, msg_id):
+    """后台线程执行：大脑生成回复 → 发回来源会话。"""
+    reply = generate_reply(user, text, ctx={
+        "conv_id": conv_id, "conv_type": conv_type, "msg_id": msg_id, "user": user,
+    })
+    if not reply:
+        log(f"reply: 大脑无回复 user={user} text={text[:40]!r}")
+        return
+    send_reply(conv_id, conv_type, reply)
 
 
 def route_reply(user, text, conv_type, raw_line):
@@ -30,19 +74,34 @@ def route_reply(user, text, conv_type, raw_line):
     "[connect] 收到 @user: text (convType=N ...)" 时调用
     （已排除 /reboot 指令，/reboot 由 core 直接处理）。
 
-    FDE 在这里实现自己的分发逻辑，例如:
-      - text == "[图片]"   → handle_image(...)
-      - text == "/cmd ..." → handle_custom_command(...)
-      - 其他               → handle_reply(user, text)
+    流程：防回环过滤自己 → msgId 去重 → 提交大脑生成回复 → 发回来源群。
 
     Args:
-        user: 发送者标识
+        user: 发送者展示名
         text: 消息文本（已 strip）
         conv_type: 会话类型（从日志 convType=N 提取）
-        raw_line: 原始日志行（用于需要完整上下文的复杂匹配）
+        raw_line: 原始日志行（含 convId / msgId）
     """
-    # 默认：什么都不做。FDE 按业务实现
-    pass
+    # 1. 防回环：过滤数字员工自己发的消息（否则自问自答死循环）
+    if user in _SELF_NAMES:
+        return
+
+    # 2. 从 raw_line 提取会话/消息 ID
+    conv_id = ""
+    msg_id = ""
+    m = _CONVID_RE.search(raw_line or "")
+    if m:
+        conv_id = m.group(1)
+    m = _MSGID_RE.search(raw_line or "")
+    if m:
+        msg_id = m.group(1)
+
+    # 3. 去重（同一条消息只回一次）
+    if _seen_before(msg_id):
+        return
+
+    # 4. 提交到有界线程池：生成回复 + 发送
+    submit_handler(_handle_text_reply, user, text, conv_type, conv_id, msg_id)
 
 
 def route_business_line(line):
