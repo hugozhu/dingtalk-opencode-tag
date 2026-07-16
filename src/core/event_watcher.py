@@ -121,48 +121,35 @@ CLEANUP_TTL = 40
 # SSE event stream parsing
 # ---------------------------------------------------------------------------
 
-def parse_sse_events(sock):
-    """从 socket 读 SSE 流，yield data 字段。"""
+def parse_sse_events(resp):
+    """从 HTTP 响应对象读 SSE 流，yield data 字段。
+
+    直接读 http.client.HTTPResponse（urlopen 返回值）：它会**透明解码**
+    chunked transfer-encoding，也支持 Content-Length，故无需手工解析十六进制块长，
+    也无需触碰底层 socket 私有属性。socket 超时（由 urlopen timeout 设定）触发时
+    继续循环（无数据 ≠ 断开），并检查 running 以便优雅退出。
+    """
     buf = ""
+    read = getattr(resp, "read1", None) or resp.read
     while running:
         try:
-            sock.settimeout(5)
-            chunk = sock.recv(8192)
-            if not chunk:
-                break
-            buf += chunk.decode("utf-8", errors="replace")
-
-            while "\r\n" in buf:
-                idx = buf.index("\r\n")
-                len_line = buf[:idx].strip()
-                if not len_line:
-                    buf = buf[idx+2:]
-                    continue
-                try:
-                    chunk_size = int(len_line, 16)
-                except ValueError:
-                    buf = buf[idx+2:]
-                    continue
-
-                chunk_data_start = idx + 2
-                chunk_data_end = chunk_data_start + chunk_size
-                if len(buf) < chunk_data_end + 2:
-                    break
-
-                chunk_body = buf[chunk_data_start:chunk_data_end]
-                buf = buf[chunk_data_end + 2:]
-
-                for line in chunk_body.splitlines():
-                    stripped = line.strip()
-                    if stripped.startswith("data: "):
-                        yield stripped[6:]
-                    elif stripped.startswith("data:"):
-                        yield stripped[5:]
+            chunk = read(8192)
         except socket.timeout:
             continue
         except Exception as e:
             log(f"parse err: {e}")
             break
+        if not chunk:
+            break  # 连接关闭
+        buf += chunk.decode("utf-8", errors="replace")
+
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            stripped = line.strip()
+            if stripped.startswith("data: "):
+                yield stripped[6:]
+            elif stripped.startswith("data:"):
+                yield stripped[5:]
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +359,7 @@ def connect_sse():
             r = urllib.request.urlopen(req, timeout=10)
             log(f"SSE 已连接 serve port={port}")
             interval = MIN_RECONNECT_INTERVAL
-            sock = r.fp.raw._sock  # 取底层 socket
-            for data in parse_sse_events(sock):
+            for data in parse_sse_events(r):
                 if not running:
                     break
                 try:
