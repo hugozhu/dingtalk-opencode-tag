@@ -38,6 +38,7 @@ import base64
 import json
 import os
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -126,12 +127,28 @@ def parse_sse_events(resp):
 
     直接读 http.client.HTTPResponse（urlopen 返回值）：它会**透明解码**
     chunked transfer-encoding，也支持 Content-Length，故无需手工解析十六进制块长，
-    也无需触碰底层 socket 私有属性。socket 超时（由 urlopen timeout 设定）触发时
-    继续循环（无数据 ≠ 断开），并检查 running 以便优雅退出。
+    也无需触碰底层 socket 私有属性。
+
+    用 select 等 fd 可读再 read，而不是靠 socket 读超时轮询 running：urlopen(timeout=)
+    的 SocketIO 是带缓冲的，一旦某次 read 超时就会置 _timeout_occurred，之后每次 read 都抛
+    OSError("cannot read from timed out object")（不是 socket.timeout），把长连接打死 →
+    每 ~timeout 秒断开重连、丢事件。select 只在有数据时才 read，超时永不触发，同时每秒
+    检查 running 以便优雅退出（serve 在 127.0.0.1 明文 http，可读即 read1 立即返回）。
     """
     buf = ""
     read = getattr(resp, "read1", None) or resp.read
+    try:
+        fd = resp.fileno()
+    except (OSError, ValueError, AttributeError):
+        fd = None
     while running:
+        if fd is not None:
+            try:
+                ready, _, _ = select.select([fd], [], [], 1.0)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue  # 无数据，回去检查 running（不 read → 不会超时 poison）
         try:
             chunk = read(8192)
         except socket.timeout:
