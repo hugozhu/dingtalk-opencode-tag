@@ -35,15 +35,15 @@ notify_alert() {
 sleep 1
 
 log "停止所有组件..."
-pkill -f "agent-connect.*--unified-app-id" 2>/dev/null || true
-pkill -f "agent-serve" 2>/dev/null || true
-pkill -f "event-watcher\.py" 2>/dev/null || true
-pkill -f "serve-watcher\.sh" 2>/dev/null || true
+for _pat in "${HARNESS_COMP_PATTERNS[@]}"; do
+    pkill -f "$_pat" 2>/dev/null || true
+done
 
-# 清状态文件
-rm -f "$SCRIPT_DIR"/.{connect,serve,serve-watcher,event-watcher,monitor}.pid \
-      "$SCRIPT_DIR"/.next-check \
-      "$SCRIPT_DIR"/.serve.{port,pwd} 2>/dev/null || true
+# 清状态文件（组件 PID + monitor 锁 + 额外运行时状态），全部从 lib.sh 单一真相源派生
+rm -f "$HARNESS_MONITOR_LOCK" 2>/dev/null || true
+for _b in "${HARNESS_COMP_PID_BASENAMES[@]}" "${HARNESS_EXTRA_STATE_BASENAMES[@]}"; do
+    rm -f "$SCRIPT_DIR/$_b" 2>/dev/null || true
+done
 
 sleep 2
 

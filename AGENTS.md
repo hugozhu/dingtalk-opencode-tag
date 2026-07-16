@@ -71,10 +71,11 @@ def route_business_line(line):
     ...
 ```
 
-`core/event_watcher.py` 的 `log_tail_thread` 会调用这三个 hook：
+`core/event_watcher.py` 的 `log_tail_thread` / `format_and_forward` 会调用这些 hook：
 - `route_reply(user, text, conv_type, raw_line)` — 普通文本回复（已排除 /reboot）
 - `route_business_line(line)` — 业务消息行
 - `route_sse_event(event, port, password)` — SSE 事件（可选拦截，返回 False 走 core 默认转发）
+- `route_cleanup_state(event, cleanup_state, cleanup_lock)` — spurious 多余轮次 cleanup 状态机（core 只做 TTL 兜底，状态机在 custom 实现）
 
 ### Step 4: 替换通知后端（可选）
 

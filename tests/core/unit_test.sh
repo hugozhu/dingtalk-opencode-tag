@@ -88,6 +88,16 @@ else
 fi
 assert_eq "reboot.sh LAUNCHD_LABEL 存在" "1" "$([ -n "$LAUNCHD_VAL" ] && echo 1 || echo 0)"
 
+# 测试 README 不硬编码版本号（应指向 VERSION，避免漂移）
+echo ""
+echo "Testing version consistency..."
+# README 里不应出现形如 `1.2.3` 的裸版本号（VERSION 是唯一真相源）
+if grep -Eq '版本[:：].*`[0-9]+\.[0-9]+\.[0-9]+`' "$SCRIPT_DIR/README.md"; then
+    assert_eq "README 不硬编码版本号" "1" "0 (README 出现硬编码版本，应指向 VERSION)"
+else
+    assert_eq "README 不硬编码版本号" "1" "1"
+fi
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

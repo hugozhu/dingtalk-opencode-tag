@@ -26,17 +26,32 @@ source "$SCRIPT_DIR/bin/core/lib.sh"
 
 COMPONENT_NAME="monitor"
 
+# 加载可配置常量（真实值在 config/constants.local.sh，被 .gitignore 忽略）
+if [[ -f "$SCRIPT_DIR/config/constants.local.sh" ]]; then
+    source "$SCRIPT_DIR/config/constants.local.sh"
+elif [[ -f "$SCRIPT_DIR/config/constants.sh" ]]; then
+    source "$SCRIPT_DIR/config/constants.sh"
+fi
+
 # 可配置常量（被 config/constants.sh 覆盖）
 : "${CHECK_INTERVAL:=1800}"           # 健康检查间隔（秒）
 : "${MAX_FAILURES:=3}"               # 连续失败熔断阈值
 : "${WARMUP_TIMEOUT:=60}"            # warmup 超时
 : "${LOCK_FILE:=/tmp/agent-monitor.lock}"
 
-# 组件配置：每个组件 = PID 文件 + cmdline 签名 + 启动函数
-# 数组下标约定：COMP_NAMES / COMP_PID_FILES / COMP_PATTERNS / COMP_START_FUNCS
-COMP_NAMES=("connect" "watcher" "event-watcher")
-COMP_PID_FILES=("$SCRIPT_DIR/.connect.pid" "$SCRIPT_DIR/.watcher.pid" "$SCRIPT_DIR/.event-watcher.pid")
-COMP_PATTERNS=("agent-connect.*--unified-app-id" "serve-watcher\.sh" "event-watcher\.py")
+# 组件配置：从 lib.sh 的单一真相源派生（避免与 reboot.sh/healthcheck.sh 命名漂移）
+# COMP_NAMES 用下划线（bash 函数名不能含连字符），对应 start_<name> 函数
+# serve 也纳入托管：healthcheck 对 serve 硬失败，必须有人拉起（否则熔断循环）
+COMP_NAMES=("${HARNESS_COMP_NAMES[@]}")
+COMP_PATTERNS=("${HARNESS_COMP_PATTERNS[@]}")
+COMP_PID_FILES=()
+for _b in "${HARNESS_COMP_PID_BASENAMES[@]}"; do
+    COMP_PID_FILES+=("$SCRIPT_DIR/$_b")
+done
+
+# 加载组件启动函数（core 默认 + custom 覆盖）。定义 start_connect / start_watcher /
+# start_event_watcher，被 start_all / 兜底拉起调用。
+source "$SCRIPT_DIR/bin/core/start_funcs.sh"
 
 # 进程检测：是否在运行
 is_running() {
@@ -176,7 +191,7 @@ main() {
     sleep 3
     warmup
     bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
-    date -v+${CHECK_INTERVAL}M '+%s' > "$SCRIPT_DIR/.next-check"
+    date -v+${CHECK_INTERVAL}S '+%s' > "$SCRIPT_DIR/.next-check"
 
     case "${1:---foreground}" in
         --foreground) run_forever ;;

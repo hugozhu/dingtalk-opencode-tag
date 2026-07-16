@@ -19,7 +19,7 @@ if SRC_DIR not in sys.path:
 
 import threading
 
-from core.agent_common import log
+from core.agent_common import log, submit_handler
 from custom.handler import handle_message, match_business_line
 
 
@@ -57,9 +57,7 @@ def route_business_line(line):
     m = match_business_line(line)
     if m:
         mid, convs = m
-        threading.Thread(
-            target=handle_message, args=(mid, convs), daemon=True
-        ).start()
+        submit_handler(handle_message, mid, convs)
         return True
     return False
 
@@ -72,5 +70,25 @@ def route_sse_event(event, port, password):
 
     FDE 一般不需要改这里（默认转发逻辑在 core/format_and_forward 里）。
     仅当需要自定义事件过滤/转换时实现本函数返回 True。
+    """
+    return False
+
+
+def route_cleanup_state(event, cleanup_state, cleanup_lock):
+    """spurious 多余轮次的 cleanup 状态机 hook（可选）。
+
+    被 core/format_and_forward 在处理每个 SSE 事件时调用（core 已做 TTL 过期兜底）。
+    core 有意把状态机下放到 custom：awaiting_spurious → cleaning 的具体判定与依赖
+    服务的日志/消息格式强相关，属于业务特定逻辑，放在可编辑的 custom 层。
+
+    参数：
+        event: SSE 事件 dict（含 type / properties.sessionID / ...）
+        cleanup_state: core 持有的共享状态 dict（sid[:12] -> {state, expires, ...}）
+        cleanup_lock: 保护 cleanup_state 的 threading.Lock
+
+    返回 True 表示本事件已被 cleanup 消费（core 不再默认转发）；False 走默认。
+
+    默认实现：不做任何 cleanup（返回 False）。需要清理 spurious 轮次的 FDE，
+    参考 agent_common._abort_and_clean_session 在这里实现状态机。
     """
     return False

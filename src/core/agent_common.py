@@ -23,30 +23,104 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
-# Constants — 用户在 config/config.json 里覆盖
+# Config loading — config/config.local.json（真实值）覆盖占位默认
+#
+# 优先级（从高到低）: 环境变量 > config.local.json > config.example.json > 硬编码默认
+# 这样 FDE 填了 config.local.json 就能真正生效（此前该文件从没被读取）。
+# ---------------------------------------------------------------------------
+
+_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config")
+# 项目根（运行时状态文件 .serve.port/.serve.pwd 等所在目录）
+_PROJECT_ROOT = os.environ.get(
+    "PROJECT_DIR",
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _load_config_file():
+    """读 config.local.json（优先）或 config.example.json，返回扁平 dict 或 {}。"""
+    for name in ("config.local.json", "config.example.json"):
+        path = os.path.join(_CONFIG_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+_CONFIG = _load_config_file()
+
+
+def _cfg(env_key, *json_path, default=""):
+    """取配置值：环境变量优先，然后 config.json 的嵌套路径，最后 default。"""
+    if env_key and os.environ.get(env_key) is not None:
+        return os.environ[env_key]
+    node = _CONFIG
+    for key in json_path:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(key)
+        if node is None:
+            return default
+    return node if node is not None else default
+
+
+# ---------------------------------------------------------------------------
+# Constants — 环境变量 > config.local.json > 默认
 # ---------------------------------------------------------------------------
 
 # 机器人/数字员工身份（用于 send_notification 用机器人身份发消息）
-ROBOT_CODE = os.environ.get("AGENT_ROBOT_CODE", "your-robot-code")
-USER_ID = os.environ.get("AGENT_USER_ID", "your-user-id")
-PROFILE = os.environ.get("AGENT_PROFILE", "default-profile")
+ROBOT_CODE = _cfg("AGENT_ROBOT_CODE", "identity", "robot_code", default="your-robot-code")
+USER_ID = _cfg("AGENT_USER_ID", "identity", "user_id", default="your-user-id")
+PROFILE = _cfg("AGENT_PROFILE", "identity", "profile", default="default-profile")
 
 # 视觉/多模态模型（经代理服务调用）
-PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:4000/v1")
-PROXY_KEY = os.environ.get("PROXY_KEY", "sk-1234")
-VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-3.1-flash-image")
+PROXY_URL = _cfg("PROXY_URL", "vision", "proxy_url", default="http://localhost:4000/v1")
+PROXY_KEY = _cfg("PROXY_KEY", "vision", "proxy_key", default="sk-1234")
+VISION_MODEL = _cfg("VISION_MODEL", "vision", "model", default="gemini-3.1-flash-image")
 
 # session.directory 含此子串的就是数字员工用的会话（按 --agent-workdir 设置）
-_BOT_DIR_SUBSTR = os.environ.get("AGENT_BOT_DIR_SUBSTR", "your-agent-workdir")
+_BOT_DIR_SUBSTR = _cfg("AGENT_BOT_DIR_SUBSTR", "paths", "agent_workdir_basename",
+                       default="your-agent-workdir")
 
 # 注入模板轮询参数（测试 patch 为 0）
 _INJECT_POLL_MAX_SECONDS = 60
 _INJECT_POLL_INTERVAL = 5
+
+# serve 凭据发现缓存（避免每次访问都全表 ps 扫描）
+_CREDS_CACHE_TTL = float(os.environ.get("AGENT_CREDS_CACHE_TTL", "10"))
+_creds_cache = {}
+_creds_lock = threading.Lock()
+
+# 业务 handler 派发线程池（有界并发）
+# 此前每条消息 threading.Thread().start() 无上限；消息突发 + 每个 handler 阻塞
+# 数十秒（轮询 + post_user_message）会导致线程数无界。用有界池限流。
+_HANDLER_MAX_WORKERS = int(os.environ.get("AGENT_HANDLER_WORKERS", "8"))
+_handler_pool = ThreadPoolExecutor(
+    max_workers=_HANDLER_MAX_WORKERS, thread_name_prefix="handler")
+
+
+def submit_handler(fn, *args, **kwargs):
+    """把业务 handler 提交到有界线程池执行（替代裸 threading.Thread）。
+
+    返回 Future。handler 内部异常会被吞掉并记日志，避免污染池。
+    """
+    def _wrapped():
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            log(f"handler {getattr(fn, '__name__', fn)} err: {e}")
+    return _handler_pool.submit(_wrapped)
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +193,53 @@ def find_serve_credentials():
     """从进程表定位 opencode serve 进程，返回 (pid, port, password) 或 (None, None, None)。
 
     通用思路: ps -ax 找 "<serve-cmd>" 进程 → 提取 --port + OPENCODE_SERVER_PASSWORD 环境变量
+
+    带短 TTL 缓存（_CREDS_CACHE_TTL 秒）：agent_common 里 8 个函数各自调用本函数，
+    一次 inject_and_forward 会触发 ≥3 次全表 ps。缓存命中时跳过 subprocess，
+    大幅降低进程表扫描频率。缓存的是成功结果；失败不缓存（下次立即重试）。
     """
+    now = time.time()
+    with _creds_lock:
+        cached = _creds_cache.get("value")
+        if cached and (now - _creds_cache.get("ts", 0)) < _CREDS_CACHE_TTL:
+            return cached
+
+    creds = _discover_serve_credentials()
+    if creds[1]:  # 只缓存成功结果（port 非空）
+        with _creds_lock:
+            _creds_cache["value"] = creds
+            _creds_cache["ts"] = now
+    return creds
+
+
+def invalidate_serve_credentials():
+    """清除凭据缓存（端口/密码变更、连接失败重连前调用）。"""
+    with _creds_lock:
+        _creds_cache.pop("value", None)
+        _creds_cache.pop("ts", None)
+
+
+def _discover_serve_credentials():
+    """定位 serve 凭据。返回 (pid, port, password)。
+
+    单一真相源：优先读 .serve.port / .serve.pwd 文件（start_serve 写、healthcheck 读），
+    避免与进程表扫描出现两套真相导致漂移。文件缺失/不完整时回退到 ps 扫描，
+    并把扫描结果写回文件，让 healthcheck 与本模块看到一致的凭据。
+    """
+    # 1. 优先从状态文件读（与 healthcheck check_serve_http 同源）
+    port = _read_state_file(".serve.port")
+    pwd = _read_state_file(".serve.pwd")
+    if port and pwd:
+        try:
+            pid = int(_read_state_file(".serve.pid") or 0) or None
+        except ValueError:
+            pid = None
+        try:
+            return pid, int(port), pwd
+        except ValueError:
+            pass  # port 文件损坏，回退扫描
+
+    # 2. 回退：进程表扫描
     try:
         result = subprocess.run(
             ["ps", "-ax", "-o", "pid,args"],
@@ -137,10 +257,35 @@ def find_serve_credentials():
                 pm = re.search(r"AGENT_SERVER_PASSWORD=(\S+)", pr.stdout)
                 pwd = pm.group(1) if pm else None
                 if pwd:
+                    # 写回状态文件，保持与 healthcheck 同源
+                    _write_state_file(".serve.pid", str(pid))
+                    _write_state_file(".serve.port", str(port))
+                    _write_state_file(".serve.pwd", pwd)
                     return int(pid), port, pwd
     except Exception as e:
         log(f"find serve err: {e}")
     return None, None, None
+
+
+def _read_state_file(basename):
+    """读 PROJECT_ROOT 下的运行时状态文件，返回 strip 后内容或 None。"""
+    path = os.path.join(_PROJECT_ROOT, basename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            return v or None
+    except Exception:
+        return None
+
+
+def _write_state_file(basename, value):
+    """写运行时状态文件（best-effort，失败仅记日志）。"""
+    path = os.path.join(_PROJECT_ROOT, basename)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(value)
+    except Exception as e:
+        log(f"write state {basename} err: {e}")
 
 
 def _find_bot_session():

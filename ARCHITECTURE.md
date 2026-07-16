@@ -112,13 +112,14 @@ handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在
 - 线程安全 dedup（`_seen` 集合 + `_state_lock`）
 
 ### 7. 状态机 cleanup（awaiting_spurious → cleaning）
-**文件**: `src/core/event_watcher.py` 的 `cleanup_state`
+**文件**: core `src/core/event_watcher.py` 提供 TTL 兜底 + `route_cleanup_state` hook；
+状态机实现在 custom `src/custom/routes.py`（业务特定，FDE 可编辑）
 **关键设计**:
+- core 只负责 TTL 过期兜底防僵死（`CLEANUP_TTL=40s`）+ 调用 hook
 - awaiting_spurious → 等多余消息出现（原轮次事件正常放行）
 - cleaning → DELETE + abort 多余 user/assistant 消息
 - 多选/连发场景下累积删除 `expected_count` 条
 - idle 时不立即 pop：比较 `deleted_user` vs `expected_count`，未达标重置 awaiting_spurious
-- TTL 兜底防僵死（`CLEANUP_TTL=40s`）
 
 ### 8. 公共注入模板 inject_and_forward
 **文件**: `src/core/agent_common.py` 的 `inject_and_forward()`
@@ -180,9 +181,9 @@ handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在
 | `.serve.pid` | opencode serve 进程 PID |
 | `.serve.port` | opencode serve 监听端口 |
 | `.serve.pwd` | opencode serve 的 OPENCODE_SERVER_PASSWORD |
-| `.serve-watcher.pid` | serve-watcher 后台进程 PID |
+| `.watcher.pid` | serve-watcher 后台进程 PID |
 | `.event-watcher.pid` | event-watcher 后台进程 PID |
-| `.monitor.pid` | monitor 守护进程 PID |
+| `/tmp/agent-monitor.lock` | monitor 守护进程单实例锁（含 PID） |
 | `.next-check` | 下次自检的 Unix 时间戳 |
 | `.opencode-connect-status.json` | 最近一次健康检查结果 |
 

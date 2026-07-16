@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 
 SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if SRC_DIR not in sys.path:
@@ -37,6 +38,7 @@ from core.agent_common import (
     inject_and_forward,
     log,
     send_notification,
+    submit_handler,
 )
 
 # ---------------------------------------------------------------------------
@@ -59,7 +61,29 @@ BUSINESS_MSG_RE = re.compile(r'msgtype="business-special"')
 MSGID_RE = re.compile(r'msgId=([^\s)]+)')
 
 # 已处理的 msgId 去重 + 跨行状态
-_seen = set()
+# 有界去重：长驻进程里 msgId 只增不删会内存泄漏，用 OrderedDict 当 FIFO 上限
+_SEEN_MAX = 4096
+
+
+class _BoundedSeen:
+    """FIFO 上限的去重集合（超出 maxlen 时淘汰最旧的）。"""
+    def __init__(self, maxlen):
+        self._d = OrderedDict()
+        self._maxlen = maxlen
+
+    def __contains__(self, k):
+        return k in self._d
+
+    def add(self, k):
+        self._d[k] = None
+        if len(self._d) > self._maxlen:
+            self._d.popitem(last=False)
+
+    def clear(self):
+        self._d.clear()
+
+
+_seen = _BoundedSeen(_SEEN_MAX)
 _pending_cross_line = False
 _pending_cross_convs = []
 _state_lock = threading.Lock()
@@ -322,6 +346,8 @@ def render_prompt(body, senders, attachments, sender):
     messages = body.get("messages") or []
     if not messages:
         return None
+    # 拷贝，避免就地改调用方传入的 list（保持纯函数语义）
+    senders = list(senders)
     while len(senders) < len(messages):
         senders.append("未知发送人")
 
@@ -443,5 +469,5 @@ def handle_message(msg_id, original_convs=None):
 
 
 def handle_message_async(msg_id, original_convs=None):
-    """Spawn handle_message in a daemon thread (matches log_tail_thread usage)."""
-    threading.Thread(target=handle_message, args=(msg_id, original_convs), daemon=True).start()
+    """Submit handle_message to the bounded handler pool (matches log_tail usage)."""
+    submit_handler(handle_message, msg_id, original_convs)

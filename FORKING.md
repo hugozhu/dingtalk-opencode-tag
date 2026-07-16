@@ -125,6 +125,11 @@ templates 保持纯净，是 FDE diff 的稳定基线。
 
 ## 已知限制
 
+- **serve 密码经 `ps` 可见**：`find_serve_credentials` 回退路径从 `ps eww` 提取 serve 的
+  `AGENT_SERVER_PASSWORD` 环境变量，`.serve.pwd` 也是明文文件。在**多用户主机**上，同机其他用户
+  可通过 `ps eww` / 读文件看到该密码。仅 localhost basic-auth 场景可接受；若主机有不受信任的其他
+  用户，请改用 unix socket + 文件权限（`chmod 600 .serve.pwd`）或短期令牌。同理 `PROXY_KEY`
+  默认 `sk-1234` 只是占位，务必在 `config.local.json` 换成真实密钥且勿提交。
 - **空回复撤回**：依赖服务触发 abort 后返回空 finalizer 被发到通知渠道时，event-watcher 无法用机器人身份撤回（钉钉 API "仅消息发送者可撤回" + 缺 processQueryKey）。需要依赖服务端配合过滤空回复。
 - **macOS 限定**：launchd 托管是 macOS 特性。Linux 用 systemd、Windows 用服务/任务计划器，需自己适配 `bin/core/monitor.sh`。
 - **依赖 dws CLI**：`send_notification` / `_run_cli` 默认用 dws。其他平台在 custom 层覆盖。

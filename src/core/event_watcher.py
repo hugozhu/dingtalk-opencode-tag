@@ -20,11 +20,10 @@
    - 匹配后 spawn 业务 handler daemon thread
 
 3. 状态机 cleanup（处理 spurious 多余轮次）：
-   - awaiting_spurious → cleaning
+   - core 只做 TTL 过期兜底（CLEANUP_TTL=40s）+ 提供 route_cleanup_state hook
+   - 具体 awaiting_spurious → cleaning 状态机由 custom.routes 实现（业务特定）
    - DELETE + abort 多余 user/assistant 消息
    - 多选/连发场景下累积删除 expected_count 条
-   - TTL 兜底防僵死（CLEANUP_TTL=40s）
-   - idle 时不立即 pop，比较 deleted_user vs expected_count
 
 4. 撤回空回复尝试（监听 "agent 已生成回复" + "普通消息已发送"）：
    - 检测到空 finalizer（"本地 agent 无文本输出"）→ 主动 list + recall
@@ -67,7 +66,12 @@ from core.agent_common import (
     log,
     send_notification,
 )
-from custom.routes import route_reply, route_business_line, route_sse_event
+from custom.routes import (
+    route_reply,
+    route_business_line,
+    route_sse_event,
+    route_cleanup_state,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -117,48 +121,35 @@ CLEANUP_TTL = 40
 # SSE event stream parsing
 # ---------------------------------------------------------------------------
 
-def parse_sse_events(sock):
-    """从 socket 读 SSE 流，yield data 字段。"""
+def parse_sse_events(resp):
+    """从 HTTP 响应对象读 SSE 流，yield data 字段。
+
+    直接读 http.client.HTTPResponse（urlopen 返回值）：它会**透明解码**
+    chunked transfer-encoding，也支持 Content-Length，故无需手工解析十六进制块长，
+    也无需触碰底层 socket 私有属性。socket 超时（由 urlopen timeout 设定）触发时
+    继续循环（无数据 ≠ 断开），并检查 running 以便优雅退出。
+    """
     buf = ""
+    read = getattr(resp, "read1", None) or resp.read
     while running:
         try:
-            sock.settimeout(5)
-            chunk = sock.recv(8192)
-            if not chunk:
-                break
-            buf += chunk.decode("utf-8", errors="replace")
-
-            while "\r\n" in buf:
-                idx = buf.index("\r\n")
-                len_line = buf[:idx].strip()
-                if not len_line:
-                    buf = buf[idx+2:]
-                    continue
-                try:
-                    chunk_size = int(len_line, 16)
-                except ValueError:
-                    buf = buf[idx+2:]
-                    continue
-
-                chunk_data_start = idx + 2
-                chunk_data_end = chunk_data_start + chunk_size
-                if len(buf) < chunk_data_end + 2:
-                    break
-
-                chunk_body = buf[chunk_data_start:chunk_data_end]
-                buf = buf[chunk_data_end + 2:]
-
-                for line in chunk_body.splitlines():
-                    stripped = line.strip()
-                    if stripped.startswith("data: "):
-                        yield stripped[6:]
-                    elif stripped.startswith("data:"):
-                        yield stripped[5:]
+            chunk = read(8192)
         except socket.timeout:
             continue
         except Exception as e:
             log(f"parse err: {e}")
             break
+        if not chunk:
+            break  # 连接关闭
+        buf += chunk.decode("utf-8", errors="replace")
+
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            stripped = line.strip()
+            if stripped.startswith("data: "):
+                yield stripped[6:]
+            elif stripped.startswith("data:"):
+                yield stripped[5:]
 
 
 # ---------------------------------------------------------------------------
@@ -177,14 +168,18 @@ def format_and_forward(event, port=None, password=None):
     full_sid = props.get("sessionID", "") or ""
     sid = full_sid[:12]
 
-    # ---- 状态机 cleanup 处理（与 question/forward 多余轮次清理共用）----
+    # ---- 状态机 cleanup 处理（spurious 多余轮次清理）----
+    # core 只做 TTL 过期兜底 + 提供 hook；具体 awaiting_spurious → cleaning 状态机
+    # 由 custom.routes.route_cleanup_state 实现（业务特定，FDE 在 custom 层写）。
     with cleanup_lock:
         cs = cleanup_state.get(sid)
         if cs and time.time() > cs.get("expires", 0):
             cleanup_state.pop(sid, None)
             log(f"cleanup 过期清理 sid={sid}")
             cs = None
-    # 用户实现 cleanup 处理逻辑（参考 dingtalk-opencode-agent/event-watcher.py 的 cleanup_state 状态机）
+    # 下放给 custom：返回 True 表示 custom 已消费该事件（core 不再默认转发）
+    if route_cleanup_state(event, cleanup_state, cleanup_lock):
+        return True
 
     # ---- 收到新请求：session 变 busy 时第一时间通知 ----
     if etype == "session.status" and sid:
@@ -364,8 +359,7 @@ def connect_sse():
             r = urllib.request.urlopen(req, timeout=10)
             log(f"SSE 已连接 serve port={port}")
             interval = MIN_RECONNECT_INTERVAL
-            sock = r.fp.raw._sock  # 取底层 socket
-            for data in parse_sse_events(sock):
+            for data in parse_sse_events(r):
                 if not running:
                     break
                 try:
@@ -380,6 +374,9 @@ def connect_sse():
                     log(f"format_and_forward err: {e}")
         except Exception as e:
             log(f"SSE 连接失败: {e}，{interval}s 后重试")
+            # 连接失败可能是 serve 重启换了端口/密码，清缓存下次重新发现
+            from core.agent_common import invalidate_serve_credentials
+            invalidate_serve_credentials()
             time.sleep(interval)
             interval = min(interval * 2, MAX_RECONNECT_INTERVAL)
 
@@ -389,6 +386,7 @@ def connect_sse():
 # ---------------------------------------------------------------------------
 
 def main():
+    global running
     log(f"event-watcher 启动 - 无限重试 + 自动重连")
     stop_flag = threading.Event()
 
@@ -402,8 +400,8 @@ def main():
     except KeyboardInterrupt:
         log("收到 KeyboardInterrupt，退出")
     finally:
-        stop_flag.set()
         running = False
+        stop_flag.set()
 
 
 if __name__ == "__main__":
