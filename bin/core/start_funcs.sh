@@ -23,6 +23,15 @@ _spawn() {
     log "  spawned pid=$pid → $pid_file (cmd: $1)"
 }
 
+# start_serve — opencode serve 进程（**业务特定，FDE 在 custom 覆盖**）
+# healthcheck 对 serve 硬失败，所以 serve 必须被托管。默认告警提示未覆盖。
+# FDE 覆盖后应额外写出 .serve.port / .serve.pwd（healthcheck check_serve_http 依赖）。
+start_serve() {
+    log "  ⚠️ start_serve 未被 custom 覆盖 —— 请在 bin/custom/start_funcs.sh 实现"
+    log "     serve 需写出 .serve.pid / .serve.port / .serve.pwd 供 healthcheck 使用"
+    return 1
+}
+
 # start_connect — 数字员工核心连接进程（**业务特定，FDE 在 custom 覆盖**）
 # 默认实现仅告警：没有 connect 命令，harness 跑不起来。
 start_connect() {

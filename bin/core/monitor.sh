@@ -42,9 +42,10 @@ fi
 # 组件配置：每个组件 = PID 文件 + cmdline 签名 + 启动函数
 # 数组下标约定：COMP_NAMES / COMP_PID_FILES / COMP_PATTERNS
 # 注意：COMP_NAMES 用下划线（bash 函数名不能含连字符），对应 start_<name> 函数
-COMP_NAMES=("connect" "watcher" "event_watcher")
-COMP_PID_FILES=("$SCRIPT_DIR/.connect.pid" "$SCRIPT_DIR/.watcher.pid" "$SCRIPT_DIR/.event-watcher.pid")
-COMP_PATTERNS=("agent-connect.*--unified-app-id" "serve-watcher\.sh" "event-watcher\.py")
+# serve 也纳入托管：healthcheck 对 serve 硬失败，必须有人拉起（否则熔断循环）
+COMP_NAMES=("serve" "connect" "watcher" "event_watcher")
+COMP_PID_FILES=("$SCRIPT_DIR/.serve.pid" "$SCRIPT_DIR/.connect.pid" "$SCRIPT_DIR/.watcher.pid" "$SCRIPT_DIR/.event-watcher.pid")
+COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "serve-watcher\.sh" "event-watcher\.py")
 
 # 加载组件启动函数（core 默认 + custom 覆盖）。定义 start_connect / start_watcher /
 # start_event_watcher，被 start_all / 兜底拉起调用。
