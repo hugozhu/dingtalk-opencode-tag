@@ -1,0 +1,82 @@
+"""replier.py — 把回复发回钉钉（custom 层）
+
+可插拔发送模式，由环境变量 AGENT_REPLY_MODE 选择：
+  log  (默认)  只写日志，不真正发钉钉。安全联调用：先验证收发闭环与回复内容，
+               确认无误后再开真发，避免误发/刷屏。
+  bot          用机器人身份 send-by-bot 发到来源群（需 AGENT_ROBOT_CODE）。
+  user         用当前登录用户身份 send 发到来源群。
+
+接口：send_reply(conv_id, conv_type, text, *, at_user_id=None) -> bool
+"""
+
+import os
+import subprocess
+
+from core.agent_common import ROBOT_CODE, PROFILE, log
+
+_REPLY_MODE = os.environ.get("AGENT_REPLY_MODE", "log")
+# 回复标题（send-by-bot 需要 title）
+_REPLY_TITLE = os.environ.get("AGENT_REPLY_TITLE", "数字员工")
+
+
+def send_reply(conv_id, conv_type, text, *, at_user_id=None):
+    """把回复发回来源会话。返回 True 表示已发送/已记录。
+
+    Args:
+        conv_id:  来源 openConversationId
+        conv_type: 会话类型（1=单聊 2=群聊，目前仅群聊路径实现）
+        text:     回复正文
+        at_user_id: 可选，群里 @ 回某人的 userId
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    if not conv_id:
+        log(f"reply skip: 无 conv_id (mode={_REPLY_MODE})")
+        return False
+
+    if _REPLY_MODE == "bot":
+        return _reply_bot(conv_id, text, at_user_id)
+    if _REPLY_MODE == "user":
+        return _reply_user(conv_id, text)
+    # 默认 log 模式：只记录不发送
+    log(f"[reply:log] → conv={conv_id[:16]} text={text[:120]!r}")
+    return True
+
+
+def _reply_bot(conv_id, text, at_user_id):
+    """机器人身份 send-by-bot 发到群。"""
+    if not ROBOT_CODE or ROBOT_CODE == "your-robot-code":
+        log("reply bot skip: AGENT_ROBOT_CODE 未配置")
+        return False
+    cmd = ["dws", "chat", "message", "send-by-bot",
+           "--robot-code", ROBOT_CODE,
+           "--group", conv_id,
+           "--title", _REPLY_TITLE[:60],
+           "--text", text,
+           "--profile", PROFILE, "--format", "markdown", "-y"]
+    if at_user_id:
+        cmd += ["--at-user-ids", at_user_id]
+    return _run(cmd, "bot")
+
+
+def _reply_user(conv_id, text):
+    """当前用户身份 send 发到群。"""
+    cmd = ["dws", "chat", "message", "send",
+           "--group", conv_id,
+           "--text", text,
+           "--profile", PROFILE, "-y"]
+    return _run(cmd, "user")
+
+
+def _run(cmd, mode):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            log(f"reply {mode} FAIL rc={r.returncode} stderr={r.stderr[:200]}")
+            return False
+        log(f"reply {mode} OK")
+        return True
+    except Exception as e:
+        log(f"reply {mode} err: {e}")
+        return False
