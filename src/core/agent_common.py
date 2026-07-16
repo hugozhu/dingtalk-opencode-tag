@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
 # Config loading — config/config.local.json（真实值）覆盖占位默认
@@ -100,6 +101,26 @@ _INJECT_POLL_INTERVAL = 5
 _CREDS_CACHE_TTL = float(os.environ.get("AGENT_CREDS_CACHE_TTL", "10"))
 _creds_cache = {}
 _creds_lock = threading.Lock()
+
+# 业务 handler 派发线程池（有界并发）
+# 此前每条消息 threading.Thread().start() 无上限；消息突发 + 每个 handler 阻塞
+# 数十秒（轮询 + post_user_message）会导致线程数无界。用有界池限流。
+_HANDLER_MAX_WORKERS = int(os.environ.get("AGENT_HANDLER_WORKERS", "8"))
+_handler_pool = ThreadPoolExecutor(
+    max_workers=_HANDLER_MAX_WORKERS, thread_name_prefix="handler")
+
+
+def submit_handler(fn, *args, **kwargs):
+    """把业务 handler 提交到有界线程池执行（替代裸 threading.Thread）。
+
+    返回 Future。handler 内部异常会被吞掉并记日志，避免污染池。
+    """
+    def _wrapped():
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            log(f"handler {getattr(fn, '__name__', fn)} err: {e}")
+    return _handler_pool.submit(_wrapped)
 
 
 # ---------------------------------------------------------------------------

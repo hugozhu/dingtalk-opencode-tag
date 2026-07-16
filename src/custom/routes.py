@@ -19,7 +19,7 @@ if SRC_DIR not in sys.path:
 
 import threading
 
-from core.agent_common import log
+from core.agent_common import log, submit_handler
 from custom.handler import handle_message, match_business_line
 
 
@@ -57,9 +57,7 @@ def route_business_line(line):
     m = match_business_line(line)
     if m:
         mid, convs = m
-        threading.Thread(
-            target=handle_message, args=(mid, convs), daemon=True
-        ).start()
+        submit_handler(handle_message, mid, convs)
         return True
     return False
 
