@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  agent-template.plist — launchd agent 配置模板
+
+  提炼自: dingtalk-opencode-agent/com.hugozhu.opencode-connect.plist (v4.1)
+  原作者: hugozhu
+
+  关键字段:
+    KeepAlive={SuccessfulExit:false}  - exit 0 不拉起（等人工），崩溃/被杀会拉起
+    RunAtLoad=true                    - 开机/登录时自动启动
+    ThrottleInterval=10                - 10 秒内不重复拉起（防崩溃循环）
+
+  安装:
+    cp agent-template.plist ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
+    # 编辑 Label / ProgramArguments / PATH / 环境变量
+    launchctl load -w ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
+
+  卸载:
+    launchctl unload ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
+
+  手动重启:
+    launchctl kickstart -k gui/$(id -u)/com.<your-org>.<your-agent>
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.agent-connect</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/path/to/your/project/bin/core/monitor.sh</string>
+        <string>--foreground</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/path/to/your/project/monitor.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/path/to/your/project/monitor.log</string>
+
+    <!-- launchd 环境最小 PATH（含项目用到的 CLI 路径） -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/youruser/.local/bin</string>
+        <!-- 项目特定环境变量 -->
+        <key>AGENT_TIMEOUT_MS</key>
+        <string>1800000</string>
+    </dict>
+</dict>
+</plist>

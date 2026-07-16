@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 本项目本地配置（含真实凭据，勿提交）
+config/config.local.json
+config/constants.local.sh
+
+# 运行时日志 / PID
+*.log
+*.pid
+agent-connect.log
+monitor.log

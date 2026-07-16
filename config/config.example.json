@@ -1,0 +1,52 @@
+{
+  "_comment": "数字员工项目配置示例 — 复制为 config.json 填入真实值",
+  "identity": {
+    "robot_code": "your-robot-code",
+    "user_id": "your-user-id",
+    "profile": "your-profile",
+    "launchd_label": "com.example.agent-connect"
+  },
+  "paths": {
+    "project_dir": "/path/to/your/project",
+    "agent_workdir_basename": "your-agent-workdir",
+    "connect_log": "/path/to/your/project/agent-connect.log",
+    "monitor_log": "/path/to/your/project/monitor.log"
+  },
+  "daemon": {
+    "check_interval_seconds": 1800,
+    "max_failures_before_circuit_break": 3,
+    "warmup_timeout_seconds": 60,
+    "kickstart_retry_interval_seconds": 10,
+    "throttle_interval_seconds": 10
+  },
+  "healthcheck": {
+    "log_inactivity_threshold_seconds": 2100,
+    "checks": {
+      "connect": {"severity": "hard"},
+      "log_activity": {"severity": "warn"},
+      "log_fatal": {"severity": "hard"},
+      "event_watcher": {"severity": "warn"},
+      "serve": {"severity": "hard"},
+      "serve_http": {"severity": "hard"}
+    }
+  },
+  "vision": {
+    "proxy_url": "http://localhost:4000/v1",
+    "proxy_key": "sk-xxxx",
+    "model": "gemini-3.1-flash-image"
+  },
+  "inject_template": {
+    "poll_max_seconds": 60,
+    "poll_interval_seconds": 5,
+    "asked_ts_buffer_ms": 5000
+  },
+  "cleanup_state_machine": {
+    "ttl_seconds": 40,
+    "states": ["awaiting_spurious", "cleaning"]
+  },
+  "_notes": [
+    "复制为 config.local.json 后填真实值（被 .gitignore 忽略）",
+    "launchd plist 单独配置（见 bin/agent-template.plist）",
+    "用户在 src/custom/handler.py 实现具体业务逻辑"
+  ]
+}
