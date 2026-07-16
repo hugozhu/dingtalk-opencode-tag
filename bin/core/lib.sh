@@ -56,8 +56,10 @@ _cleanup_pidfile() {
     local fallback="${4:-}"
     if [[ -f "$pid_file" ]]; then
         if ! verify_pid "$pid_file" "$pattern" "$fallback"; then
+            local old_pid
+            old_pid=$(cat "$pid_file" 2>/dev/null)
             rm -f "$pid_file"
-            log "  $name: pid=$(cat "$pid_file" 2>/dev/null) 失效或被复用，删除"
+            log "  $name: pid=$old_pid 失效或被复用，删除"
         fi
     fi
 }
