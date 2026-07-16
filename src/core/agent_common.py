@@ -28,21 +28,64 @@ import urllib.error
 import urllib.request
 
 # ---------------------------------------------------------------------------
-# Constants — 用户在 config/config.json 里覆盖
+# Config loading — config/config.local.json（真实值）覆盖占位默认
+#
+# 优先级（从高到低）: 环境变量 > config.local.json > config.example.json > 硬编码默认
+# 这样 FDE 填了 config.local.json 就能真正生效（此前该文件从没被读取）。
+# ---------------------------------------------------------------------------
+
+_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config")
+
+
+def _load_config_file():
+    """读 config.local.json（优先）或 config.example.json，返回扁平 dict 或 {}。"""
+    for name in ("config.local.json", "config.example.json"):
+        path = os.path.join(_CONFIG_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+_CONFIG = _load_config_file()
+
+
+def _cfg(env_key, *json_path, default=""):
+    """取配置值：环境变量优先，然后 config.json 的嵌套路径，最后 default。"""
+    if env_key and os.environ.get(env_key) is not None:
+        return os.environ[env_key]
+    node = _CONFIG
+    for key in json_path:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(key)
+        if node is None:
+            return default
+    return node if node is not None else default
+
+
+# ---------------------------------------------------------------------------
+# Constants — 环境变量 > config.local.json > 默认
 # ---------------------------------------------------------------------------
 
 # 机器人/数字员工身份（用于 send_notification 用机器人身份发消息）
-ROBOT_CODE = os.environ.get("AGENT_ROBOT_CODE", "your-robot-code")
-USER_ID = os.environ.get("AGENT_USER_ID", "your-user-id")
-PROFILE = os.environ.get("AGENT_PROFILE", "default-profile")
+ROBOT_CODE = _cfg("AGENT_ROBOT_CODE", "identity", "robot_code", default="your-robot-code")
+USER_ID = _cfg("AGENT_USER_ID", "identity", "user_id", default="your-user-id")
+PROFILE = _cfg("AGENT_PROFILE", "identity", "profile", default="default-profile")
 
 # 视觉/多模态模型（经代理服务调用）
-PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:4000/v1")
-PROXY_KEY = os.environ.get("PROXY_KEY", "sk-1234")
-VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-3.1-flash-image")
+PROXY_URL = _cfg("PROXY_URL", "vision", "proxy_url", default="http://localhost:4000/v1")
+PROXY_KEY = _cfg("PROXY_KEY", "vision", "proxy_key", default="sk-1234")
+VISION_MODEL = _cfg("VISION_MODEL", "vision", "model", default="gemini-3.1-flash-image")
 
 # session.directory 含此子串的就是数字员工用的会话（按 --agent-workdir 设置）
-_BOT_DIR_SUBSTR = os.environ.get("AGENT_BOT_DIR_SUBSTR", "your-agent-workdir")
+_BOT_DIR_SUBSTR = _cfg("AGENT_BOT_DIR_SUBSTR", "paths", "agent_workdir_basename",
+                       default="your-agent-workdir")
 
 # 注入模板轮询参数（测试 patch 为 0）
 _INJECT_POLL_MAX_SECONDS = 60
