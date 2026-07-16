@@ -180,9 +180,9 @@ handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在
 | `.serve.pid` | opencode serve 进程 PID |
 | `.serve.port` | opencode serve 监听端口 |
 | `.serve.pwd` | opencode serve 的 OPENCODE_SERVER_PASSWORD |
-| `.serve-watcher.pid` | serve-watcher 后台进程 PID |
+| `.watcher.pid` | serve-watcher 后台进程 PID |
 | `.event-watcher.pid` | event-watcher 后台进程 PID |
-| `.monitor.pid` | monitor 守护进程 PID |
+| `/tmp/agent-monitor.lock` | monitor 守护进程单实例锁（含 PID） |
 | `.next-check` | 下次自检的 Unix 时间戳 |
 | `.opencode-connect-status.json` | 最近一次健康检查结果 |
 

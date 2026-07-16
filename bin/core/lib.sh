@@ -95,3 +95,18 @@ log() {
     ts=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[${ts}] [${COMPONENT_NAME:-monitor}] $*" >&2
 }
+
+# ---------------------------------------------------------------------------
+# 组件清单单一真相源 — monitor.sh / reboot.sh / healthcheck.sh 共享，避免命名漂移
+#   COMP_NAMES：组件名（下划线，对应 start_<name> 函数）
+#   COMP_PID_BASENAMES：对应 PID 文件名（相对 SCRIPT_DIR）
+#   COMP_PATTERNS：cmdline 签名（verify_pid / pkill 用）
+# 顺序一一对应。改这里三个脚本同步生效。
+# ---------------------------------------------------------------------------
+HARNESS_COMP_NAMES=("serve" "connect" "watcher" "event_watcher")
+HARNESS_COMP_PID_BASENAMES=(".serve.pid" ".connect.pid" ".watcher.pid" ".event-watcher.pid")
+HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "serve-watcher\.sh" "event-watcher\.py")
+
+# monitor 自身的运行时状态文件（reboot 清理时用）
+HARNESS_MONITOR_LOCK="${LOCK_FILE:-/tmp/agent-monitor.lock}"
+HARNESS_EXTRA_STATE_BASENAMES=(".next-check" ".serve.port" ".serve.pwd" ".opencode-connect-status.json")
