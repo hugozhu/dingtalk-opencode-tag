@@ -51,6 +51,10 @@ cp config/constants.sh config/constants.local.sh
 #   - 在 route_reply 里实现文本回复分发
 #   - 在 route_business_line 里扩展业务消息检测
 
+# 4b. 实现组件启动命令（编辑 bin/custom/start_funcs.sh）
+#   - 必须实现 start_connect（数字员工核心连接进程的真实命令）
+#   - 可选覆盖 start_watcher；start_event_watcher 已有 core 默认实现
+
 # 5. 装 launchd agent（macOS）
 cp bin/custom/agent-template.plist ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
 # 编辑 plist：Label / ProgramArguments / StandardOutPath / PATH

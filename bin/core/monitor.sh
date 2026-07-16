@@ -26,6 +26,13 @@ source "$SCRIPT_DIR/bin/core/lib.sh"
 
 COMPONENT_NAME="monitor"
 
+# 加载可配置常量（真实值在 config/constants.local.sh，被 .gitignore 忽略）
+if [[ -f "$SCRIPT_DIR/config/constants.local.sh" ]]; then
+    source "$SCRIPT_DIR/config/constants.local.sh"
+elif [[ -f "$SCRIPT_DIR/config/constants.sh" ]]; then
+    source "$SCRIPT_DIR/config/constants.sh"
+fi
+
 # 可配置常量（被 config/constants.sh 覆盖）
 : "${CHECK_INTERVAL:=1800}"           # 健康检查间隔（秒）
 : "${MAX_FAILURES:=3}"               # 连续失败熔断阈值
@@ -33,10 +40,15 @@ COMPONENT_NAME="monitor"
 : "${LOCK_FILE:=/tmp/agent-monitor.lock}"
 
 # 组件配置：每个组件 = PID 文件 + cmdline 签名 + 启动函数
-# 数组下标约定：COMP_NAMES / COMP_PID_FILES / COMP_PATTERNS / COMP_START_FUNCS
-COMP_NAMES=("connect" "watcher" "event-watcher")
+# 数组下标约定：COMP_NAMES / COMP_PID_FILES / COMP_PATTERNS
+# 注意：COMP_NAMES 用下划线（bash 函数名不能含连字符），对应 start_<name> 函数
+COMP_NAMES=("connect" "watcher" "event_watcher")
 COMP_PID_FILES=("$SCRIPT_DIR/.connect.pid" "$SCRIPT_DIR/.watcher.pid" "$SCRIPT_DIR/.event-watcher.pid")
 COMP_PATTERNS=("agent-connect.*--unified-app-id" "serve-watcher\.sh" "event-watcher\.py")
+
+# 加载组件启动函数（core 默认 + custom 覆盖）。定义 start_connect / start_watcher /
+# start_event_watcher，被 start_all / 兜底拉起调用。
+source "$SCRIPT_DIR/bin/core/start_funcs.sh"
 
 # 进程检测：是否在运行
 is_running() {
