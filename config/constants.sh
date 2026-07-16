@@ -30,3 +30,10 @@ export VISION_MODEL="${VISION_MODEL:-gemini-3.1-flash-image}"
 
 # --- 业务特定（用户扩展）---
 # 在这里加自己的业务常量
+
+# --- dws event connect（bin/custom/dws-connect.sh）---
+# 敏感值：真实的群 conversationId / profile 填在 config/constants.local.sh（gitignored），
+# 不要写进本模板文件。
+export DWS_EVENT_KEY="${DWS_EVENT_KEY:-user_im_message_receive_group}"
+export DWS_EVENT_GROUP="${DWS_EVENT_GROUP:-}"   # 群 openConversationId（敏感，勿提交）
+export DWS_PROFILE="${DWS_PROFILE:-}"           # 组织 profile（敏感，勿提交）

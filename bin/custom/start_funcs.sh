@@ -34,3 +34,26 @@
 # }
 
 # event_watcher 通常沿用 core 默认实现，无需覆盖。
+
+# ---------------------------------------------------------------------------
+# connect 组件：dws event consume（订阅指定群消息）→ bridge → CONNECT_LOG
+# 群 conversationId / profile 从环境变量读取（见 config/constants.local.sh，gitignored）
+# ---------------------------------------------------------------------------
+
+# connect 进程的 cmdline 签名改为 dws-connect.sh（默认模式 agent-connect 匹配不到本实现）。
+# 注意：verify_pid 的 cmdline 校验是**字面子串**匹配，模式里不要写正则转义 '\.'
+# （'\.' 会当字面反斜杠，永远匹配不到）。'.' 作字面子串即可，pgrep 兜底也仍匹配。
+# COMP_PATTERNS 在 monitor.sh 里已按下标赋值，connect 是 index 1（serve=0）。
+# HARNESS_COMP_NAMES 顺序: serve connect watcher event_watcher
+for _i in "${!COMP_NAMES[@]}"; do
+    if [[ "${COMP_NAMES[$_i]}" == "connect" ]]; then
+        COMP_PATTERNS[$_i]='dws-connect.sh'
+        break
+    fi
+done
+
+# start_connect — 拉起 dws-connect.sh（内部跑 dws event consume | bridge 管道）
+start_connect() {
+    _spawn "$SCRIPT_DIR/.connect.pid" "$CONNECT_LOG" \
+        bash "$SCRIPT_DIR/bin/custom/dws-connect.sh"
+}
