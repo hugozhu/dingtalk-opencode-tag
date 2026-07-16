@@ -400,6 +400,7 @@ def connect_sse():
 # ---------------------------------------------------------------------------
 
 def main():
+    global running
     log(f"event-watcher 启动 - 无限重试 + 自动重连")
     stop_flag = threading.Event()
 
@@ -413,8 +414,8 @@ def main():
     except KeyboardInterrupt:
         log("收到 KeyboardInterrupt，退出")
     finally:
-        stop_flag.set()
         running = False
+        stop_flag.set()
 
 
 if __name__ == "__main__":
