@@ -288,6 +288,34 @@ def _write_state_file(basename, value):
         log(f"write state {basename} err: {e}")
 
 
+# AGENT_DEBUG=1 时，每次 serve 请求成功也打访问日志；否则成功静默、仅错误恒打。
+_SERVE_DEBUG = os.environ.get("AGENT_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
+
+
+def _serve_urlopen(req, timeout):
+    """urlopen 包一层 [serve] 访问日志：从 req 取 method+path，记状态码与耗时。
+
+    - 成功：仅 AGENT_DEBUG=1 时打（`[serve] GET /session → 200 (12ms)`），平时静默不刷屏。
+    - 失败（HTTPError / 其它异常）：**恒打**一行含 method/path/错误/耗时，然后原样重抛，
+      交给各调用点已有的 try/except 处理（返回默认值）。不改变任何控制流。
+    返回 urlopen 的响应对象（body 仍由调用方 read）。
+    """
+    method = req.get_method()
+    path = req.selector
+    t0 = time.time()
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+        if _SERVE_DEBUG:
+            log(f"[serve] {method} {path} → {r.status} ({int((time.time() - t0) * 1000)}ms)")
+        return r
+    except urllib.error.HTTPError as e:
+        log(f"[serve] {method} {path} → HTTP {e.code} ({int((time.time() - t0) * 1000)}ms)")
+        raise
+    except Exception as e:
+        log(f"[serve] {method} {path} → ERR {type(e).__name__}: {e} ({int((time.time() - t0) * 1000)}ms)")
+        raise
+
+
 def _find_bot_session():
     """找数字员工当前会话（directory 含 _BOT_DIR_SUBSTR，time.updated 最新的）。
 
@@ -302,7 +330,7 @@ def _find_bot_session():
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/session",
             headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
+        r = _serve_urlopen(req, 8)
         data = json.loads(r.read().decode("utf-8"))
         sessions = data if isinstance(data, list) else data.get("data", [])
         bot = None
@@ -339,7 +367,7 @@ def _find_session_with_predicate(predicate, asked_ts_ms=None, max_candidates=8):
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/session",
             headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
+        r = _serve_urlopen(req, 8)
         data = json.loads(r.read().decode("utf-8"))
         sessions = data if isinstance(data, list) else data.get("data", [])
         candidates = [s for s in sessions if _BOT_DIR_SUBSTR in (s.get("directory", "") or "")]
@@ -379,7 +407,7 @@ def _create_session(title="agent-default"):
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
             method="POST",
         )
-        r = urllib.request.urlopen(req, timeout=10)
+        r = _serve_urlopen(req, 10)
         d = json.loads(r.read().decode("utf-8"))
         sid = d.get("id")
         if sid:
@@ -404,7 +432,7 @@ def _post_user_message(full_sid, text):
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
             method="POST",
         )
-        r = urllib.request.urlopen(req, timeout=180)
+        r = _serve_urlopen(req, 180)
         d = json.loads(r.read().decode("utf-8"))
         return d.get("info", {}).get("id") or None
     except Exception as e:
@@ -422,7 +450,7 @@ def _get_message_text(full_sid, msg_id):
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/session/{full_sid}/message",
             headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
+        r = _serve_urlopen(req, 8)
         data = json.loads(r.read().decode("utf-8"))
         msgs = data if isinstance(data, list) else data.get("data", [])
         for m in msgs:
@@ -444,7 +472,7 @@ def _list_session_messages(full_sid):
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/session/{full_sid}/message",
             headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
+        r = _serve_urlopen(req, 8)
         data = json.loads(r.read().decode("utf-8"))
         return data if isinstance(data, list) else data.get("data", [])
     except Exception as e:
@@ -464,7 +492,7 @@ def _delete_session_message(full_sid, msg_id):
             headers={"Authorization": f"Basic {auth}"},
             method="DELETE",
         )
-        r = urllib.request.urlopen(req, timeout=6)
+        r = _serve_urlopen(req, 6)
         return r.status == 200
     except urllib.error.HTTPError as e:
         log(f"delete_session_message HTTP {e.code}")
@@ -488,7 +516,7 @@ def _session_action(full_sid, action, body=None):
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
             method="POST",
         )
-        r = urllib.request.urlopen(req, timeout=6)
+        r = _serve_urlopen(req, 6)
         return r.status == 200
     except urllib.error.HTTPError as e:
         log(f"session_action {action} HTTP {e.code}")
