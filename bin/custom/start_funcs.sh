@@ -53,7 +53,31 @@ for _i in "${!COMP_NAMES[@]}"; do
 done
 
 # start_connect — 拉起 dws-connect.sh（内部跑 dws event consume | bridge 管道）
+# CONNECT_LOG 兜底：monitor.sh 是 set -u 且不定义 CONNECT_LOG，裸引用会 unbound→杀死
+# monitor（2026-07-17 混沌测试实测：connect 死后 monitor 首次调 start_connect 即崩）。
+# 默认值与 dws-connect.sh 内部的 `: "${CONNECT_LOG:=...}"` 保持一致。
 start_connect() {
-    _spawn "$SCRIPT_DIR/.connect.pid" "$CONNECT_LOG" \
+    _spawn "$SCRIPT_DIR/.connect.pid" "${CONNECT_LOG:-$SCRIPT_DIR/agent-connect.log}" \
         bash "$SCRIPT_DIR/bin/custom/dws-connect.sh"
+}
+
+# ---------------------------------------------------------------------------
+# start_serve — opencode serve（SSE /event 源）。覆盖 core 的告警占位实现。
+#
+# 为什么必须实现：healthcheck 对 serve / serve_http 硬失败。若不实现，monitor 的
+# stop_all→start_all 自愈路径会调 core 默认 start_serve（return 1），而 monitor.sh
+# 是 set -e —— 非零返回会让 monitor 自己退出，整个守护链崩塌（2026-07-17 实测事故）。
+# 逻辑与 start-digital-employee.sh 的 serve 块一致：生成随机密码 + 写 .serve.{port,pwd}
+# 供 healthcheck check_serve_http 和 event_watcher find_serve_credentials 发现。
+# ---------------------------------------------------------------------------
+start_serve() {
+    local port="${SERVE_PORT:-4096}"
+    local pwd
+    pwd="$(openssl rand -hex 16)"
+    echo "$port" > "$SCRIPT_DIR/.serve.port"
+    echo "$pwd"  > "$SCRIPT_DIR/.serve.pwd"
+    chmod 600 "$SCRIPT_DIR/.serve.pwd"
+    OPENCODE_SERVER_PASSWORD="$pwd" _spawn "$SCRIPT_DIR/.serve.pid" \
+        "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
+        opencode serve --port "$port" --hostname 127.0.0.1
 }
