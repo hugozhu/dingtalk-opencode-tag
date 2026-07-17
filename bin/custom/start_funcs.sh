@@ -81,3 +81,14 @@ start_serve() {
         "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
         opencode serve --port "$port" --hostname 127.0.0.1
 }
+
+# ---------------------------------------------------------------------------
+# start_watcher — serve-watcher（opencode serve 快速探活 + 秒级单独重拉）。
+# 覆盖 core 的空实现。cmdline 含 "serve-watcher.sh"，命中 HARNESS_COMP_PATTERNS 的
+# watcher 项，故 monitor is_running 能匹配到（否则空实现下 monitor 每轮误判"watcher 死亡"
+# 兜底拉起 → 刷屏，2026-07-17 实测）。补齐 monitor 5min 体检之间的 serve 盲区。
+# ---------------------------------------------------------------------------
+start_watcher() {
+    _spawn "$SCRIPT_DIR/.watcher.pid" "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
+        bash "$SCRIPT_DIR/bin/custom/serve-watcher.sh"
+}
