@@ -9,8 +9,8 @@
 # 的 5min 体检、或自身抖动同时重拉出两个 serve 抢 4096 端口。复用 start_serve（与
 # start-digital-employee.sh / monitor 同一份 serve 启动逻辑，写 .serve.port/.serve.pwd）。
 #
-# 由 monitor 的 start_watcher 托管（见 bin/custom/start_funcs.sh）；cmdline 含
-# "serve-watcher.sh"，对应 HARNESS_COMP_PATTERNS 的 watcher 项，故 monitor 能 is_running 到它。
+# 由 monitor 的 start_serve_watcher 托管（见 bin/custom/start_funcs.sh）；cmdline 含
+# "serve-watcher.sh"，对应 HARNESS_COMP_PATTERNS 的 serve_watcher 项，故 monitor 能 is_running 到它。
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

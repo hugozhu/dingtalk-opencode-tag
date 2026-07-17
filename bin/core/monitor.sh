@@ -49,7 +49,7 @@ for _b in "${HARNESS_COMP_PID_BASENAMES[@]}"; do
     COMP_PID_FILES+=("$SCRIPT_DIR/$_b")
 done
 
-# 加载组件启动函数（core 默认 + custom 覆盖）。定义 start_connect / start_watcher /
+# 加载组件启动函数（core 默认 + custom 覆盖）。定义 start_connect / start_serve_watcher /
 # start_event_watcher，被 start_all / 兜底拉起调用。
 source "$SCRIPT_DIR/bin/core/start_funcs.sh"
 
@@ -133,7 +133,7 @@ run_forever() {
         if run_healthcheck; then
             log "健康检查通过"
             fail_count=0
-            # 兜底拉起：watcher 死亡 30 分钟内自愈
+            # 兜底拉起：serve_watcher 死亡 30 分钟内自愈
             for i in "${!COMP_NAMES[@]}"; do
                 if ! is_running "$i"; then
                     log "${COMP_NAMES[$i]} 死亡，兜底拉起"

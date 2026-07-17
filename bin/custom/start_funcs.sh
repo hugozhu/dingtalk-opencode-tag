@@ -7,7 +7,7 @@
 # 可用助手: _spawn <pid_file> <log_file> <cmd...>
 # 可用变量: SCRIPT_DIR / CONNECT_LOG / MONITOR_LOG
 #
-# 约定的组件（见 monitor.sh 的 COMP_NAMES）: serve / connect / watcher / event_watcher
+# 约定的组件（见 monitor.sh 的 COMP_NAMES）: serve / connect / serve_watcher / event_watcher
 
 # 示例：opencode serve 进程（替换为你的真实命令）
 # healthcheck 对 serve 硬失败，必须实现本函数，且写出 .serve.port / .serve.pwd。
@@ -28,8 +28,8 @@
 # }
 
 # 示例：serve 日志监控（可选）
-# start_watcher() {
-#     _spawn "$SCRIPT_DIR/.watcher.pid" "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
+# start_serve_watcher() {
+#     _spawn "$SCRIPT_DIR/.serve-watcher.pid" "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
 #         bash "$SCRIPT_DIR/bin/custom/serve-watcher.sh"
 # }
 
@@ -44,7 +44,7 @@
 # 注意：verify_pid 的 cmdline 校验是**字面子串**匹配，模式里不要写正则转义 '\.'
 # （'\.' 会当字面反斜杠，永远匹配不到）。'.' 作字面子串即可，pgrep 兜底也仍匹配。
 # COMP_PATTERNS 在 monitor.sh 里已按下标赋值，connect 是 index 1（serve=0）。
-# HARNESS_COMP_NAMES 顺序: serve connect watcher event_watcher
+# HARNESS_COMP_NAMES 顺序: serve connect serve_watcher event_watcher
 for _i in "${!COMP_NAMES[@]}"; do
     if [[ "${COMP_NAMES[$_i]}" == "connect" ]]; then
         COMP_PATTERNS[$_i]='dws-connect.sh'
@@ -83,12 +83,13 @@ start_serve() {
 }
 
 # ---------------------------------------------------------------------------
-# start_watcher — serve-watcher（opencode serve 快速探活 + 秒级单独重拉）。
+# start_serve_watcher — serve-watcher（opencode serve 快速探活 + 秒级单独重拉）。
 # 覆盖 core 的空实现。cmdline 含 "serve-watcher.sh"，命中 HARNESS_COMP_PATTERNS 的
-# watcher 项，故 monitor is_running 能匹配到（否则空实现下 monitor 每轮误判"watcher 死亡"
-# 兜底拉起 → 刷屏，2026-07-17 实测）。补齐 monitor 5min 体检之间的 serve 盲区。
+# serve_watcher 项，故 monitor is_running 能匹配到（否则空实现下 monitor 每轮误判
+# "serve_watcher 死亡"兜底拉起 → 刷屏，2026-07-17 实测）。补齐 monitor 5min 体检之间的
+# serve 盲区。
 # ---------------------------------------------------------------------------
-start_watcher() {
-    _spawn "$SCRIPT_DIR/.watcher.pid" "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
+start_serve_watcher() {
+    _spawn "$SCRIPT_DIR/.serve-watcher.pid" "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
         bash "$SCRIPT_DIR/bin/custom/serve-watcher.sh"
 }

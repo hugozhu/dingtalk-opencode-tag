@@ -122,8 +122,8 @@ log() {
 #   反斜杠永远匹配不到；'.' 在子串与 pgrep/pkill 正则里都能命中真实的 '.'。
 # 顺序一一对应。改这里三个脚本同步生效。
 # ---------------------------------------------------------------------------
-HARNESS_COMP_NAMES=("serve" "connect" "watcher" "event_watcher")
-HARNESS_COMP_PID_BASENAMES=(".serve.pid" ".connect.pid" ".watcher.pid" ".event-watcher.pid")
+HARNESS_COMP_NAMES=("serve" "connect" "serve_watcher" "event_watcher")
+HARNESS_COMP_PID_BASENAMES=(".serve.pid" ".connect.pid" ".serve-watcher.pid" ".event-watcher.pid")
 HARNESS_COMP_PATTERNS=("opencode serve" "dws-connect.sh" "serve-watcher.sh" "event_watcher.py")
 
 # monitor 自身的运行时状态文件（reboot 清理时用）

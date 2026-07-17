@@ -43,10 +43,10 @@ start_connect() {
     return 1
 }
 
-# start_watcher — serve 日志监控（**业务特定，FDE 在 custom 覆盖**）
+# start_serve_watcher — serve 快速探活看门狗（**业务特定，FDE 在 custom 覆盖**）
 # 默认实现为空跳过（serve-watcher 是可选组件）。
-start_watcher() {
-    log "  start_watcher 使用默认空实现（如需 serve-watcher，请在 custom 覆盖）"
+start_serve_watcher() {
+    log "  start_serve_watcher 使用默认空实现（如需 serve-watcher，请在 custom 覆盖）"
     return 0
 }
 

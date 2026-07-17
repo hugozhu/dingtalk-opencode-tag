@@ -20,7 +20,7 @@ COMPONENT_NAME="healthcheck"
 
 # 加载组件配置
 : "${CONNECT_PID_FILE:=$SCRIPT_DIR/.connect.pid}"
-: "${WATCHER_PID_FILE:=$SCRIPT_DIR/.watcher.pid}"
+: "${SERVE_WATCHER_PID_FILE:=$SCRIPT_DIR/.serve-watcher.pid}"
 : "${EVENT_WATCHER_PID_FILE:=$SCRIPT_DIR/.event-watcher.pid}"
 : "${SERVE_PID_FILE:=$SCRIPT_DIR/.serve.pid}"
 : "${SERVE_PORT_FILE:=$SCRIPT_DIR/.serve.port}"
