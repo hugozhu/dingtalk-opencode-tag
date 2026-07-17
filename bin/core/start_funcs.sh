@@ -12,15 +12,18 @@
 #
 # 变量来自 monitor.sh: SCRIPT_DIR / COMP_PID_FILES / CONNECT_LOG 等。
 
-# _spawn <pid_file> <log_file> <cmd...> — 通用拉起助手（nohup + disown + 写 pid）
+# _spawn <pid_file> <log_file> <cmd...> — 通用拉起助手（setsid + 写真实 pid）
+# 用 setsid 让被拉起进程成为独立 session/进程组 leader（pgid==pid），这样后续
+# `kill -9 -PID` 能整组带走它 fork 出的子进程（如 connect 的 dws consume + bridge），
+# 不留孤儿。否则 monitor 自愈起的进程会继承 monitor 的 pgid、非组 leader，组杀失效
+# → 回退单杀 → 子进程被 reparent 到 init 成孤儿（2026-07-17 实测：混沌自愈后残留重复消费者）。
+# `bash -c 'echo $$>pid; exec CMD'`：进程写下自己的 $$ 后 exec 成 CMD，pidfile 即真实 pid，
+# 避开 $!/pgrep 抓到 setsid 包裹进程的坑（与 start-digital-employee.sh 的 spawn 同法）。
 _spawn() {
     local pid_file="$1"; shift
     local log_file="$1"; shift
-    nohup "$@" >>"$log_file" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$pid_file"
-    disown "$pid" 2>/dev/null || true
-    log "  spawned pid=$pid → $pid_file (cmd: $1)"
+    setsid bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pid_file" "$@" >>"$log_file" 2>&1 &
+    log "  spawned → $pid_file (cmd: $1)"
 }
 
 # start_serve — opencode serve 进程（**业务特定，FDE 在 custom 覆盖**）

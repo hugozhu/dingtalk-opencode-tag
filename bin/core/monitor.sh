@@ -190,7 +190,10 @@ main() {
     start_all
     sleep 3
     warmup
-    bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
+    # 启动自检仅作信息展示：set -e 下裸跑，若此刻有硬失败组件 down（healthcheck 返回 1）
+    # 会让 monitor 启动即自杀，根本进不到能修复它的 run_forever——恰恰在最该守护时失守。
+    # 故设为非致命；真正的检测+重启由 run_forever 负责（其 healthcheck 在 if 条件里，set -e 安全）。
+    bash "$SCRIPT_DIR/bin/core/healthcheck.sh" || true
     future_epoch "$CHECK_INTERVAL" > "$SCRIPT_DIR/.next-check"
 
     case "${1:---foreground}" in
