@@ -50,18 +50,21 @@ _OPENCODE_LOG = os.environ.get(
 # brain 现在与 event_watcher 的 SSE 循环同进程共享内存：brain 在托管 serve 上建的
 # 临时 session 会在 SSE 流里冒出 session.status/idle 事件，若不区分会触发 core
 # format_and_forward 的"收到新请求/会话完成"业务通知（刷屏）。这里登记 brain 自己的
-# session id，供 custom.routes.route_sse_event 抑制这些事件（不影响合并转发业务 session）。
-# 有界 + FIFO：即使 idle 事件在 brain 删完 session 后才被 SSE 线程处理，也仍能命中。
+# session id（连同来源会话 conv 上下文），供：
+#   - custom.routes.route_sse_event 抑制这些事件（不影响合并转发业务 session）；
+#   - question 能力把 question.asked / 答案路由回**来源群**（事件只有 sessionID，无 conv_id）。
+# 值是 ctx dict（含 conv_id/conv_type），无 ctx 时为 {}。有界 + FIFO。
 _TEXTREPLY_SIDS = OrderedDict()
 _TEXTREPLY_SIDS_MAX = 256
 _textreply_lock = threading.Lock()
 
 
-def _register_textreply_sid(sid):
+def _register_textreply_sid(sid, ctx=None):
+    """登记 brain 临时 session；ctx 可含来源会话（conv_id/conv_type）供事件回程路由。"""
     if not sid:
         return
     with _textreply_lock:
-        _TEXTREPLY_SIDS[sid] = None
+        _TEXTREPLY_SIDS[sid] = dict(ctx or {})
         while len(_TEXTREPLY_SIDS) > _TEXTREPLY_SIDS_MAX:
             _TEXTREPLY_SIDS.popitem(last=False)
 
@@ -75,6 +78,18 @@ def is_textreply_session(sid):
         return False
     with _textreply_lock:
         return sid in _TEXTREPLY_SIDS
+
+
+def session_conv(sid):
+    """取某 session 登记的来源会话 ctx（{conv_id, conv_type, ...}）；未登记返回 None。
+
+    question 能力用它把 question.asked / 答案路由回来源群。
+    """
+    if not sid:
+        return None
+    with _textreply_lock:
+        v = _TEXTREPLY_SIDS.get(sid)
+        return dict(v) if v is not None else None
 # 系统提示词（proxy/opencode 后端），可用环境变量覆盖
 _SYSTEM_PROMPT = os.environ.get(
     "AGENT_SYSTEM_PROMPT",
@@ -173,7 +188,7 @@ def _brain_opencode(user, text, ctx, raw=False):
     请求异常时无缝回退到一次性子进程，保证收发闭环永远有回复。
     """
     prompt = text if raw else f"{user}：{text}"
-    reply = _brain_opencode_http(prompt)
+    reply = _brain_opencode_http(prompt, ctx=ctx)
     if reply is not None:
         return reply
     # HTTP 不可用（serve 没起/凭据缺失/异常）→ 回退 CLI
@@ -201,11 +216,15 @@ def _serve_request(method, port, pwd, path, body=None, timeout=8):
     return json.loads(raw) if raw.strip() else None
 
 
-def _brain_opencode_http(prompt):
+def _brain_opencode_http(prompt, ctx=None):
     """走 opencode serve HTTP 生成回复。
 
     流程：发现 serve 凭据 → 建临时 session → POST message（带 system + model）→
     拼 text parts → best-effort 删 session（保持与 CLI 一样的无状态语义，避免 session 堆积）。
+
+    ctx（含 conv_id/conv_type）登记到 session 注册表，供 question 能力把 agent 提问/答案
+    路由回来源群。若该轮 agent 调 question 工具，POST 会阻塞到用户答复（另一线程 POST
+    reply 解阻塞），故 timeout 需覆盖等待答案的时间。
 
     Returns: 回复文本（可能空串）；serve 不可用/出错返回 None（交给调用方回退 CLI）。
     """
@@ -221,8 +240,8 @@ def _brain_opencode_http(prompt):
         sid = (created or {}).get("id")
         if not sid:
             raise RuntimeError("create session 无 id")
-        # 登记为 brain 临时 session，让 route_sse_event 抑制其 SSE 业务通知
-        _register_textreply_sid(sid)
+        # 登记为 brain 临时 session（带来源会话 ctx）：抑制 SSE 业务通知 + question 回程路由
+        _register_textreply_sid(sid, ctx)
         d = _serve_request(
             "POST", port, pwd, f"/session/{sid}/message",
             {
