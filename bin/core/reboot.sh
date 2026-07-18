@@ -36,7 +36,10 @@ sleep 1
 
 log "停止所有组件..."
 for _pat in "${HARNESS_COMP_PATTERNS[@]}"; do
-    pkill -f "$_pat" 2>/dev/null || true
+    # 连子进程一起杀（子在前），否则 connect 管道的 dws consume / bridge 会成孤儿
+    for _pid in $(pgrep -f "$_pat" 2>/dev/null); do
+        kill_tree "$_pid" TERM
+    done
 done
 
 # 清状态文件（组件 PID + monitor 锁 + 额外运行时状态），全部从 lib.sh 单一真相源派生

@@ -39,6 +39,13 @@ fi
 : "${WARMUP_TIMEOUT:=60}"            # warmup 超时
 : "${LOCK_FILE:=/tmp/agent-monitor.lock}"
 
+# 组件日志路径 —— start_funcs.sh 的 start_* 函数引用（如 start_connect 用 CONNECT_LOG、
+# start_serve/start_event_watcher 用 MONITOR_LOG）。必须在 source start_funcs.sh 之前
+# 定义并 export，否则冷启动真正调 start_connect 时 set -u 会因未绑定变量崩溃。
+: "${MONITOR_LOG:=$SCRIPT_DIR/monitor.log}"
+: "${CONNECT_LOG:=$SCRIPT_DIR/agent-connect.log}"
+export MONITOR_LOG CONNECT_LOG
+
 # 组件配置：从 lib.sh 的单一真相源派生（避免与 reboot.sh/healthcheck.sh 命名漂移）
 # COMP_NAMES 用下划线（bash 函数名不能含连字符），对应 start_<name> 函数
 # serve 也纳入托管：healthcheck 对 serve 硬失败，必须有人拉起（否则熔断循环）
@@ -82,13 +89,24 @@ start_all() {
     done
 }
 
-# stop_all: 杀掉所有组件
+# stop_all: 杀掉所有组件（含管道子进程，避免孤儿）
 stop_all() {
     log "停止残留进程..."
+    local pattern pid
+    # 第一轮 SIGTERM：按模式找到每个组件进程，连同其子进程一起杀（子在前）。
+    # 只 pkill 父进程会把 connect 管道的 dws consume / bridge 甩成孤儿继续跑。
     for pattern in "${COMP_PATTERNS[@]}"; do
-        pkill -f "$pattern" 2>/dev/null || true
+        for pid in $(pgrep -f "$pattern" 2>/dev/null); do
+            kill_tree "$pid" TERM
+        done
     done
     sleep 2
+    # 第二轮 SIGKILL 兜底：TERM 没死透的（含忽略 SIGTERM 的进程）强杀。
+    for pattern in "${COMP_PATTERNS[@]}"; do
+        for pid in $(pgrep -f "$pattern" 2>/dev/null); do
+            kill_tree "$pid" KILL
+        done
+    done
     for f in "${COMP_PID_FILES[@]}"; do
         rm -f "$f"
     done
@@ -125,11 +143,26 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT
 
+# 可被信号打断的 sleep：把长 sleep 切成小块。
+# bash 在前台 sleep 期间收到已 trap 的信号会**推迟** trap 到该 sleep 结束才执行
+# （sleep 子进程本身没收到信号，会睡满）。直接 `sleep $CHECK_INTERVAL` 会导致
+# SIGTERM 最长要等一整个检查周期才响应（停服务卡住）。切成 5s 小块后，trap 最多
+# 延迟 ~5s 就能触发 cleanup 退出。
+_interruptible_sleep() {
+    local remaining="$1"
+    local step=5
+    while [[ "$remaining" -gt 0 ]]; do
+        [[ "$remaining" -lt "$step" ]] && step="$remaining"
+        sleep "$step"
+        remaining=$((remaining - step))
+    done
+}
+
 # 主循环
 run_forever() {
     local fail_count=0
     while true; do
-        sleep "$CHECK_INTERVAL"
+        _interruptible_sleep "$CHECK_INTERVAL"
         if run_healthcheck; then
             log "健康检查通过"
             fail_count=0
