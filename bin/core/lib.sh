@@ -105,7 +105,7 @@ log() {
 # ---------------------------------------------------------------------------
 HARNESS_COMP_NAMES=("serve" "connect" "watcher" "event_watcher")
 HARNESS_COMP_PID_BASENAMES=(".serve.pid" ".connect.pid" ".watcher.pid" ".event-watcher.pid")
-HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "serve-watcher\.sh" "event-watcher\.py")
+HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "serve-watcher\.sh" "event_watcher.py")
 
 # monitor 自身的运行时状态文件（reboot 清理时用）
 HARNESS_MONITOR_LOCK="${LOCK_FILE:-/tmp/agent-monitor.lock}"
