@@ -105,6 +105,12 @@ class TestHandleForward(unittest.TestCase):
         # prompt 里应包含解析出的内层消息内容
         self.assertIn("probe-fulldata", prompt)
         self.assertIn("未找到相关代码", prompt)
+        # 语境头 + 末句指令都在（明确这是合并转发聊天记录）
+        self.assertIn("转发了一段聊天记录", prompt)
+        self.assertIn("合并转发", prompt)
+        # raw=True：brain 不再拼 "{user}：" 前缀
+        self.assertTrue(gen.call_args.kwargs.get("raw"))
+        self.assertFalse(prompt.startswith("hugozhu："))
         # 回复发回来源群
         snd.assert_called_once()
         self.assertEqual(snd.call_args[0][0], "cid==")
