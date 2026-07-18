@@ -16,6 +16,11 @@
 # healthcheck 对 serve 硬失败，必须写出 .serve.pid / .serve.port / .serve.pwd。
 # 端口可用 config/constants.local.sh 的 OPENCODE_SERVE_PORT 覆盖；密码优先复用已存在
 # 的 .serve.pwd（重启 serve 时保持凭据稳定，避免 in-flight 请求 401）。
+#
+# AGENT_DEBUG 开启时：给 opencode serve 加 --print-logs --log-level（默认 DEBUG），
+# 把 serve 自身日志打到独立文件 serve.log（默认 $SCRIPT_DIR/serve.log，可用
+# AGENT_SERVE_LOG 覆盖），便于排查 serve 侧问题；不污染 monitor.log。级别可用
+# AGENT_SERVE_LOG_LEVEL 覆盖（DEBUG|INFO|WARN|ERROR）。关闭时 serve 静默，日志入 monitor.log。
 # ---------------------------------------------------------------------------
 start_serve() {
     local port="${OPENCODE_SERVE_PORT:-4096}"
@@ -27,11 +32,22 @@ start_serve() {
     [[ -z "$pw" ]] && pw="$(openssl rand -hex 16)"
     echo "$port" > "$SCRIPT_DIR/.serve.port"
     echo "$pw"   > "$pwd_file"
+
+    # serve 启动参数（AGENT_DEBUG 时加日志开关）
+    local serve_args=(serve --port "$port" --hostname 127.0.0.1)
+    local serve_log="${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}"
+    case "$(printf '%s' "${AGENT_DEBUG:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on)
+            serve_args+=(--print-logs --log-level "${AGENT_SERVE_LOG_LEVEL:-DEBUG}")
+            serve_log="${AGENT_SERVE_LOG:-$SCRIPT_DIR/serve.log}"
+            ;;
+    esac
+
     # OPENCODE_SERVER_PASSWORD 让 serve 要求 Basic auth(opencode:<pwd>)，与
     # healthcheck check_serve_http / agent_common.find_serve_credentials 约定一致。
     OPENCODE_SERVER_PASSWORD="$pw" _spawn "$SCRIPT_DIR/.serve.pid" \
-        "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
-        "${AGENT_OPENCODE_BIN:-opencode}" serve --port "$port" --hostname 127.0.0.1
+        "$serve_log" \
+        "${AGENT_OPENCODE_BIN:-opencode}" "${serve_args[@]}"
 }
 
 # event_watcher 通常沿用 core 默认实现，无需覆盖。
