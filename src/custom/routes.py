@@ -22,7 +22,7 @@ import threading
 
 from core.agent_common import log, submit_handler
 from custom.handler import handle_message, match_business_line
-from custom.brain import generate_reply
+from custom.brain import generate_reply, is_textreply_session
 from custom.replier import send_reply
 
 # 从 raw_line 提取 convId / msgId（bridge 写的格式：... convId=X msgId=Y)）
@@ -127,9 +127,14 @@ def route_sse_event(event, port, password):
     被 core/event_watcher.py 的 connect_sse 在收到每个 SSE 事件时调用。
     返回 True 表示已处理，core 不再做默认转发；返回 False 走 core 默认逻辑。
 
-    FDE 一般不需要改这里（默认转发逻辑在 core/format_and_forward 里）。
-    仅当需要自定义事件过滤/转换时实现本函数返回 True。
+    这里抑制 brain 文本回复临时 session 的事件：brain 现在走 serve HTTP 生成回复，
+    与 SSE 循环同进程共享 serve，其临时 session 会在 SSE 流冒出 session.status/idle，
+    若不拦截会触发 core 的"收到新请求/会话完成"业务通知刷屏。合并转发业务 session
+    不在登记表里，照常走 core 默认转发。
     """
+    sid = (event.get("properties", {}) or {}).get("sessionID", "") or ""
+    if is_textreply_session(sid):
+        return True  # brain 文本回复 session，吞掉，不发业务通知
     return False
 
 

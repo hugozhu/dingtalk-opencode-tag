@@ -23,6 +23,10 @@ if SRC_DIR not in sys.path:
 
 from custom import brain, replier, routes
 
+# 测试隔离：把 opencode 调用日志重定向到临时文件，避免污染项目根的运行时 opencode.log
+import tempfile
+brain._OPENCODE_LOG = os.path.join(tempfile.gettempdir(), "opencode_test.log")
+
 
 class TestBrainEcho(unittest.TestCase):
     def test_ping(self):
@@ -44,8 +48,12 @@ class TestBrainEcho(unittest.TestCase):
             self.assertTrue(out.endswith("…（已截断）"))
 
 
-class TestBrainOpencode(unittest.TestCase):
-    """opencode 后端：mock subprocess，验证 JSON 事件解析（不依赖真实 opencode）。"""
+class TestBrainOpencodeCliFallback(unittest.TestCase):
+    """opencode 后端的 CLI 回退路径：serve 不可用时走 `opencode run`。
+
+    强制 find_serve_credentials 返回空 → _brain_opencode_http 返回 None → 回退 CLI，
+    再 mock subprocess 验证 JSON 事件解析（不依赖真实 opencode / serve）。
+    """
 
     def _events(self, *texts):
         lines = [json.dumps({"type": "step_start", "part": {}})]
@@ -57,12 +65,14 @@ class TestBrainOpencode(unittest.TestCase):
     def test_concatenates_text_events(self):
         fake = MagicMock(returncode=0, stdout=self._events("苹果,", "香蕉,", "橙子"), stderr="")
         with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(None, None, None)), \
              patch("subprocess.run", return_value=fake):
             self.assertEqual(brain.generate_reply("u", "列水果"), "苹果,香蕉,橙子")
 
     def test_nonzero_rc_returns_empty(self):
         fake = MagicMock(returncode=1, stdout="", stderr="boom")
         with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(None, None, None)), \
              patch("subprocess.run", return_value=fake):
             self.assertEqual(brain.generate_reply("u", "hi"), "")
 
@@ -70,8 +80,61 @@ class TestBrainOpencode(unittest.TestCase):
         fake = MagicMock(returncode=0,
                          stdout=self._events("答案") + "\nnot-json-line", stderr="")
         with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(None, None, None)), \
              patch("subprocess.run", return_value=fake):
             self.assertEqual(brain.generate_reply("u", "q"), "答案")
+
+
+class TestBrainOpencodeHttp(unittest.TestCase):
+    """opencode 后端的 HTTP 优先路径：走 serve /session，不碰 CLI 子进程。"""
+
+    def _serve_side_effect(self, calls):
+        """按 (method, path) 返回假响应，并把调用记进 calls 供断言。"""
+        def fake(method, port, pwd, path, body=None, timeout=8):
+            calls.append((method, path, body))
+            if method == "POST" and path == "/session":
+                return {"id": "ses_test"}
+            if method == "POST" and path.endswith("/message"):
+                return {"parts": [{"type": "text", "text": "2"}]}
+            return None  # DELETE
+        return fake
+
+    def test_http_path_returns_reply_without_cli(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve_side_effect(calls)), \
+             patch("subprocess.run") as mock_run:
+            self.assertEqual(brain.generate_reply("hugozhu", "1+1"), "2")
+            mock_run.assert_not_called()  # HTTP 成功不应回退 CLI
+
+    def test_http_body_has_nested_model_and_system(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free"), \
+             patch.object(brain, "_SYSTEM_PROMPT", "SYS"), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve_side_effect(calls)):
+            brain.generate_reply("hugozhu", "1+1")
+        msg_calls = [c for c in calls if c[0] == "POST" and c[1].endswith("/message")]
+        self.assertEqual(len(msg_calls), 1)
+        body = msg_calls[0][2]
+        self.assertEqual(body["model"], {"providerID": "opencode", "modelID": "deepseek-v4-flash-free"})
+        self.assertEqual(body["system"], "SYS")
+        self.assertEqual(body["parts"][0]["text"], "hugozhu：1+1")
+        # 建了 session 就要删（无状态语义，避免堆积）
+        self.assertTrue(any(c[0] == "DELETE" for c in calls))
+
+    def test_http_error_falls_back_to_cli(self):
+        fake = MagicMock(returncode=0,
+                         stdout=json.dumps({"type": "text", "part": {"text": "cli-2"}}),
+                         stderr="")
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=RuntimeError("boom")), \
+             patch("subprocess.run", return_value=fake) as mock_run:
+            self.assertEqual(brain.generate_reply("u", "1+1"), "cli-2")
+            mock_run.assert_called_once()  # HTTP 抛错 → 回退 CLI
 
 
 class TestReplierLogMode(unittest.TestCase):
@@ -153,6 +216,24 @@ class TestRouteReply(unittest.TestCase):
              patch.object(routes, "send_reply") as s:
             routes._handle_text_reply("张三", "x", "2", "cid==", "msg==")
             s.assert_not_called()
+
+
+class TestTextreplySessionSuppression(unittest.TestCase):
+    """brain 临时 session 的 SSE 事件应被 route_sse_event 抑制（不发业务通知）。"""
+
+    def _evt(self, sid):
+        return {"type": "session.idle", "properties": {"sessionID": sid}}
+
+    def test_registered_sid_suppressed(self):
+        brain._register_textreply_sid("ses_brain_1")
+        self.assertTrue(routes.route_sse_event(self._evt("ses_brain_1"), 4096, "pw"))
+
+    def test_business_sid_not_suppressed(self):
+        # 未登记的（合并转发业务）session 照常走 core 默认转发
+        self.assertFalse(routes.route_sse_event(self._evt("ses_business_x"), 4096, "pw"))
+
+    def test_empty_sid_not_suppressed(self):
+        self.assertFalse(routes.route_sse_event(self._evt(""), 4096, "pw"))
 
 
 if __name__ == "__main__":

@@ -9,29 +9,28 @@
 #
 # 约定的组件（见 monitor.sh 的 COMP_NAMES）: serve / connect / watcher / event_watcher
 
-# 示例：opencode serve 进程（替换为你的真实命令）
-# healthcheck 对 serve 硬失败，必须实现本函数，且写出 .serve.port / .serve.pwd。
-# start_serve() {
-#     local port=4096
-#     local pwd="$(openssl rand -hex 16)"
-#     echo "$port" > "$SCRIPT_DIR/.serve.port"
-#     echo "$pwd"  > "$SCRIPT_DIR/.serve.pwd"
-#     AGENT_SERVER_PASSWORD="$pwd" _spawn "$SCRIPT_DIR/.serve.pid" \
-#         "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
-#         agent-serve --port "$port"
-# }
-
-# 示例：数字员工核心连接进程（替换为你的真实命令）
-# start_connect() {
-#     _spawn "$SCRIPT_DIR/.connect.pid" "$CONNECT_LOG" \
-#         dws dev connect --unified-app-id your-app-id --agent-workdir "$SCRIPT_DIR"
-# }
-
-# 示例：serve 日志监控（可选）
-# start_watcher() {
-#     _spawn "$SCRIPT_DIR/.watcher.pid" "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
-#         bash "$SCRIPT_DIR/bin/custom/serve-watcher.sh"
-# }
+# ---------------------------------------------------------------------------
+# serve 组件：托管 opencode serve
+#   - brain(opencode) 走 HTTP 生成回复（POST /session/{id}/message），省 CLI 冷启动
+#   - 合并转发业务路径也用它（agent_common.inject_and_forward）
+# healthcheck 对 serve 硬失败，必须写出 .serve.pid / .serve.port / .serve.pwd。
+# 端口可用 config/constants.local.sh 的 OPENCODE_SERVE_PORT 覆盖；密码优先复用已存在
+# 的 .serve.pwd（重启 serve 时保持凭据稳定，避免 in-flight 请求 401）。
+# ---------------------------------------------------------------------------
+start_serve() {
+    local port="${OPENCODE_SERVE_PORT:-4096}"
+    local pwd_file="$SCRIPT_DIR/.serve.pwd"
+    local pw
+    pw="$(cat "$pwd_file" 2>/dev/null)"
+    [[ -z "$pw" ]] && pw="$(openssl rand -hex 16)"
+    echo "$port" > "$SCRIPT_DIR/.serve.port"
+    echo "$pw"   > "$pwd_file"
+    # OPENCODE_SERVER_PASSWORD 让 serve 要求 Basic auth(opencode:<pwd>)，与
+    # healthcheck check_serve_http / agent_common.find_serve_credentials 约定一致。
+    OPENCODE_SERVER_PASSWORD="$pw" _spawn "$SCRIPT_DIR/.serve.pid" \
+        "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
+        "${AGENT_OPENCODE_BIN:-opencode}" serve --port "$port" --hostname 127.0.0.1
+}
 
 # event_watcher 通常沿用 core 默认实现，无需覆盖。
 
@@ -41,15 +40,17 @@
 # ---------------------------------------------------------------------------
 
 # connect 进程的 cmdline 签名改为 dws-connect.sh（默认模式 agent-connect 匹配不到本实现）。
+# serve 进程签名是 `opencode serve`（默认模式 agent-serve 也匹配不到），一并覆盖，
+# 否则 verify_pid 认定 serve 死亡 → monitor 反复兜底拉起 → 熔断循环。
 # 注意：verify_pid 的 cmdline 校验是**字面子串**匹配，模式里不要写正则转义 '\.'
 # （'\.' 会当字面反斜杠，永远匹配不到）。'.' 作字面子串即可，pgrep 兜底也仍匹配。
-# COMP_PATTERNS 在 monitor.sh 里已按下标赋值，connect 是 index 1（serve=0）。
-# HARNESS_COMP_NAMES 顺序: serve connect watcher event_watcher
+# COMP_PATTERNS 在 monitor.sh 里已按下标赋值。
+# HARNESS_COMP_NAMES 顺序: serve(0) connect(1) watcher(2) event_watcher(3)
 for _i in "${!COMP_NAMES[@]}"; do
-    if [[ "${COMP_NAMES[$_i]}" == "connect" ]]; then
-        COMP_PATTERNS[$_i]='dws-connect.sh'
-        break
-    fi
+    case "${COMP_NAMES[$_i]}" in
+        serve)   COMP_PATTERNS[$_i]='opencode serve' ;;
+        connect) COMP_PATTERNS[$_i]='dws-connect.sh' ;;
+    esac
 done
 
 # start_connect — 拉起 dws-connect.sh（内部跑 dws event consume | bridge 管道）

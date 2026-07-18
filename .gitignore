@@ -227,3 +227,7 @@ config/constants.local.sh
 agent-connect.log
 monitor.log
 start-digital-employee.sh
+
+# serve 运行时状态（.serve.pwd 含密码，务必不提交）
+.serve.port
+.serve.pwd
