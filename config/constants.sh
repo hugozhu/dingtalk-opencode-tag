@@ -70,6 +70,17 @@ export AGENT_REPLY_MODE="${AGENT_REPLY_MODE:-log}"
 # ⚠️ user 模式：回复以你本人身份发出，必须把你的真实显示名加进来（如 hugozhu）。
 export AGENT_SELF_NAMES="${AGENT_SELF_NAMES:-数字员工,Claude Code}"
 
+# --- 能力开关（src/custom/capabilities/，可组装/可选配）---
+# 每个能力一个 CAP_<NAME>_ENABLED 开关。1/true/yes/on=开，0/false/no/off=关；
+# 不设则用能力自带默认。关掉的能力压根不注册、不参与分发。
+export CAP_TEXT_REPLY_ENABLED="${CAP_TEXT_REPLY_ENABLED:-1}"   # 普通文本回复（brain→replier）
+export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（chatRecord）
+# 后续能力（issue #27/#28/#29）落地后在此追加：
+# export CAP_QUESTION_ENABLED="${CAP_QUESTION_ENABLED:-1}"     # Question 交互
+# export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别
+# export CAP_AGGREGATION_ENABLED="${CAP_AGGREGATION_ENABLED:-0}"  # 群消息聚合（默认关）
+
+
 # --- 调试 ---
 # AGENT_DEBUG=1 时：agent_common 每次 serve 请求成功也打 [serve] 访问日志到 monitor.log；
 # brain 每次 opencode 调用单独记一条到 opencode.log（transport=http|cli / model / 耗时 /

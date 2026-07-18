@@ -66,12 +66,17 @@ from core.agent_common import (
     log,
     send_notification,
 )
-from custom.routes import (
-    route_reply,
-    route_business_line,
-    route_sse_event,
-    route_cleanup_state,
+from core import inbound as _inbound
+from core.capabilities import (
+    classify_line as _cap_classify_line,
+    dispatch_inbound as _dispatch_inbound,
+    dispatch_sse as _dispatch_sse,
+    dispatch_cleanup as _dispatch_cleanup,
 )
+# import 触发业务能力注册（custom 层，可组装/可选配；见 src/custom/capabilities/）。
+# core 只认注册表，不认具体能力 —— 加/删能力不动本文件。
+import custom.capabilities  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -190,8 +195,8 @@ def format_and_forward(event, port=None, password=None):
             cleanup_state.pop(sid, None)
             log(f"cleanup 过期清理 sid={sid}")
             cs = None
-    # 下放给 custom：返回 True 表示 custom 已消费该事件（core 不再默认转发）
-    if route_cleanup_state(event, cleanup_state, cleanup_lock):
+    # 下放给能力：返回 True 表示某能力已消费该事件（core 不再默认转发）
+    if _dispatch_cleanup(event, cleanup_state, cleanup_lock):
         return True
 
     # ---- 收到新请求：session 变 busy 时第一时间通知 ----
@@ -327,17 +332,20 @@ def log_tail_thread(stop_flag):
                         log(f"recall: 检测到空回复 last_text={last_text[:50]!r}，派生 recall 线程")
                         threading.Thread(target=_recall_empty_reply, daemon=True).start()
 
-                # --- 业务路由：调用 custom.routes 注册的处理逻辑（FDE 不改这里）---
-                m = REPLY_RE.search(line)
-                if m:
-                    user, text, conv_type = m.group(1), m.group(2).strip(), m.group(3)
-                    if text.lower() == "/reboot":
-                        log(f"reboot: 命中 /reboot 指令 user={user}")
-                        threading.Thread(target=handle_reboot, args=(user,), daemon=True).start()
+                # --- 业务路由：解析成 InboundMessage → 能力注册表分发（FDE 不改这里）---
+                # 先给能力认领特殊格式（如合并转发 chatRecord，含跨行状态）；
+                # 没能力认领再回退 core 标准 "收到 @user: text" 解析。
+                msg = _cap_classify_line(line)
+                if msg is None:
+                    msg = _inbound.parse_line(line)
+                if msg is not None:
+                    if msg.kind == _inbound.KIND_REBOOT:
+                        # /reboot 由 core 直接处理（不是可关的业务能力）
+                        log(f"reboot: 命中 /reboot 指令 user={msg.user}")
+                        threading.Thread(target=handle_reboot, args=(msg.user,),
+                                         daemon=True).start()
                     else:
-                        route_reply(user, text, conv_type, line)
-                # 业务消息行路由（合并转发 / 业务特殊消息等）
-                route_business_line(line)
+                        _dispatch_inbound(msg)
             try:
                 f.close()
             except Exception:
@@ -378,8 +386,8 @@ def connect_sse():
                 try:
                     event = json.loads(data)
                     with sse_lock:
-                        # SSE 事件路由：custom 可拦截，返回 False 走 core 默认转发
-                        if not route_sse_event(event, port, pwd):
+                        # SSE 事件路由：能力可拦截，返回 False 走 core 默认转发
+                        if not _dispatch_sse(event, port, pwd):
                             format_and_forward(event, port=port, password=pwd)
                 except json.JSONDecodeError:
                     continue
