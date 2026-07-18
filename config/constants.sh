@@ -74,7 +74,10 @@ export AGENT_SELF_NAMES="${AGENT_SELF_NAMES:-数字员工,Claude Code}"
 # 每个能力一个 CAP_<NAME>_ENABLED 开关。1/true/yes/on=开，0/false/no/off=关；
 # 不设则用能力自带默认。关掉的能力压根不注册、不参与分发。
 export CAP_TEXT_REPLY_ENABLED="${CAP_TEXT_REPLY_ENABLED:-1}"   # 普通文本回复（brain→replier）
-export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（chatRecord）
+export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（chatRecord 聊天记录）
+# 合并转发检测正则（匹配 content 摘要特征）。DingTalk 合并转发 content 形如
+# "群聊的聊天记录\n..."；默认匹配"聊天记录"。命中后 list-by-ids 反查 forwardMessages 二次确认。
+# export CAP_FORWARD_SUMMARY_PATTERN="聊天记录"
 # 后续能力（issue #27/#28/#29）落地后在此追加：
 # export CAP_QUESTION_ENABLED="${CAP_QUESTION_ENABLED:-1}"     # Question 交互
 # export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别
