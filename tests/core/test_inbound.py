@@ -31,6 +31,13 @@ class TestParseLine(unittest.TestCase):
         m = inbound.parse_line(self._line("u", "[图片]", ctype=1))
         self.assertEqual(m.kind, KIND_IMAGE)
 
+    def test_image_marker_kind(self):
+        # event-consume 格式：[图片消息](mediaId=...)，可带 caption
+        m = inbound.parse_line(self._line("u", "[图片消息](mediaId=$abc)"))
+        self.assertEqual(m.kind, KIND_IMAGE)
+        m2 = inbound.parse_line(self._line("u", "[图片消息](mediaId=@x)看这里"))
+        self.assertEqual(m2.kind, KIND_IMAGE)
+
     def test_reboot_kind_case_insensitive(self):
         self.assertEqual(inbound.parse_line(self._line("u", "/reboot")).kind, KIND_REBOOT)
         self.assertEqual(inbound.parse_line(self._line("u", "/REBOOT")).kind, KIND_REBOOT)
