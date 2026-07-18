@@ -21,7 +21,9 @@ start_serve() {
     local port="${OPENCODE_SERVE_PORT:-4096}"
     local pwd_file="$SCRIPT_DIR/.serve.pwd"
     local pw
-    pw="$(cat "$pwd_file" 2>/dev/null)"
+    # || true：文件不存在时 cat 返回非零，set -e 下会杀掉 monitor（冷启动/reboot 清了
+    # .serve.pwd 后就没这文件）。吞掉失败，下面按空值重新生成。
+    pw="$(cat "$pwd_file" 2>/dev/null || true)"
     [[ -z "$pw" ]] && pw="$(openssl rand -hex 16)"
     echo "$port" > "$SCRIPT_DIR/.serve.port"
     echo "$pw"   > "$pwd_file"
