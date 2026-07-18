@@ -78,6 +78,10 @@ export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（c
 # 合并转发检测正则（匹配 content 摘要特征）。DingTalk 合并转发 content 形如
 # "群聊的聊天记录\n..."；默认匹配"聊天记录"。命中后 list-by-ids 反查 forwardMessages 二次确认。
 # export CAP_FORWARD_SUMMARY_PATTERN="聊天记录"
+# 合并转发注入 agent 的 prompt 末句指令（点明这是合并转发聊天记录 + 任务）。留空用内置默认。
+# export CAP_FORWARD_PROMPT_FOOTER="以上是一段钉钉「合并转发」的聊天记录，…请理解语境后回应/总结。"
+# 单条内层消息内容截断上限（防超长附件撑爆 prompt），默认 4000。
+# export CAP_FORWARD_ENTRY_MAX="4000"
 # 后续能力（issue #27/#28/#29）落地后在此追加：
 # export CAP_QUESTION_ENABLED="${CAP_QUESTION_ENABLED:-1}"     # Question 交互
 # export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别

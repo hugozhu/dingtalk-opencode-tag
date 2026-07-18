@@ -127,6 +127,16 @@ class TestBrainOpencodeHttp(unittest.TestCase):
         # 建了 session 就要删（无状态语义，避免堆积）
         self.assertTrue(any(c[0] == "DELETE" for c in calls))
 
+    def test_raw_skips_user_prefix(self):
+        # raw=True：text 已是完整 prompt，不拼 "{user}：" 前缀（合并转发用）
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve_side_effect(calls)):
+            brain.generate_reply("hugozhu", "完整的结构化 prompt", raw=True)
+        msg_calls = [c for c in calls if c[0] == "POST" and c[1].endswith("/message")]
+        self.assertEqual(msg_calls[0][2]["parts"][0]["text"], "完整的结构化 prompt")
+
     def test_http_error_falls_back_to_cli(self):
         fake = MagicMock(returncode=0,
                          stdout=json.dumps({"type": "text", "part": {"text": "cli-2"}}),

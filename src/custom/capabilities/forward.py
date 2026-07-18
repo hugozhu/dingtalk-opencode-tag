@@ -29,7 +29,7 @@ from core.agent_common import _run_cli, log, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
 from custom.brain import generate_reply
-from custom.handler import fetch_attachments, _fetch_senders, render_prompt
+from custom.handler import fetch_attachments, _fetch_senders
 from custom.replier import send_reply
 
 # 合并转发聊天记录的 content 摘要特征。DingTalk 合并转发（chatRecord）的 content 是一段
@@ -85,6 +85,54 @@ def _fetch_forward_body(msg_id):
     return body, (body.get("forwardMessages") or [])
 
 
+# 合并转发聊天记录 prompt 末句指令。点明"这是钉钉合并转发的聊天记录、含多方对话、
+# 图片/文件已识别转写"，比泛化的"请回应用户"更利于 agent 理解上下文。可用环境变量覆盖。
+_FORWARD_PROMPT_FOOTER = os.environ.get(
+    "CAP_FORWARD_PROMPT_FOOTER",
+    "以上是一段钉钉「合并转发」的聊天记录，包含多位参与者的对话，"
+    "其中图片、文件的内容已由系统识别/转写并内联在对应条目里。"
+    "请理解这段记录的完整语境（谁说了什么、讨论的主题、引用的图片/文件/链接），"
+    "然后对转发者的意图做出有帮助的回应或总结。",
+)
+
+# prompt 单条内容截断上限（防止单条超长附件把整个 prompt 撑爆）
+_FORWARD_ENTRY_MAX = int(os.environ.get("CAP_FORWARD_ENTRY_MAX", "4000"))
+
+
+def _build_forward_prompt(forwarder, fms, senders, attachments):
+    """组装合并转发的结构化 prompt（完整 input，供 brain raw=True 直接用）。
+
+    结构：
+        [语境头] 用户 X 转发了一段聊天记录（共 N 条），按时间顺序列出每条
+        [1] [时间] 发送人: 内容
+        ...
+        [语境尾] 明确这是合并转发的聊天记录 + 任务指令（_FORWARD_PROMPT_FOOTER）
+
+    每条 content 取 attachments[i].text（图片=识别描述、文件=正文、文本=原文），
+    单条过长按 _FORWARD_ENTRY_MAX 截断。
+    """
+    if not fms:
+        return None
+    senders = list(senders)
+    while len(senders) < len(fms):
+        senders.append("未知发送人")
+
+    lines = [
+        f"用户 {forwarder} 转发了一段聊天记录（共 {len(fms)} 条消息）。"
+        f"以下按时间顺序列出每一条（含发送人、时间、内容）：\n"
+    ]
+    for i, fm in enumerate(fms):
+        att = attachments[i] if i < len(attachments) else {}
+        t = att.get("time") or fm.get("createTime", "")
+        s = senders[i] if i < len(senders) else "未知发送人"
+        entry = (att.get("text") or fm.get("content", "") or "").strip()
+        if len(entry) > _FORWARD_ENTRY_MAX:
+            entry = entry[:_FORWARD_ENTRY_MAX] + "…（内容过长已截断）"
+        lines.append(f"[{i + 1}] [{t}] {s}: {entry}\n")
+    lines.append(_FORWARD_PROMPT_FOOTER)
+    return "\n".join(lines)
+
+
 def handle_forward(user, text, msg_id, conv_id, conv_type):
     """反查 forwardMessages → 解析 → 组装 prompt → brain 回复 → 发回来源群。
 
@@ -110,14 +158,14 @@ def handle_forward(user, text, msg_id, conv_id, conv_type):
     ]
     senders = _fetch_senders(fms, fallback)
     attachments = fetch_attachments(fms, lookup_convs=None)
-    # render_prompt 读 body["messages"]；把 forwardMessages 作为 messages 传入
-    prompt = render_prompt({"messages": fms}, senders, attachments, sender)
+    prompt = _build_forward_prompt(sender, fms, senders, attachments)
     if not prompt:
-        log(f"forward: render_prompt 为空 msgId={msg_id[:24]}")
+        log(f"forward: prompt 为空 msgId={msg_id[:24]}")
         return
 
-    # 走 brain（opencode serve HTTP）生成回复 → 发回来源群
-    reply = generate_reply(sender, prompt)
+    # 走 brain（opencode serve HTTP）生成回复 → 发回来源群。
+    # raw=True：prompt 已是完整结构化 input，brain 不要再拼 "{user}：" 前缀污染上下文。
+    reply = generate_reply(sender, prompt, raw=True)
     if reply:
         send_reply(conv_id, conv_type, reply)
     else:

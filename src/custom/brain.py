@@ -116,22 +116,24 @@ def _split_model(model):
     return "", (model or "")
 
 
-def generate_reply(user, text, ctx=None):
+def generate_reply(user, text, ctx=None, raw=False):
     """根据用户消息生成回复文本。返回空串 = 不回复。
 
     Args:
         user: 发送者展示名
         text: 消息正文（已 strip）
         ctx:  可选上下文 dict（conv_id / msg_id / conv_type 等）
+        raw:  True 时 text 已是**完整 prompt**，后端不再拼 "{user}：" 前缀
+              （合并转发等已自行组装结构化 prompt 的调用方用它，避免前缀污染上下文）
     """
     text = (text or "").strip()
     if not text:
         return ""
     try:
         if _BRAIN == "proxy":
-            reply = _brain_proxy(user, text, ctx)
+            reply = _brain_proxy(user, text, ctx, raw=raw)
         elif _BRAIN == "opencode":
-            reply = _brain_opencode(user, text, ctx)
+            reply = _brain_opencode(user, text, ctx, raw=raw)
         else:
             reply = _brain_echo(user, text, ctx)
     except Exception as e:
@@ -164,13 +166,13 @@ def _brain_echo(user, text, ctx):
 # opencode 后端 — HTTP 优先（serve 常驻，快）+ CLI 回退（serve 挂了也有回复）
 # ---------------------------------------------------------------------------
 
-def _brain_opencode(user, text, ctx):
+def _brain_opencode(user, text, ctx, raw=False):
     """opencode 大脑：优先走 serve HTTP，serve 不可用/出错时回退 `opencode run` CLI。
 
     HTTP 复用常驻 serve 进程，省掉每次 CLI 冷启动（实测 ~3x）；serve 未起/凭据缺失/
     请求异常时无缝回退到一次性子进程，保证收发闭环永远有回复。
     """
-    prompt = f"{user}：{text}"
+    prompt = text if raw else f"{user}：{text}"
     reply = _brain_opencode_http(prompt)
     if reply is not None:
         return reply
@@ -282,13 +284,14 @@ def _brain_opencode_cli(prompt):
 # proxy 后端 — 经 LLM /chat/completions
 # ---------------------------------------------------------------------------
 
-def _brain_proxy(user, text, ctx):
+def _brain_proxy(user, text, ctx, raw=False):
     """调用 LLM 生成回复（OpenAI 兼容 /chat/completions）。"""
+    user_content = text if raw else f"{user}：{text}"
     body = json.dumps({
         "model": _CHAT_MODEL,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": f"{user}：{text}"},
+            {"role": "user", "content": user_content},
         ],
     }).encode()
     req = urllib.request.Request(
