@@ -16,22 +16,37 @@
 开关：CAP_IMAGE_ENABLED（默认开）。优先级 40（先于合并转发 50 / 文本 100，图片检测最明确）。
 """
 
+import base64
+import json
 import os
 import re
 import tempfile
 import threading
+import urllib.request
 from collections import OrderedDict
 
-from core.agent_common import _proxy_vision, _run_cli, log, submit_handler
+from core.agent_common import _proxy_vision, _run_cli, find_serve_credentials, log, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_IMAGE
-from custom.brain import generate_reply
+from custom.brain import generate_reply, _register_textreply_sid
 from custom.replier import send_reply
 
 # 图片 mediaId 提取（content 形如 "[图片消息](mediaId=$xxx)"，ID 含 $@/_- 等，止于 )）
 _RE_MEDIA_ID = re.compile(r"mediaId=([^\s)]+)")
 # 去掉 content 里的图片标记，剩下的当用户 caption（"[图片消息](mediaId=x)看标红处" → "看标红处"）
 _RE_IMAGE_TAG = re.compile(r"\[图片消息\]\(mediaId=[^\s)]+\)")
+
+# 识别方式：优先经 opencode serve 用免费多模态模型识别（无需外部 proxy）；失败回退
+# agent_common._proxy_vision（外部 PROXY_URL）。AGENT_VISION_MODEL 是 provider/model 格式。
+_VISION_MODEL = os.environ.get("AGENT_VISION_MODEL", "")
+_VISION_TIMEOUT = int(os.environ.get("CAP_IMAGE_VISION_TIMEOUT", "90"))
+# 识别 prompt（要模型逐字提取文字 + 客观描述，不主观总结）
+_VISION_PROMPT = os.environ.get(
+    "CAP_IMAGE_VISION_PROMPT",
+    "请逐字提取这张图片中的所有文字内容（保持原始顺序、换行、标点，不要省略或总结）。"
+    "如果图片中没有文字，则客观描述图片内容（场景、物体、UI 元素、图表数据、颜色等），"
+    "不要做主观总结或解读。",
+)
 
 # 防回环：数字员工自己发的图不处理
 _SELF_NAMES = {
@@ -84,12 +99,86 @@ def _download_image(media_id, msg_id, conv_id):
     return None
 
 
+def _split_model(model):
+    """'provider/model' → (providerID, modelID)。无 '/' 时 provider 空。"""
+    if "/" in (model or ""):
+        p, _, m = model.partition("/")
+        return p, m
+    return "", (model or "")
+
+
+def _recognize_via_serve(img_bytes, mime="image/png"):
+    """经 opencode serve 用 AGENT_VISION_MODEL 识别图片，返回描述文本或 ""。
+
+    建临时 session → POST 一条含 file(image) + text 的 user 消息（阻塞到该轮完成）→
+    取 assistant 文本 → best-effort 删 session。免外部 proxy。
+    """
+    if not _VISION_MODEL:
+        return ""
+    pid, port, pwd = find_serve_credentials()
+    if not port:
+        log("image: serve 凭据缺失，serve 识别不可用")
+        return ""
+    provider, model_id = _split_model(_VISION_MODEL)
+    b64 = base64.b64encode(img_bytes).decode()
+    data_url = f"data:{mime};base64,{b64}"
+    auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
+
+    def _req(method, path, body=None, timeout=15):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                   data=data, headers=headers, method=method)
+        resp = urllib.request.urlopen(r, timeout=timeout)
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw.strip() else None
+
+    sid = None
+    try:
+        created = _req("POST", "/session", {"title": "agent-vision"}, timeout=10)
+        sid = (created or {}).get("id")
+        if not sid:
+            return ""
+        # 登记为 brain 抑制名单，避免 vision session 的 SSE 事件触发业务通知刷屏
+        _register_textreply_sid(sid)
+        d = _req("POST", f"/session/{sid}/message", {
+            "model": {"providerID": provider, "modelID": model_id},
+            "parts": [
+                {"type": "file", "mime": mime, "filename": "image", "url": data_url},
+                {"type": "text", "text": _VISION_PROMPT},
+            ],
+        }, timeout=_VISION_TIMEOUT) or {}
+        desc = "".join(
+            p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
+        ).strip()
+        if desc:
+            log(f"image: serve 识别成功 model={_VISION_MODEL} desc_len={len(desc)}")
+        return desc
+    except Exception as e:
+        log(f"image: serve 识别失败 model={_VISION_MODEL} err={e}")
+        return ""
+    finally:
+        if sid:
+            try:
+                _req("DELETE", f"/session/{sid}", timeout=6)
+            except Exception:
+                pass
+
+
 def _recognize(image_path):
-    """读图片字节 → vision 识别，返回描述文本（失败返回 ""）。用完删临时文件。"""
+    """读图片字节 → vision 识别，返回描述文本（失败返回 ""）。用完删临时文件。
+
+    优先经 opencode serve 用 AGENT_VISION_MODEL 识别（免外部 proxy）；空则回退
+    agent_common._proxy_vision（外部 PROXY_URL）。
+    """
+    mime = "image/jpeg" if image_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
     try:
         with open(image_path, "rb") as f:
             img_bytes = f.read()
-        return _proxy_vision(img_bytes)
+        desc = _recognize_via_serve(img_bytes, mime=mime)
+        if not desc:
+            desc = _proxy_vision(img_bytes)   # 回退外部 proxy
+        return desc
     except Exception as e:
         log(f"image: 识别读文件失败 {e}")
         return ""

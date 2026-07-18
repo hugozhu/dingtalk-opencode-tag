@@ -105,5 +105,38 @@ class TestHandleImage(unittest.TestCase):
         snd.assert_not_called()
 
 
+class TestRecognize(unittest.TestCase):
+    """_recognize 优先经 serve 识别，空则回退 _proxy_vision。"""
+
+    def _tmp_png(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.write(fd, b"\x89PNG\r\n\x1a\nfakebytes")
+        os.close(fd)
+        return path
+
+    def test_prefers_serve_over_proxy(self):
+        path = self._tmp_png()
+        with patch.object(image, "_recognize_via_serve", return_value="serve识别结果") as srv, \
+             patch.object(image, "_proxy_vision") as proxy:
+            desc = image._recognize(path)
+        self.assertEqual(desc, "serve识别结果")
+        srv.assert_called_once()
+        proxy.assert_not_called()            # serve 成功 → 不回退
+        self.assertFalse(os.path.exists(path))  # 用完删文件
+
+    def test_falls_back_to_proxy_when_serve_empty(self):
+        path = self._tmp_png()
+        with patch.object(image, "_recognize_via_serve", return_value=""), \
+             patch.object(image, "_proxy_vision", return_value="proxy识别结果") as proxy:
+            desc = image._recognize(path)
+        self.assertEqual(desc, "proxy识别结果")
+        proxy.assert_called_once()
+
+    def test_serve_disabled_when_no_model(self):
+        with patch.object(image, "_VISION_MODEL", ""):
+            self.assertEqual(image._recognize_via_serve(b"x"), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
