@@ -80,6 +80,13 @@ from custom.routes import (
 MIN_RECONNECT_INTERVAL = 3
 MAX_RECONNECT_INTERVAL = 30
 
+# SSE 读超时（秒）。opencode serve 的 /event 流每 ~10s 发一个 server.heartbeat；
+# 若读超时 <= 心跳间隔，每次读都在和心跳赛跑、经常刚好超时 → socket 中毒 →
+# "cannot read from timed out object" → 断开重连（每 ~10s 刷屏 + churn）。
+# 设成明显大于心跳间隔（默认 30s）：每次读都能先收到心跳、重置计时，连接长活；
+# 真的 >30s 没心跳（serve 挂了）才超时重连，正好当存活检测。可用环境变量覆盖。
+SSE_READ_TIMEOUT = int(os.environ.get("SSE_READ_TIMEOUT", "30"))
+
 # 主进程运行日志 + connect 进程日志（log-tail 监听这个）
 CONNECT_LOG = os.environ.get("CONNECT_LOG", os.path.join(PROJECT_ROOT, "agent-connect.log"))
 
@@ -126,8 +133,12 @@ def parse_sse_events(resp):
 
     直接读 http.client.HTTPResponse（urlopen 返回值）：它会**透明解码**
     chunked transfer-encoding，也支持 Content-Length，故无需手工解析十六进制块长，
-    也无需触碰底层 socket 私有属性。socket 超时（由 urlopen timeout 设定）触发时
-    继续循环（无数据 ≠ 断开），并检查 running 以便优雅退出。
+    也无需触碰底层 socket 私有属性。
+
+    读超时（SSE_READ_TIMEOUT）触发时**干净退出让上层重连**：CPython 的带缓冲 socket
+    读取器一旦超时就永久中毒（下次读必抛 OSError: cannot read from timed out object），
+    无法原地 continue 续读。正常情况下 serve 每 ~10s 发心跳，读永远在超时前拿到数据、
+    不会走到这里；真超时说明 serve 静默过久（挂了/网络断），break 触发重连即可。
     """
     buf = ""
     read = getattr(resp, "read1", None) or resp.read
@@ -135,7 +146,9 @@ def parse_sse_events(resp):
         try:
             chunk = read(8192)
         except socket.timeout:
-            continue
+            # serve 静默超过 SSE_READ_TIMEOUT（心跳都没了）→ socket 已中毒，断开重连
+            log("SSE 读超时（serve 静默过久），重连")
+            break
         except Exception as e:
             log(f"parse err: {e}")
             break
@@ -356,7 +369,7 @@ def connect_sse():
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/event",
                 headers={"Authorization": f"Basic {auth}", "Accept": "text/event-stream"})
-            r = urllib.request.urlopen(req, timeout=10)
+            r = urllib.request.urlopen(req, timeout=SSE_READ_TIMEOUT)
             log(f"SSE 已连接 serve port={port}")
             interval = MIN_RECONNECT_INTERVAL
             for data in parse_sse_events(r):
