@@ -22,6 +22,8 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from custom import brain, replier, routes
+from custom.capabilities import text_reply
+from core import inbound
 
 # 测试隔离：把 opencode 调用日志重定向到临时文件，避免污染项目根的运行时 opencode.log
 import tempfile
@@ -168,18 +170,22 @@ class TestReplierLogMode(unittest.TestCase):
             mock_run.assert_not_called()
 
 
-class TestRouteReply(unittest.TestCase):
-    def setUp(self):
-        routes._reply_seen.clear()
+class TestTextReplyCapability(unittest.TestCase):
+    """text_reply 能力：InboundMessage(kind=text) → 防回环 + 去重 + 提交大脑。"""
 
-    def _line(self, user, text, conv="cidXYZ==", mid="msg1=="):
-        return f"[connect] 收到 @{user}: {text} (convType=2 convId={conv} msgId={mid})"
+    def setUp(self):
+        text_reply._reply_seen.clear()
+
+    def _msg(self, user, text, conv="cidXYZ==", mid="msg1=="):
+        line = f"[connect] 收到 @{user}: {text} (convType=2 convId={conv} msgId={mid})"
+        return inbound.parse_line(line)
 
     def test_normal_message_dispatches(self):
         calls = []
-        with patch.object(routes, "submit_handler",
+        with patch.object(text_reply, "submit_handler",
                           side_effect=lambda fn, *a: calls.append(a)):
-            routes.route_reply("张三", "你好", "2", self._line("张三", "你好"))
+            consumed = text_reply.on_inbound(self._msg("张三", "你好"))
+        self.assertTrue(consumed)
         self.assertEqual(len(calls), 1)
         # args: user, text, conv_type, conv_id, msg_id
         self.assertEqual(calls[0][0], "张三")
@@ -188,34 +194,43 @@ class TestRouteReply(unittest.TestCase):
 
     def test_self_message_filtered(self):
         calls = []
-        with patch.object(routes, "_SELF_NAMES", {"数字员工"}), \
-             patch.object(routes, "submit_handler",
+        with patch.object(text_reply, "_SELF_NAMES", {"数字员工"}), \
+             patch.object(text_reply, "submit_handler",
                           side_effect=lambda fn, *a: calls.append(a)):
-            routes.route_reply("数字员工", "你好", "2", self._line("数字员工", "你好"))
-        self.assertEqual(calls, [])  # 自己发的被过滤
+            consumed = text_reply.on_inbound(self._msg("数字员工", "你好"))
+        self.assertTrue(consumed)      # 消费掉（不再往下传）
+        self.assertEqual(calls, [])    # 但不提交大脑（自己发的）
 
     def test_duplicate_msgid_dedup(self):
         calls = []
-        with patch.object(routes, "submit_handler",
+        with patch.object(text_reply, "submit_handler",
                           side_effect=lambda fn, *a: calls.append(a)):
-            line = self._line("张三", "你好", mid="dupmsg==")
-            routes.route_reply("张三", "你好", "2", line)
-            routes.route_reply("张三", "你好", "2", line)
+            m = self._msg("张三", "你好", mid="dupmsg==")
+            text_reply.on_inbound(m)
+            text_reply.on_inbound(self._msg("张三", "你好", mid="dupmsg=="))
         self.assertEqual(len(calls), 1)  # 第二次去重
 
     def test_handle_text_reply_calls_brain_and_replier(self):
-        with patch.object(routes, "generate_reply", return_value="生成的回复") as g, \
-             patch.object(routes, "send_reply", return_value=True) as s:
-            routes._handle_text_reply("张三", "问题", "2", "cid==", "msg==")
+        with patch.object(text_reply, "generate_reply", return_value="生成的回复") as g, \
+             patch.object(text_reply, "send_reply", return_value=True) as s:
+            text_reply._handle_text_reply("张三", "问题", "2", "cid==", "msg==")
             g.assert_called_once()
             s.assert_called_once()
             self.assertEqual(s.call_args[0][2], "生成的回复")
 
     def test_empty_brain_reply_not_sent(self):
-        with patch.object(routes, "generate_reply", return_value=""), \
-             patch.object(routes, "send_reply") as s:
-            routes._handle_text_reply("张三", "x", "2", "cid==", "msg==")
+        with patch.object(text_reply, "generate_reply", return_value=""), \
+             patch.object(text_reply, "send_reply") as s:
+            text_reply._handle_text_reply("张三", "x", "2", "cid==", "msg==")
             s.assert_not_called()
+
+    def test_route_reply_shim_still_works(self):
+        """兼容垫片 routes.route_reply 仍能派发（走 InboundMessage → 能力）。"""
+        calls = []
+        with patch.object(text_reply, "submit_handler",
+                          side_effect=lambda fn, *a: calls.append(a)):
+            routes.route_reply("张三", "你好", "2", self._msg("张三", "你好").raw_line)
+        self.assertEqual(len(calls), 1)
 
 
 class TestTextreplySessionSuppression(unittest.TestCase):

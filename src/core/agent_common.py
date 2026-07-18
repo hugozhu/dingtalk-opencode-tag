@@ -75,6 +75,28 @@ def _cfg(env_key, *json_path, default=""):
     return node if node is not None else default
 
 
+_TRUE_TOKENS = ("1", "true", "yes", "on")
+_FALSE_TOKENS = ("0", "false", "no", "off", "")
+
+
+def env_flag(key, default=False):
+    """统一布尔环境变量解析。1/true/yes/on → True；0/false/no/off/空 → False。
+
+    未设置该变量时返回 default。能力开关（CAP_<NAME>_ENABLED）等用它，避免各处
+    自己写 `os.environ.get(...) == "1"` 口径不一。
+    """
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in _TRUE_TOKENS:
+        return True
+    if v in _FALSE_TOKENS:
+        return False
+    return default
+
+
+
 # ---------------------------------------------------------------------------
 # Constants — 环境变量 > config.local.json > 默认
 # ---------------------------------------------------------------------------

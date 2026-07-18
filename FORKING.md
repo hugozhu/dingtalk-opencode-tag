@@ -53,27 +53,52 @@ cp config/constants.sh config/constants.local.sh
 
 6. **`make_reply_msgs`**（在 `inject_and_forward` 调用里）：构造自己的通知消息格式。注意：reply 不要被 `_md` 的 `**...**` 包裹。
 
-### Step 4: 注册业务路由
+### Step 4: 写一个能力插件（capability）
 
-编辑 `src/custom/routes.py`（**不要改 `src/core/event_watcher.py`**）：
+业务能力都是 `src/custom/capabilities/` 下**可组装、可选配**的插件。加一个能力 =
+写一个模块 + 在 `capabilities/__init__.py` import 它。**不要改 `src/core/`。**
+
+一个能力就是一个 `Capability`，声明它挂哪些 hook（都可选）：
 
 ```python
-def route_reply(user, text, conv_type, raw_line):
-    # 在这里实现文本回复的分发
-    if text == "[图片]":
-        threading.Thread(target=handle_image, args=(time.time(),), daemon=True).start()
-    elif match_business_line(raw_line):
-        mid, convs = match_business_line(raw_line)
-        threading.Thread(target=handle_message, args=(mid, convs), daemon=True).start()
-    else:
-        handle_reply(user, text)
+# src/custom/capabilities/my_cap.py
+from core.agent_common import submit_handler
+from core.capabilities import Capability, register
+from core.inbound import InboundMessage, KIND_TEXT, KIND_FORWARD
 
-def route_business_line(line):
-    # 默认实现已处理合并转发，按需扩展
-    ...
+def on_inbound(msg):           # 处理入站消息（InboundMessage）
+    # msg.user / msg.text / msg.conv_id / msg.msg_id / msg.kind / msg.raw_line
+    submit_handler(my_handler, msg.msg_id)
+    return True                # True=已消费，registry 不再往下传；False=放行给后续能力
+
+def classify_line(line):       # 可选：识别本能力的特殊日志格式（如合并转发 chatRecord）
+    ...                        # 返回 InboundMessage 或 None；core 只认标准 "收到 @user" 格式
+
+def on_sse_event(event, port, pwd):   # 可选：拦截 serve SSE 事件
+    return False
+def on_cleanup(event, state, lock):   # 可选：spurious 轮次清理状态机
+    return False
+
+CAPABILITY = Capability(
+    name="my_cap",                     # 开关变量 CAP_MY_CAP_ENABLED
+    on_inbound=on_inbound,
+    handles_kinds={KIND_TEXT},         # 只吃这些 kind；空集=全部
+    classify_line=classify_line,       # 不需要就不传
+    priority=50,                       # 小的先；catch-all 文本回复用 100 兜底
+    default_enabled=True,
+)
+register(CAPABILITY)
 ```
 
-`core/event_watcher.py` 的 `log_tail_thread` 会调用这两个函数，FDE 不需要碰 core。
+然后在 `src/custom/capabilities/__init__.py` 加一行 `from custom.capabilities import my_cap`。
+
+- **分发**：core 的 log-tail 把每行解析成 `InboundMessage`，按 `priority` 依次交给启用
+  能力，短路于第一个返回 True 的。SSE / cleanup 同理。
+- **开关**：`CAP_<NAME>_ENABLED`（constants.local.sh）。关掉的能力不注册、不参与。
+- **顺序**：`priority` 小的先跑（如 Question 交互要先于 catch-all 文本回复拦截用户答案）。
+- `src/custom/routes.py` 是**兼容垫片**（旧的 route_* 转调注册表），新增能力不用碰它。
+
+`core/event_watcher.py` 只认注册表，FDE 永不碰 core → upstream 修复能干净 merge。
 
 ### Step 5: 替换通知后端
 

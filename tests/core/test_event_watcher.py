@@ -48,10 +48,11 @@ class TestParseSSEEvents(unittest.TestCase):
         resp = _FakeResp([b'data: {"b":', b'2}\n'])
         self.assertEqual(list(event_watcher.parse_sse_events(resp)), ['{"b":2}'])
 
-    def test_timeout_is_not_disconnect(self):
-        # 中途 timeout 应继续读，不中断
+    def test_timeout_breaks_for_reconnect(self):
+        # timeout 表示 serve 静默过久（心跳都没了）→ socket 已中毒，break 让上层重连。
+        # （见 SSE 心跳/超时修复：CPython 带缓冲 socket 超时后无法续读）
         resp = _FakeResp([b'data: one\n', "TIMEOUT", b'data: two\n'])
-        self.assertEqual(list(event_watcher.parse_sse_events(resp)), ['one', 'two'])
+        self.assertEqual(list(event_watcher.parse_sse_events(resp)), ['one'])
 
     def test_data_without_space(self):
         resp = _FakeResp([b'data:nospace\n'])
