@@ -88,8 +88,11 @@ export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别（vi
 export CAP_QUESTION_ENABLED="${CAP_QUESTION_ENABLED:-1}"     # Question 交互（钉钉端答 agent 提问）
 # Question 超时未答自动 reject 的秒数（serve 端 question 无 TTL，这是安全网防会话卡死），默认 60。
 # export CAP_QUESTION_TIMEOUT="60"
-# 后续能力（issue #29）落地后在此追加：
-# export CAP_AGGREGATION_ENABLED="${CAP_AGGREGATION_ENABLED:-0}"  # 群消息聚合（默认关）
+export CAP_AGGREGATION_ENABLED="${CAP_AGGREGATION_ENABLED:-0}"  # 群消息聚合（默认关，与逐条回复互斥）
+# 聚合开启后：群文本消息不逐条回复，缓冲到时间窗后合并成一次摘要回复。相关参数：
+# export CAP_AGGREGATION_WINDOW="300"      # 时间窗秒数（缓冲第一条后多久 flush），默认 300
+# export CAP_AGGREGATION_MAX_MSGS="50"     # 缓冲数量上限，达到即立即 flush
+# export CAP_AGGREGATION_PROMPT_FOOTER="以上是群里最近多条消息，请做简洁总结/回应，不要逐条复述。"
 
 
 # --- 调试 ---
