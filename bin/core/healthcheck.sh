@@ -27,10 +27,15 @@ COMPONENT_NAME="healthcheck"
 : "${SERVE_PWD_FILE:=$SCRIPT_DIR/.serve.pwd}"
 : "${LOG_FILE:=$SCRIPT_DIR/agent-connect.log}"
 : "${LOG_INACTIVITY_THRESHOLD:=2100}"   # 日志活跃度阈值（秒，35 分钟）
+# 进程 cmdline 匹配模式（verify_pid 用，字面子串匹配）。FDE 换了 connect/event_watcher
+# 的实现时，在 config/constants.local.sh 覆盖这两个，否则默认模式匹配不到自定义进程、
+# 健康检查恒失败。默认值对应 harness 自带实现（dws dev connect / event_watcher.py）。
+: "${CONNECT_CHECK_PATTERN:=agent-connect.*--unified-app-id}"
+: "${EVENT_WATCHER_CHECK_PATTERN:=event_watcher.py}"
 
 # 检查1: connect 进程存活（硬失败）
 check_connect() {
-    if verify_pid "$CONNECT_PID_FILE" "agent-connect.*--unified-app-id"; then
+    if verify_pid "$CONNECT_PID_FILE" "$CONNECT_CHECK_PATTERN"; then
         echo "OK"
     else
         echo "FAIL: connect 进程不存活"
@@ -69,7 +74,7 @@ check_log_fatal() {
 
 # 检查4: event-watcher 进程活跃（仅告警）
 check_event_watcher() {
-    if verify_pid "$EVENT_WATCHER_PID_FILE" "event-watcher\.py"; then
+    if verify_pid "$EVENT_WATCHER_PID_FILE" "$EVENT_WATCHER_CHECK_PATTERN"; then
         echo "OK"
     else
         echo "WARN: event-watcher 不活跃"
@@ -119,21 +124,27 @@ main() {
     done
 
     # 跑所有检查
-    declare -A results
-    results[connect]=$(check_connect)
-    results[log_activity]=$(check_log_activity)
-    results[log_fatal]=$(check_log_fatal)
-    results[event_watcher]=$(check_event_watcher)
-    results[serve]=$(check_serve)
-    results[serve_http]=$(check_serve_http)
+    # 注意：用普通变量而非关联数组（declare -A）——macOS 自带 /bin/bash 是 3.2，
+    # 不支持关联数组，monitor.sh 经 /bin/bash 调本脚本会 declare 报错、set -e 退出，
+    # 导致 monitor 误判"不健康"进入全量重启/熔断循环。保持 bash 3.2 兼容。
+    local r_connect r_log_activity r_log_fatal r_event_watcher r_serve r_serve_http
+    r_connect=$(check_connect)
+    r_log_activity=$(check_log_activity)
+    r_log_fatal=$(check_log_fatal)
+    r_event_watcher=$(check_event_watcher)
+    r_serve=$(check_serve)
+    r_serve_http=$(check_serve_http)
 
-    # 判定：硬失败 → 不健康
+    # 判定：硬失败 → 不健康（connect / log_fatal / serve / serve_http）
     local healthy=1
     local message=""
-    for key in connect log_fatal serve serve_http; do
-        if [[ "${results[$key]}" == FAIL* ]]; then
+    local pair key val
+    for pair in "connect|$r_connect" "log_fatal|$r_log_fatal" "serve|$r_serve" "serve_http|$r_serve_http"; do
+        key="${pair%%|*}"
+        val="${pair#*|}"
+        if [[ "$val" == FAIL* ]]; then
             healthy=0
-            message="$message $key=${results[$key]}"
+            message="$message $key=$val"
         fi
     done
     if [[ -z "$message" ]]; then
@@ -146,19 +157,24 @@ main() {
   "healthy": $healthy,
   "message": "$message",
   "checks": {
-    "connect": "${results[connect]}",
-    "log_activity": "${results[log_activity]}",
-    "log_fatal": "${results[log_fatal]}",
-    "event_watcher": "${results[event_watcher]}",
-    "serve": "${results[serve]}",
-    "serve_http": "${results[serve_http]}"
+    "connect": "$r_connect",
+    "log_activity": "$r_log_activity",
+    "log_fatal": "$r_log_fatal",
+    "event_watcher": "$r_event_watcher",
+    "serve": "$r_serve",
+    "serve_http": "$r_serve_http"
   }
 }
 EOF
     else
-        [[ -n "$verbose" ]] && for key in "${!results[@]}"; do
-            echo "  $key: ${results[$key]}"
-        done
+        if [[ -n "$verbose" ]]; then
+            echo "  connect: $r_connect"
+            echo "  log_activity: $r_log_activity"
+            echo "  log_fatal: $r_log_fatal"
+            echo "  event_watcher: $r_event_watcher"
+            echo "  serve: $r_serve"
+            echo "  serve_http: $r_serve_http"
+        fi
         if [[ "$healthy" == "1" ]]; then
             echo "✅ 健康"
         else
