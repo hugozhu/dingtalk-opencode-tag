@@ -82,9 +82,11 @@ export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（c
 # export CAP_FORWARD_PROMPT_FOOTER="以上是一段钉钉「合并转发」的聊天记录，…请理解语境后回应/总结。"
 # 单条内层消息内容截断上限（防超长附件撑爆 prompt），默认 4000。
 # export CAP_FORWARD_ENTRY_MAX="4000"
-# 后续能力（issue #27/#28/#29）落地后在此追加：
-# export CAP_QUESTION_ENABLED="${CAP_QUESTION_ENABLED:-1}"     # Question 交互
-# export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别
+export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别（vision 兜底）
+# 图片识别需要多模态 proxy 可达（见下方 PROXY_URL/VISION_MODEL）。注入 agent 的末句指令可覆盖：
+# export CAP_IMAGE_PROMPT_FOOTER="以上「图片识别内容」由多模态模型提取…请结合说明回应。"
+# 后续能力（issue #27/#29）落地后在此追加：
+# export CAP_QUESTION_ENABLED="${CAP_QUESTION_ENABLED:-1}"     # Question 交互（依赖 brain 异步 #34）
 # export CAP_AGGREGATION_ENABLED="${CAP_AGGREGATION_ENABLED:-0}"  # 群消息聚合（默认关）
 
 

@@ -29,8 +29,10 @@ KIND_REBOOT = "reboot"    # /reboot 远程指令
 KIND_FORWARD = "forward"  # 合并转发（chatRecord）等业务消息行
 KIND_UNKNOWN = "unknown"  # 未匹配任何已知形态
 
-# 图片占位文本（dws dev connect 把图片消息转发成这个）
+# 图片占位文本（dws dev connect 把图片消息转发成这个；event-consume 下则是
+# "[图片消息](mediaId=...)"，两种都识别为图片）
 _IMAGE_PLACEHOLDER = "[图片]"
+_IMAGE_MARKER = "[图片消息]"
 
 
 @dataclass
@@ -106,6 +108,8 @@ def classify(text):
     low = (text or "").strip().lower()
     if low == "/reboot":
         return KIND_REBOOT
-    if text.strip() == _IMAGE_PLACEHOLDER:
+    t = text.strip()
+    # 图片：dev-connect 是精确 "[图片]"；event-consume 是 "[图片消息](mediaId=...)"（可带说明文字）
+    if t == _IMAGE_PLACEHOLDER or _IMAGE_MARKER in t:
         return KIND_IMAGE
     return KIND_TEXT
