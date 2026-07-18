@@ -54,7 +54,9 @@ for _i in "${!COMP_NAMES[@]}"; do
 done
 
 # start_connect — 拉起 dws-connect.sh（内部跑 dws event consume | bridge 管道）
+# CONNECT_LOG 兜底默认：monitor.sh 未导出该变量，冷启动时 set -u 会因未绑定变量崩溃
+# （dws-connect.sh 内部也有同样兜底，这里补上 spawn 阶段的）。
 start_connect() {
-    _spawn "$SCRIPT_DIR/.connect.pid" "$CONNECT_LOG" \
+    _spawn "$SCRIPT_DIR/.connect.pid" "${CONNECT_LOG:-$SCRIPT_DIR/agent-connect.log}" \
         bash "$SCRIPT_DIR/bin/custom/dws-connect.sh"
 }
