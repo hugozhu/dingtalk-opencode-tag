@@ -96,6 +96,19 @@ log() {
     echo "[${ts}] [${COMPONENT_NAME:-monitor}] $*" >&2
 }
 
+# kill_tree <pid> [signal]：先递归杀子进程再杀自己（子在前，避免留孤儿）。
+# connect 是 `dws-connect.sh` → `dws event consume | python3 bridge` 管道，只按父脚本
+# 模式 pkill 会把管道子进程（dws consume / bridge）甩成孤儿继续消费消息。默认 SIGTERM。
+kill_tree() {
+    local pid="$1"
+    local sig="${2:-TERM}"
+    local child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        kill_tree "$child" "$sig"
+    done
+    kill "-$sig" "$pid" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # 组件清单单一真相源 — monitor.sh / reboot.sh / healthcheck.sh 共享，避免命名漂移
 #   COMP_NAMES：组件名（下划线，对应 start_<name> 函数）
