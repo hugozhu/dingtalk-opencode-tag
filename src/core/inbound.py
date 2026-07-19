@@ -25,6 +25,7 @@ _MSGID_RE = re.compile(r"msgId=([^\s)]+)")
 # kind 常量（避免裸字符串到处飞）
 KIND_TEXT = "text"        # 普通文本消息
 KIND_IMAGE = "image"      # 图片消息（dws 把图片转发成文本 "[图片]"）
+KIND_FILE = "file"        # 文件/文档消息（"[文件] <名> fileId: <id> ..."）
 KIND_REBOOT = "reboot"    # /reboot 远程指令
 KIND_FORWARD = "forward"  # 合并转发（chatRecord）等业务消息行
 KIND_UNKNOWN = "unknown"  # 未匹配任何已知形态
@@ -33,6 +34,8 @@ KIND_UNKNOWN = "unknown"  # 未匹配任何已知形态
 # "[图片消息](mediaId=...)"，两种都识别为图片）
 _IMAGE_PLACEHOLDER = "[图片]"
 _IMAGE_MARKER = "[图片消息]"
+# 文件消息标记（event-consume 下形如 "[文件] <名> fileId: <id> 注意：如需下载..."）
+_FILE_MARKER = "[文件]"
 
 
 @dataclass
@@ -99,11 +102,11 @@ def parse_line(line):
 
 
 def classify(text):
-    """根据文本判定 kind（reboot / image / text）。
+    """根据文本判定 kind（reboot / image / file / text）。
 
     forward/unknown 不在这里判——合并转发靠能力的业务正则匹配整行（text 层面看
     不出来），由 registry 在 dispatch 前用能力自己的检测；本函数只覆盖"收到 @user:
-    text"能直接看出的三类。
+    text"能直接看出的几类。
     """
     low = (text or "").strip().lower()
     if low == "/reboot":
@@ -112,4 +115,7 @@ def classify(text):
     # 图片：dev-connect 是精确 "[图片]"；event-consume 是 "[图片消息](mediaId=...)"（可带说明文字）
     if t == _IMAGE_PLACEHOLDER or _IMAGE_MARKER in t:
         return KIND_IMAGE
+    # 文件：event-consume 下形如 "[文件] <名> fileId: <id> 注意：如需下载..."
+    if _FILE_MARKER in t:
+        return KIND_FILE
     return KIND_TEXT
