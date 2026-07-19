@@ -161,16 +161,31 @@ _interruptible_sleep() {
 # 主循环
 run_forever() {
     local fail_count=0
+    # 空实现（no-op）组件登记表：某组件的 start_<name> 不产出实体进程（不写 pid 文件，
+    # 如未覆盖的 serve-watcher 默认空实现），兜底循环里会永远 is_running=false → 每轮刷
+    # "死亡，兜底拉起"日志。识别一次后记进本表，后续兜底跳过、不再刷日志。
+    # 判据可靠：真实组件的 start_<name> 经 _spawn 同步写 pid 文件；no-op 不写。
+    local noop_comps=" "
     while true; do
         _interruptible_sleep "$CHECK_INTERVAL"
         if run_healthcheck; then
             log "健康检查通过"
             fail_count=0
-            # 兜底拉起：watcher 死亡 30 分钟内自愈
+            # 兜底拉起：真实子组件死亡 30 分钟内自愈；no-op 组件跳过（不刷日志）
             for i in "${!COMP_NAMES[@]}"; do
-                if ! is_running "$i"; then
-                    log "${COMP_NAMES[$i]} 死亡，兜底拉起"
-                    "start_${COMP_NAMES[$i]}"
+                if is_running "$i"; then
+                    continue
+                fi
+                # 已知 no-op（无实体进程）→ 静默跳过
+                if [[ "$noop_comps" == *" ${COMP_NAMES[$i]} "* ]]; then
+                    continue
+                fi
+                log "${COMP_NAMES[$i]} 死亡，兜底拉起"
+                "start_${COMP_NAMES[$i]}"
+                # start_<name> 未产出 pid 文件（no-op 空实现）→ 记入 no-op 表，此后不再兜底
+                if [[ ! -f "${COMP_PID_FILES[$i]}" ]]; then
+                    noop_comps+="${COMP_NAMES[$i]} "
+                    log "  ${COMP_NAMES[$i]} 无实体进程（空实现），后续兜底跳过"
                 fi
             done
         else
