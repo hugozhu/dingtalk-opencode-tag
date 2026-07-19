@@ -62,31 +62,49 @@ dws --version
 
 ### 第 1 步：钉钉授权 + 数字员工企业账号
 
-数字员工本质是一个**企业里的钉钉账号**（用它的身份收发消息）。整个链路涉及"组织 → 账号 → 授权"三层：
+数字员工本质是一个**企业里的钉钉账号**（用它的身份收发消息）。链路是"授权 → 组织 → 数字员工专属账号"：
+
+**先授权本机：**
 
 ```bash
-dws auth login          # 浏览器/扫码登录钉钉，把一个「组织账号」加成本机 profile
+dws auth login          # 浏览器/扫码登录钉钉，把一个组织账号加成本机 profile
 #   SSH / 容器 / 无头环境（本机没浏览器）用设备流：
 dws auth login --device # 显示 user_code + 短链接，手机钉钉扫码授权
 
-dws auth status         # 确认 authenticated: true，记下 corp_id / user_id
+dws auth status         # 确认 authenticated: true
 dws profile list        # 列出本机已登录的全部组织账号（corpId / userId / 组织名）
 ```
 
-**创建组织 / 入职数字员工账号（一次性）：**
+**创建组织（没有现成企业时，用 `dws contact org`）：**
 
-- **创建组织**：在**钉钉 App / 管理后台**创建企业组织（`dws` CLI 不做建组织，它只连已有组织）。已有组织就跳过。
-- **数字员工的专属账号（推荐）**：在组织通讯录里给数字员工**建一个独立成员账号**（如叫 `opencode` / `数字员工`），把它拉进目标群。好处是身份清晰、和真人分开、可单独管权限。
-- **让数字员工账号授权本机**：切到该账号登录，让 CLI 拿到它的 profile：
+```bash
+dws contact org create --org-name "我的企业" --creator-username "你的名字"
+# 建好后组织信息里会返回 corpId；已有企业就跳过这步
+```
 
-  ```bash
-  dws auth login          # 这次用「数字员工账号」扫码登录（不是你本人）
-  dws profile list        # 应能看到该账号，形如  <组织名> | <corpId> | 数字员工 | <userId>
-  ```
+**入职数字员工专属账号（推荐，用 `dws contact account`）：**
 
-- 一个组织可以有**多个账号**（真人 + 数字员工各一份 profile）。业务命令用 `--profile <corpId>:<userId>` 指定用谁的身份；本项目的 `AGENT_PROFILE` / `DWS_PROFILE` 就填**数字员工账号**的 `corpId:userId`。
+给数字员工建一个**独立的企业登录账号**（和真人分开，身份清晰、可单独管权限）：
 
-> 只是先跑通、还没单独建数字员工账号？用你本人账号也能上线（回复以你的身份发出），把 `AGENT_SELF_NAMES` 填成你的显示名防自问自答即可。等要正式交付再换成专属账号。
+```bash
+dws contact account create \
+  --org-user-name "数字员工" \        # 它在企业里的显示名
+  --login-id "opencode-bot-01" \      # 登录号（别含手机号，否则短信可能被拦）
+  --dept-ids "1" \                    # 加入的部门（可选）
+  --send-pwd-via-sms                  # 通过短信/邮件发登录邀请（可选）
+# 需要在**已授权的企业**下执行；corpId 由系统按当前 profile 自动注入
+```
+
+然后把这个账号**拉进目标群**，并让它授权本机：
+
+```bash
+dws auth login          # 这次用「数字员工账号」扫码登录（不是你本人）
+dws profile list        # 应能看到它：  <组织名> | <corpId> | 数字员工 | <userId>
+```
+
+- 一个组织可以有**多个账号**（真人 + 数字员工各一份 profile）。业务命令用 `--profile <corpId>:<userId>` 指定用谁的身份；本项目的 `DWS_PROFILE` / `AGENT_PROFILE` 填**数字员工账号**的 `corpId:userId`。
+
+> 只是先跑通、还没建专属账号？用你本人账号也能上线（回复以你的身份发出），`AGENT_SELF_NAMES` 填你的显示名防自问自答即可，正式交付再换成专属账号。
 
 ### 第 2 步：填配置（一个群 + 你的身份）
 
