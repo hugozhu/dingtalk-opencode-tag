@@ -227,6 +227,51 @@ register(Capability(name="my_cap", on_inbound=on_inbound,
 
 ---
 
+## 数字员工架构图
+
+一条消息从钉钉群进来、经能力处理、再回到群里的完整数据流：
+
+```
+   钉钉群（数字员工账号在群里）
+        │  ▲
+   ①消息 │  │ ⑥回复
+        ▼  │
+┌───────────────────────────────────────────────────────────────────┐
+│  dws CLI（钉钉工作台 CLI）                                             │
+│    connect: dws event consume ──► dws_event_bridge.py               │
+│             （订阅群消息，转成 connect-log 行）                         │
+│    replier: dws chat message send ◄─ 把回复发回来源群                  │
+└───────────────────────────────────────────────────────────────────┘
+        │ ② connect-log                          ▲ ⑤ send_reply
+        ▼  "[connect] 收到 @user: text …"         │
+┌───────────────────────────────────────────────────────────────────┐
+│  event_watcher（core，事件监听主进程）                                 │
+│    log-tail ──► inbound.parse_line ──► InboundMessage(kind=…)        │
+│                        │ ③ dispatch                                  │
+│                        ▼                                            │
+│    ┌─── 能力注册表（core.capabilities，按 kind + priority 分发）───┐   │
+│    │  text_reply · image · file · forward · question · aggregation │  │
+│    │  （custom 插件，各自 CAP_*_ENABLED 开关，可组装/可选配）        │   │
+│    └───────────────────────────┬───────────────────────────────┘   │
+│    SSE /event ◄── question 等能力挂 on_sse_event（人在回路作答）      │
+└────────────────────────────────┼──────────────────────────────────┘
+                                 │ ④ brain.generate_reply
+                                 ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  opencode serve（本机常驻，"想 + 做" 的大脑）                          │
+│    POST /session/{id}/message  → 免费模型（deepseek / mimo 看图 …）    │
+│    推理 · 工具调用 · 会话 · 权限 —— 由 opencode 生态负责                │
+└───────────────────────────────────────────────────────────────────┘
+
+╔═══════════════════════════════════════════════════════════════════╗
+║  monitor.sh（launchd / systemd 托管）—— 全程守护                      ║
+║   拉起 & 兜底：serve · connect · event_watcher                       ║
+║   healthcheck（6 项，30 分钟自检）· 崩溃自愈 · 熔断 · /reboot 远程重启  ║
+╚═══════════════════════════════════════════════════════════════════╝
+```
+
+**分工**：`dws` 管钉钉侧收发与富媒体下载；`event_watcher` + 能力插件做**人机协同层**（受控识别/解读、路由、作答、聚合）；`opencode serve` 做**推理与任务执行**；`monitor` 保证全程在线。
+
 ## 架构：core / custom 分层
 
 FDE 交付时通过物理分层实现"改得动 + merge 得回"：
