@@ -50,7 +50,8 @@ check_log_activity() {
     fi
     local now mtime diff
     now=$(date +%s)
-    mtime=$(stat -f %m "$LOG_FILE" 2>/dev/null || echo 0)
+    # 文件 mtime：macOS 用 `stat -f %m`，Linux 用 `stat -c %Y`——两个都试，取到为准
+    mtime=$(stat -f %m "$LOG_FILE" 2>/dev/null || stat -c %Y "$LOG_FILE" 2>/dev/null || echo 0)
     diff=$((now - mtime))
     if [[ "$diff" -gt "$LOG_INACTIVITY_THRESHOLD" ]]; then
         echo "WARN: 日志 ${diff}s 无活动"
