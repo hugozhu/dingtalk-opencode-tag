@@ -1,141 +1,185 @@
-# Agent Harness — 数字员工项目脚手架
+# 钉钉数字员工脚手架 · Agent Harness
 
-提炼自 `dingtalk-opencode-agent`（4.1+ 版本），把生产环境打磨过的 13 个最佳实践抽象成可复用模板，为新的数字员工项目做基础。
+**用免费模型、几分钟、零成本，在钉钉群里上线一个能对话、看图、读文件的数字员工。**
 
-当前版本见 [VERSION](./VERSION)（单一真相源；引用时请以该文件为准，勿在文档里硬编码）。
+下载 opencode + 装 dws + 钉钉扫码授权 —— 三步就能让机器人上线。跑在 opencode 的**免费模型**上，**起步成本为 0**。
 
-## 为什么需要这个 harness
+当前版本见 [VERSION](./VERSION)。
 
-从零搭一个"长连接数字员工 + 事件流监听 + 多模态处理"项目，要解决：
+---
 
-- 进程怎么不挂（守护 + 自愈 + 熔断）
-- 长连接断了怎么自动重连（SSE 退避 + 端口切换）
-- 多个 handler 怎么不重复写"找会话→注入→取回复"模板
-- 业务消息处理后怎么清理 spurious 多余轮次
-- 测试怎么不依赖网络/钉钉跑通
+## 为什么用它
 
-这些坑 `dingtalk-opencode-agent` 都踩过、修过、写测试覆盖了。harness 把它们提炼出来，**去掉业务特定代码**（钉钉 API、合并转发、question 交互），**保留可复用结构**。
+自己从零搭一个"群消息监听 → LLM 生成回复 → 发回群"的数字员工，你要处理进程守护、断线重连、图片/文件多模态、会话注入、测试隔离一堆脏活。这个 harness 把这些**生产环境打磨过的坑**全封装好了，你只填几个配置就能上线，想定制业务再写自己的能力插件。
 
-## 三层目录架构
+- 🆓 **零成本起步**：默认跑 opencode 免费模型（文本 `deepseek-v4-flash-free`、看图 `mimo-v2.5-free`），不需要 API key、不烧钱。
+- ⚡ **几分钟上线**：装两个工具 + 钉钉扫码，填一个群 ID 就能收发消息。
+- 🧩 **开箱即用的 6 个能力**：文本对话、图片识别、文件解读、合并转发解析、Question 交互、群消息聚合 —— 都是可开关的插件。
+- 🛡️ **生产级守护**：launchd 托管，崩溃自愈、健康检查、熔断、`/reboot` 远程重启。
+- 🔧 **可定制、可 merge**：core/custom 分层，你只改 custom，upstream 的修复能干净合并回来。
 
-FDE 在交付时通过 **core / custom / templates 三层物理隔离** 实现"改得动 + merge 得回"：
+---
 
-| 层 | 路径 | FDE 能否改 | merge 回 upstream |
-|----|------|-----------|------------------|
-| **core** | `src/core/` `bin/core/` `tests/core/` | ❌ 不改 | ✅ bug fix 贡献回 upstream |
-| **custom** | `src/custom/` `bin/custom/` `tests/custom/` | ✅ 在这里改 | ❌ 业务特定，不 merge |
-| **templates** | `src/templates/` | ❌ 不改（diff 基线） | ✅ upstream 演进 |
-| **config** | `config/*.local.*` | ✅ 填真实值 | ❌ gitignored |
+## 开箱即用的能力
 
-详见 [FORKING.md](./FORKING.md)（FDE 派生指南）和 [CONTRIBUTING.md](./CONTRIBUTING.md)（贡献回 upstream 流程）。
+每个都是 `src/custom/capabilities/` 下的插件，用 `CAP_<NAME>_ENABLED` 开关，可组装、可选配：
 
-日常运维操作（如何启动/停止服务等可复现流程）见 [SKILL.md](./SKILL.md)（项目技能手册）。
+| 能力 | 做什么 | 默认 |
+|------|--------|:---:|
+| **文本对话** | 群里发消息，数字员工用 LLM 回复 | 开 |
+| **图片识别** | 发图片 → 免费多模态模型识别内容 → 基于内容回应 | 开 |
+| **文件解读** | 发文档（txt/md/csv/json/代码…）→ 受控下载读正文 → 解读 | 开 |
+| **合并转发** | 转发一段聊天记录 → 反查逐条解析（含图/文件）→ 总结 | 开 |
+| **Question 交互** | agent 反问时，你在群里回复序号/选项作答 | 开 |
+| **群消息聚合** | 短时多条消息合并成一次摘要回复，不逐条打扰 | 关 |
 
-## 快速开始
+> 富媒体都是**受控处理**：harness 主动下载、识别、注入，不让 agent 自己乱下东西或执行 shell。
+
+---
+
+## 三步上线
+
+### 前置：装两个工具
 
 ```bash
-# 1. 复制 harness 到新项目
-cp -r . /path/to/my-agent/
-cd /path/to/my-agent/
+# 1. opencode（数字员工的"大脑"，自带免费模型）
+curl -fsSL https://opencode.ai/install | bash      # 或见 https://opencode.ai
 
-# 2. 改配置
-cp config/config.example.json config/config.local.json
-cp config/constants.sh config/constants.local.sh
-# 编辑 *.local.* 填入真实值（被 .gitignore 忽略）
-
-# 3. 实现业务 handler（编辑 src/custom/handler.py）
-#   - 改 _classify_message 分类逻辑
-#   - 改 render_prompt 末句 prompt
-#   - 改 _predicate 匹配自己业务消息特征
-#   - 改 make_reply_msgs 通知消息格式
-
-# 4. 注册业务路由（编辑 src/custom/routes.py，不要改 src/core/event_watcher.py）
-#   - 在 route_reply 里实现文本回复分发
-#   - 在 route_business_line 里扩展业务消息检测
-
-# 4b. 实现组件启动命令（编辑 bin/custom/start_funcs.sh）
-#   - 必须实现 start_connect（数字员工核心连接进程的真实命令）
-#   - 可选覆盖 start_watcher；start_event_watcher 已有 core 默认实现
-
-# 5. 装 launchd agent（macOS）
-cp bin/custom/agent-template.plist ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
-# 编辑 plist：Label / ProgramArguments / StandardOutPath / PATH
-launchctl load -w ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
-
-# 6. 跑测试
-bash tests/core/unit_test.sh                 # shell 单测
-python3 tests/core/test_agent_common.py      # Python 单测
-bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路）
+# 2. dws（钉钉工作台 CLI，负责收发消息）
+#    安装见 dws 官方说明，装好后确认可用：
+dws --version
 ```
 
-## 文件结构
+### 第 1 步：钉钉扫码授权
 
-```
-.
-├── VERSION                              ← 语义化版本（FDE 派生时记录基线）
-├── README.md                            ← 本文件
-├── ARCHITECTURE.md                      ← 架构图 + 13 个最佳实践提炼
-├── AGENTS.md                            ← 给 AI agent 看的项目说明 + 边界
-├── SKILL.md                             ← 项目技能手册（可复现运维操作：启动服务等）
-├── FORKING.md                           ← FDE 派生指南（哪些改/哪些不改/同步流程）
-├── CONTRIBUTING.md                       ← 贡献回 upstream 的流程
-├── LICENSE
-│
-├── src/
-│   ├── core/                            ← @core harness 核心（DO NOT EDIT）
-│   │   ├── __init__.py
-│   │   ├── agent_common.py              ← 共享工具（日志/通知/serve 访问/inject_and_forward）
-│   │   └── event_watcher.py              ← 事件流监听主进程（SSE 重连 + log-tail + 状态机，调用 custom.routes）
-│   ├── custom/                          ← @custom FDE 改这里
-│   │   ├── __init__.py
-│   │   ├── handler.py                   ← 业务 handler（从 templates/handler_template.py 复制改造）
-│   │   └── routes.py                    ← 业务路由注册表（route_reply / route_business_line / route_sse_event）
-│   └── templates/                       ← @template 纯净参考（diff 基线，DO NOT EDIT）
-│       ├── __init__.py
-│       └── handler_template.py          ← 完整 handler 范例
-│
-├── bin/
-│   ├── core/                            ← @core 守护/健康检查（DO NOT EDIT）
-│   │   ├── lib.sh                       ← 共享 shell 工具（verify_pid / acquire_lock / log）
-│   │   ├── monitor.sh                   ← 守护进程（cleanup_stale_state + start_all + 主循环 + 熔断）
-│   │   ├── healthcheck.sh               ← 6 项健康检查（硬失败/告警分级）
-│   │   └── reboot.sh                    ← /reboot 指令执行体（带退避重试 + 告警）
-│   └── custom/                          ← @custom FDE 改这里
-│       └── agent-template.plist          ← launchd plist 模板
-│
-├── tests/
-│   ├── core/                            ← @core 核心测试（DO NOT EDIT）
-│   │   ├── unit_test.sh                 ← shell 单测（bash -n + 函数断言）
-│   │   └── test_agent_common.py         ← Python 单测（unittest + patch.object）
-│   └── custom/                          ← @custom FDE 改这里
-│       └── e2e_test.sh                  ← 端到端测试（触发 + 日志 + dws list 验证）
-│
-└── config/                              ← @config
-    ├── config.example.json              ← 配置示例（占位符）
-    ├── constants.sh                     ← 可配置常量模板（占位符）
-    ├── config.local.json                ← 真实凭据（gitignored，FDE 填）
-    └── constants.local.sh               ← 真实常量（gitignored，FDE 填）
+```bash
+dws auth login          # 浏览器/扫码登录钉钉，拿到 profile
+dws auth status         # 确认 authenticated: true，记下 corp_id / user_id
 ```
 
-## 核心设计原则
+### 第 2 步：填配置（一个群 + 你的身份）
 
-1. **launchd 托管，不依赖应用持续在线**——开机/登录自启，应用崩溃 launchd 拉起
-2. **进程检测 PID 文件 + cmdline 签名**——绕开 pgrep -f 误匹配（send-by-bot 转发进程）
-3. **渲染/IO 分层**——fetch_xxx（I/O 集中）vs render_xxx（纯函数零 I/O），独立测试
-4. **公共注入模板**——inject_and_forward 被 N 个 handler 共用，差异点用 callable 参数化
-5. **批量反查 + 轮询等待**——一次 list-by-ids 批量取回 N 个字段，比逐个快且不依赖额外权限
-6. **状态机 cleanup**——awaiting_spurious → cleaning，处理多选/连发场景下的 spurious 多余轮次
-7. **诊断日志**——数量不匹配时记 raw 输入头 N 字符，便于排查外部 API 格式变化
-8. **三层物理隔离 + 插件化路由**——core / custom / templates 分层，FDE 只改 custom + routes.py，core 路径在 upstream/fork 一致便于干净 merge
+```bash
+cp config/constants.sh config/constants.local.sh   # *.local.* 被 gitignore
+# 找到目标群的 openConversationId：
+dws chat search --query "你的群名"
+```
 
-详细架构图 + 13 个最佳实践提炼见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+编辑 `config/constants.local.sh`，最少填这几个：
+
+```bash
+export DWS_EVENT_GROUP="cid...=="                          # 上面查到的群 ID
+export DWS_PROFILE="dinga...:<userId>"                     # dws auth status 里的 corpId:userId
+export AGENT_PROFILE="$DWS_PROFILE"                        # 同上（回复用同一身份）
+export AGENT_BRAIN="opencode"                              # 用 opencode 大脑
+export AGENT_OPENCODE_MODEL="opencode/deepseek-v4-flash-free"  # 免费文本模型
+export AGENT_VISION_MODEL="opencode/mimo-v2.5-free"        # 免费看图模型
+export AGENT_REPLY_MODE="user"                             # 以当前登录身份回复到群
+export AGENT_SELF_NAMES="你的机器人显示名"                  # 防自问自答，填数字员工自己的名字
+```
+
+### 第 3 步：上线
+
+```bash
+# 装 launchd agent（macOS，开机自启 + 崩溃自愈）
+cp bin/custom/agent-template.plist ~/Library/LaunchAgents/com.<你的组织>.<你的agent>.plist
+# 编辑 plist 的 Label / ProgramArguments 指向本目录的 bin/core/monitor.sh、PATH
+launchctl load -w ~/Library/LaunchAgents/com.<你的组织>.<你的agent>.plist
+```
+
+monitor 会自动拉起 opencode serve + 群消息订阅 + 事件监听。**去群里发条消息试试** —— 数字员工就回你了。
+
+> 调试期想先不真发消息？把 `AGENT_REPLY_MODE=log`，回复只写日志不发群，验证链路无误再开真发。
+
+---
+
+## 验证在线
+
+```bash
+bash bin/core/healthcheck.sh                 # 6 项健康检查，应 ✅ 健康
+# 群里发 "1+1" → 数字员工回 "2"
+```
+
+跑测试（不依赖网络/钉钉）：
+
+```bash
+bash tests/core/unit_test.sh                          # shell 单测
+for t in tests/core/*.py tests/custom/*.py; do python3 "$t"; done   # Python 单测
+```
+
+---
+
+## 加一个自己的能力
+
+写一个 `src/custom/capabilities/<name>.py`，声明一个 `Capability` 挂到入站/SSE 钩子上，注册即生效。core 只认注册表，加/删能力不碰 core，upstream 修复能干净 merge。三步范例见 [FORKING.md](./FORKING.md)。
+
+```python
+from core.capabilities import Capability, register
+from core.inbound import KIND_TEXT
+
+def on_inbound(msg):          # msg: InboundMessage(user/text/conv_id/msg_id/kind…)
+    ...                        # 处理并回复；return True=已消费
+    return True
+
+register(Capability(name="my_cap", on_inbound=on_inbound,
+                    handles_kinds={KIND_TEXT}, priority=50, default_enabled=True))
+```
+
+---
+
+## 架构：core / custom 分层
+
+FDE 交付时通过物理分层实现"改得动 + merge 得回"：
+
+| 层 | 路径 | FDE 改？ | merge 回 upstream |
+|----|------|:---:|:---:|
+| **core** | `src/core/` `bin/core/` `tests/core/` | ❌ | ✅ bug fix 贡献回 |
+| **custom** | `src/custom/` `bin/custom/` `tests/custom/` | ✅ 在这里改 | ❌ 业务特定 |
+| **config** | `config/*.local.*` | ✅ 填真实值 | ❌ gitignored |
+
+```
+src/
+├── core/                     ← harness 核心（不改）
+│   ├── event_watcher.py      ← 事件监听主进程（SSE 重连 + log-tail + 能力分发）
+│   ├── capabilities.py       ← 能力注册表（可组装/可选配的插件框架）
+│   ├── inbound.py            ← 统一 InboundMessage（消息归一 + kind 分类）
+│   └── agent_common.py       ← 共享工具（serve 访问 / 通知 / inject_and_forward）
+├── custom/                   ← FDE 改这里
+│   ├── capabilities/         ← 能力插件（text_reply / image / file / forward / question / aggregation）
+│   ├── brain.py              ← "大脑"：调 opencode serve 生成回复（免费模型）
+│   └── replier.py            ← 把回复发回钉钉
+bin/
+├── core/                     ← 守护/健康检查（不改）：monitor / healthcheck / reboot / lib
+└── custom/                   ← start_funcs.sh（组件启动）/ dws-connect.sh（群订阅）/ plist
+config/                       ← constants.sh（模板）+ constants.local.sh（真实值，gitignored）
+```
+
+- **运维手册**（启动/停止/状态查询）见 [SKILL.md](./SKILL.md)
+- **派生指南**（哪些改/不改/同步 upstream）见 [FORKING.md](./FORKING.md)
+- **架构 + 最佳实践**见 [ARCHITECTURE.md](./ARCHITECTURE.md)
+
+---
+
+## 免费模型说明（起步成本 = 0）
+
+默认配置全用 opencode 内置免费模型，无需任何 API key：
+
+| 用途 | 模型 | 实测 |
+|------|------|------|
+| 文本对话 | `opencode/deepseek-v4-flash-free` | ✅ |
+| 图片识别 | `opencode/mimo-v2.5-free` | ✅ 能读图里的文字/内容 |
+| 语音转写 | —— | ❌ 免费模型不支持，需外部 STT（见 issue #42） |
+
+想换更强的模型（付费）？改 `AGENT_OPENCODE_MODEL` / `AGENT_VISION_MODEL` 即可，一行配置的事。
+
+---
 
 ## 已知限制
 
-- **空回复撤回**：依赖服务（如 dws dev connect）触发 abort 后返回空 finalizer 被发到通知渠道时，event-watcher 无法用机器人身份撤回（钉钉 API "仅消息发送者可撤回" + 缺 processQueryKey）。需要依赖服务端配合过滤空回复。
-- **macOS 限定**：launchd 托管是 macOS 特性。Linux 用 systemd、Windows 用服务/任务计划器，需自己适配 `bin/core/monitor.sh`。
-- **依赖 dws CLI**：send_notification / _run_cli 都用 dws。其他平台需在 custom 层替换为对应 SDK。
-- **serve 密码经 `ps` 可见**：serve 密码从进程环境变量提取、`.serve.pwd` 为明文文件，多用户主机上同机其他用户可见。详见 [FORKING.md](./FORKING.md#已知限制) 的安全说明。
+- **macOS 限定**：launchd 托管是 macOS 特性。Linux 用 systemd、Windows 用服务/任务计划器，需自行适配 `bin/core/monitor.sh`（healthcheck/reboot 已做 bash 3.2 兼容）。
+- **依赖 dws CLI**：收发消息、下载媒体都用 dws。换平台需在 custom 层替换为对应 SDK。
+- **语音消息**：opencode 免费模型不支持音频转写，需接外部 STT，见 [issue #42](https://github.com/hugozhu/dingtalk-opencode-tag/issues/42)。
+- **serve 密码经 `ps` 可见**：`.serve.pwd` 为明文文件、密码在进程环境变量里，多用户主机上同机其他用户可见。详见 [FORKING.md](./FORKING.md) 安全说明。
 
 ## License
 
