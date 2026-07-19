@@ -89,6 +89,11 @@ export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（c
 export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别（vision 兜底）
 # 图片识别需要多模态 proxy 可达（见下方 PROXY_URL/VISION_MODEL）。注入 agent 的末句指令可覆盖：
 # export CAP_IMAGE_PROMPT_FOOTER="以上「图片识别内容」由多模态模型提取…请结合说明回应。"
+export CAP_FILE_ENABLED="${CAP_FILE_ENABLED:-1}"             # 文档/文件处理（受控下载+注入）
+# 文件能力主动 drive download 到临时目录、读前 N 字节文本注入 agent（避免 agent 自主下载到
+# 项目目录）。文本类文件（txt/md/csv/json/日志/代码等）读正文；二进制文件给说明不硬读。
+# export CAP_FILE_MAX_BYTES="16384"     # 读取正文字节上限
+# export CAP_FILE_PROMPT_FOOTER="以上是用户发送的文件内容…请结合说明回应。"
 export CAP_QUESTION_ENABLED="${CAP_QUESTION_ENABLED:-1}"     # Question 交互（钉钉端答 agent 提问）
 # Question 超时未答自动 reject 的秒数（serve 端 question 无 TTL，这是安全网防会话卡死），默认 60。
 # export CAP_QUESTION_TIMEOUT="60"
