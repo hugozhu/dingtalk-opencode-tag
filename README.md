@@ -60,12 +60,33 @@ curl -fsSL https://opencode.ai/install | bash      # 或见 https://opencode.ai
 dws --version
 ```
 
-### 第 1 步：钉钉扫码授权
+### 第 1 步：钉钉授权 + 数字员工企业账号
+
+数字员工本质是一个**企业里的钉钉账号**（用它的身份收发消息）。整个链路涉及"组织 → 账号 → 授权"三层：
 
 ```bash
-dws auth login          # 浏览器/扫码登录钉钉，拿到 profile
+dws auth login          # 浏览器/扫码登录钉钉，把一个「组织账号」加成本机 profile
+#   SSH / 容器 / 无头环境（本机没浏览器）用设备流：
+dws auth login --device # 显示 user_code + 短链接，手机钉钉扫码授权
+
 dws auth status         # 确认 authenticated: true，记下 corp_id / user_id
+dws profile list        # 列出本机已登录的全部组织账号（corpId / userId / 组织名）
 ```
+
+**创建组织 / 入职数字员工账号（一次性）：**
+
+- **创建组织**：在**钉钉 App / 管理后台**创建企业组织（`dws` CLI 不做建组织，它只连已有组织）。已有组织就跳过。
+- **数字员工的专属账号（推荐）**：在组织通讯录里给数字员工**建一个独立成员账号**（如叫 `opencode` / `数字员工`），把它拉进目标群。好处是身份清晰、和真人分开、可单独管权限。
+- **让数字员工账号授权本机**：切到该账号登录，让 CLI 拿到它的 profile：
+
+  ```bash
+  dws auth login          # 这次用「数字员工账号」扫码登录（不是你本人）
+  dws profile list        # 应能看到该账号，形如  <组织名> | <corpId> | 数字员工 | <userId>
+  ```
+
+- 一个组织可以有**多个账号**（真人 + 数字员工各一份 profile）。业务命令用 `--profile <corpId>:<userId>` 指定用谁的身份；本项目的 `AGENT_PROFILE` / `DWS_PROFILE` 就填**数字员工账号**的 `corpId:userId`。
+
+> 只是先跑通、还没单独建数字员工账号？用你本人账号也能上线（回复以你的身份发出），把 `AGENT_SELF_NAMES` 填成你的显示名防自问自答即可。等要正式交付再换成专属账号。
 
 ### 第 2 步：填配置（一个群 + 你的身份）
 
@@ -79,13 +100,13 @@ dws chat search --query "你的群名"
 
 ```bash
 export DWS_EVENT_GROUP="cid...=="                          # 上面查到的群 ID
-export DWS_PROFILE="dinga...:<userId>"                     # dws auth status 里的 corpId:userId
-export AGENT_PROFILE="$DWS_PROFILE"                        # 同上（回复用同一身份）
+export DWS_PROFILE="dinga...:<userId>"                     # 数字员工账号的 corpId:userId（见 dws profile list）
+export AGENT_PROFILE="$DWS_PROFILE"                        # 同上（数字员工以此身份回复）
 export AGENT_BRAIN="opencode"                              # 用 opencode 大脑
 export AGENT_OPENCODE_MODEL="opencode/deepseek-v4-flash-free"  # 免费文本模型
 export AGENT_VISION_MODEL="opencode/mimo-v2.5-free"        # 免费看图模型
-export AGENT_REPLY_MODE="user"                             # 以当前登录身份回复到群
-export AGENT_SELF_NAMES="你的机器人显示名"                  # 防自问自答，填数字员工自己的名字
+export AGENT_REPLY_MODE="user"                             # 以该账号身份回复到群
+export AGENT_SELF_NAMES="数字员工的显示名"                  # 防自问自答，填数字员工自己的名字
 ```
 
 ### 第 3 步：上线
