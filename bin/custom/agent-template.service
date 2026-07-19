@@ -1,0 +1,52 @@
+# agent-template.service — systemd 用户单元模板（Linux 上线用）
+#
+# 对应 macOS 的 agent-template.plist。语义映射：
+#   KeepAlive={SuccessfulExit:false}  ↔  Restart=on-failure（exit 0 不拉起=等人工；崩溃/被杀=拉起）
+#   RunAtLoad=true                    ↔  systemctl --user enable（开机/登录自启）
+#   ThrottleInterval=10                ↔  RestartSec=10（防崩溃循环）
+#   StandardOut/ErrorPath              ↔  StandardOutput/Error（这里用 append: 落盘 monitor.log）
+#
+# 安装（用户级 systemd，无需 root）：
+#   mkdir -p ~/.config/systemd/user
+#   cp agent-template.service ~/.config/systemd/user/dingtalk-agent.service
+#   # 编辑下面的 <PROJECT_DIR> / <USER_LOCAL_BIN> 为真实绝对路径
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dingtalk-agent.service
+#   loginctl enable-linger "$USER"     # 让用户单元在未登录时也能开机自启
+#
+# 状态 / 日志 / 停止 / 重启：
+#   systemctl --user status dingtalk-agent.service
+#   journalctl --user -u dingtalk-agent.service -f      # 或直接看 <PROJECT_DIR>/monitor.log
+#   systemctl --user stop  dingtalk-agent.service
+#   systemctl --user restart dingtalk-agent.service      # 手动重启（等价 launchctl kickstart）
+#
+# 注：reboot.sh 的 auto 模式在未加载 launchd 时自动走 nohup 重启，故 /reboot 指令在
+#     Linux 上也可用；若想让 /reboot 走 systemd，设 REBOOT_RESTART_MODE=systemd（如已实现）
+#     或保持 nohup（默认可用）。
+
+[Unit]
+Description=DingTalk digital employee (opencode agent) monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 绝对路径：把 <PROJECT_DIR> 换成本项目目录
+WorkingDirectory=<PROJECT_DIR>
+ExecStart=/bin/bash <PROJECT_DIR>/bin/core/monitor.sh --foreground
+
+# exit 0（熔断/人工停）不拉起；非零（崩溃/被杀）才拉起，与 plist KeepAlive 语义一致
+Restart=on-failure
+RestartSec=10
+
+# 日志落盘到 monitor.log（append），与 macOS StandardOutPath 一致
+StandardOutput=append:<PROJECT_DIR>/monitor.log
+StandardError=append:<PROJECT_DIR>/monitor.log
+
+# 让子进程能找到 opencode / dws 等 CLI（换成真实路径）
+Environment=PATH=<USER_LOCAL_BIN>:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# 项目特定环境变量（可选；也可全部放 config/constants.local.sh 由脚本 source）
+# Environment=AGENT_TIMEOUT_MS=1800000
+
+[Install]
+WantedBy=default.target

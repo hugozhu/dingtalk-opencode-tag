@@ -64,14 +64,10 @@ _cleanup_pidfile() {
     fi
 }
 
-# acquire_lock <lock_file>：单实例锁（shlock 无 unlock，释放直接 rm -f 锁文件）
+# acquire_lock <lock_file>：单实例锁（跨平台：文件存在性 + kill -0 检测，无外部依赖）
 acquire_lock() {
     local lock_file="$1"
-    if /usr/bin/shlock -u "$lock_file" 2>/dev/null; then
-        # shlock -u 是 UUCP 二进制 pid 格式，不是 unlock
-        :
-    fi
-    # 用文件存在性判断（最简）
+    # 用文件存在性 + 进程存活判断（最简、跨 macOS/Linux，无需 flock/shlock）
     if [[ -f "$lock_file" ]]; then
         local old_pid
         old_pid=$(cat "$lock_file" 2>/dev/null)

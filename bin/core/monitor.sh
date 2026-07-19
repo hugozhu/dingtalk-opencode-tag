@@ -239,7 +239,11 @@ main() {
     sleep 3
     warmup
     bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
-    date -v+${CHECK_INTERVAL}S '+%s' > "$SCRIPT_DIR/.next-check"
+    # .next-check 仅作展示（下次检查时间戳）。macOS `date -v+Ns`，Linux `date -d "+N sec"`；
+    # 两个都不行就退回"当前时间+间隔"算术，保证跨平台不报错。
+    { date -v+"${CHECK_INTERVAL}"S '+%s' 2>/dev/null \
+        || date -d "+${CHECK_INTERVAL} seconds" '+%s' 2>/dev/null \
+        || echo $(( $(date +%s) + CHECK_INTERVAL )); } > "$SCRIPT_DIR/.next-check"
 
     case "${1:---foreground}" in
         --foreground) run_forever ;;
