@@ -182,19 +182,48 @@ for t in tests/core/*.py tests/custom/*.py; do python3 "$t"; done   # Python 单
 
 ## 加一个自己的能力
 
-写一个 `src/custom/capabilities/<name>.py`，声明一个 `Capability` 挂到入站/SSE 钩子上，注册即生效。core 只认注册表，加/删能力不碰 core，upstream 修复能干净 merge。三步范例见 [FORKING.md](./FORKING.md)。
+本项目**功能全部由 AI 编码完成**（见[项目理念](#项目理念)）。加能力的推荐姿势就是：**把需求用一句话丢给 Claude Code 或 opencode，让它照现有插件范式写。**
+
+### 方式一（推荐）：让 Coding Agent 帮你写
+
+在项目根目录起一个 Coding Agent（Claude Code / opencode 都行），给它这样的提示词：
+
+```text
+在 src/custom/capabilities/ 下新增一个能力：<描述你的能力，例如：
+"收到含关键词 '排班' 的群消息时，查考勤 API 并回复本周排班表">。
+
+要求：
+- 参照现有能力的写法（如 src/custom/capabilities/text_reply.py / image.py），
+  声明一个 Capability 并 register()，挂到合适的钩子（on_inbound / on_sse_event / on_cleanup）。
+- 在 src/custom/capabilities/__init__.py 里 import 它。
+- 加一个 CAP_<NAME>_ENABLED 开关（默认值自定），并在 config/constants.sh 文档化。
+- 在 tests/custom/ 加对应单测（mock 掉网络/CLI，参照 test_image_capability.py）。
+- 不要改 src/core/。遵守 AGENTS.md 里的边界。
+- 跑一遍单测确认通过。
+```
+
+Agent 会照着现有 6 个能力（`text_reply` / `image` / `file` / `forward` / `question` / `aggregation`）的范式实现、写测试、验证。**AGENTS.md 里写好了边界（哪些能改、约定），Agent 读了就知道怎么改不越界。** 你只负责给方向和验收（最好去真实群里发条消息端到端验一下）。
+
+> 想更省事：把上面这段连同"发一条 XX 消息测试一下效果"一起给 Agent，它能自己触发真实链路验证。
+
+### 方式二：手写（了解插件契约）
+
+一个能力就是一个 `Capability`，挂到入站/SSE 钩子上，注册即生效。core 只认注册表，加/删能力不碰 core，upstream 修复能干净 merge。三步范例见 [FORKING.md](./FORKING.md)。
 
 ```python
+# src/custom/capabilities/my_cap.py
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
 
 def on_inbound(msg):          # msg: InboundMessage(user/text/conv_id/msg_id/kind…)
-    ...                        # 处理并回复；return True=已消费
+    ...                        # 处理并回复；return True=已消费，False=放行给下一个能力
     return True
 
 register(Capability(name="my_cap", on_inbound=on_inbound,
                     handles_kinds={KIND_TEXT}, priority=50, default_enabled=True))
 ```
+
+然后在 `src/custom/capabilities/__init__.py` 里 `import` 它即生效。
 
 ---
 
