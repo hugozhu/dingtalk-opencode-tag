@@ -5,12 +5,18 @@
 # cmdline 签名稳定可被 verify_pid 匹配（模式 'dws-connect.sh'），且能承载管道
 # （_spawn 只能跑单条命令，管道需要包在脚本里）。
 #
-# 订阅指定群/单聊消息，转成 connect-log 格式喂给 event_watcher 的 log-tail。
-# **敏感值（群 conversationId、profile）不写死在本文件**，从环境变量读取，
-# 真实值放在 gitignored 的 config/constants.local.sh：
-#   DWS_EVENT_KEY    事件类型（默认群消息）
-#   DWS_EVENT_GROUP  群 openConversationId（群消息必填）—— 敏感，不提交
-#   DWS_PROFILE      组织 profile —— 敏感，不提交
+# 订阅群消息 和/或 单聊(o2o)消息，转成 connect-log 格式喂给 event_watcher 的 log-tail。
+# **敏感值不写死在本文件**，从环境变量读取，真实值放在 gitignored 的
+# config/constants.local.sh：
+#   DWS_EVENT_KEY        群消息事件类型（默认 user_im_message_receive_group）
+#   DWS_EVENT_GROUP      群 openConversationId（订阅群消息时必填）—— 敏感
+#   DWS_EVENT_O2O_USERS  订阅单聊时：对端 userId 列表（逗号分隔）。留空=不订阅单聊。
+#                        钉钉 o2o 事件只能按“对端 userId”订阅（每个对端一条订阅），
+#                        故这里为每个 userId 起一个 o2o consumer。
+#   DWS_PROFILE          组织 profile（数字员工账号）—— 敏感
+#
+# 群 + 单聊可同时开：分别起 consumer，都把输出汇到同一个 bridge 管道 → CONNECT_LOG。
+# 至少要开一种（群 或 单聊），否则报错退出。
 
 set -uo pipefail
 
@@ -25,6 +31,7 @@ fi
 
 : "${DWS_EVENT_KEY:=user_im_message_receive_group}"
 : "${DWS_EVENT_GROUP:=}"
+: "${DWS_EVENT_O2O_USERS:=}"
 : "${DWS_PROFILE:=}"
 : "${CONNECT_LOG:=$SCRIPT_DIR/agent-connect.log}"
 
@@ -32,23 +39,67 @@ if [[ -z "$DWS_PROFILE" ]]; then
     echo "[connect] ERROR: DWS_PROFILE 未设置（请在 config/constants.local.sh 填）" >> "$CONNECT_LOG"
     exit 1
 fi
-if [[ "$DWS_EVENT_KEY" == *group* && -z "$DWS_EVENT_GROUP" ]]; then
-    echo "[connect] ERROR: 群订阅需要 DWS_EVENT_GROUP（请在 config/constants.local.sh 填）" >> "$CONNECT_LOG"
+
+# 判定要开哪些订阅
+_want_group=0
+[[ "$DWS_EVENT_KEY" == *group* && -n "$DWS_EVENT_GROUP" ]] && _want_group=1
+_want_o2o=0
+[[ -n "$DWS_EVENT_O2O_USERS" ]] && _want_o2o=1
+
+if [[ "$DWS_EVENT_KEY" == *group* && -z "$DWS_EVENT_GROUP" && "$_want_o2o" -eq 0 ]]; then
+    echo "[connect] ERROR: 群订阅需要 DWS_EVENT_GROUP（或改用 DWS_EVENT_O2O_USERS 订阅单聊）" >> "$CONNECT_LOG"
+    exit 1
+fi
+if [[ "$_want_group" -eq 0 && "$_want_o2o" -eq 0 ]]; then
+    echo "[connect] ERROR: 未配置任何订阅（DWS_EVENT_GROUP 群 / DWS_EVENT_O2O_USERS 单聊 至少一个）" >> "$CONNECT_LOG"
     exit 1
 fi
 
 BRIDGE="$SCRIPT_DIR/bin/custom/dws_event_bridge.py"
 
-# 组装事件订阅参数（群消息需要 --group）
-consume_args=(event consume "$DWS_EVENT_KEY" --profile "$DWS_PROFILE" -f ndjson --quiet)
-if [[ "$DWS_EVENT_KEY" == *group* ]]; then
-    consume_args+=(--group "$DWS_EVENT_GROUP")
-fi
+# _run_consumers：把所有要开的 consumer 的 stdout 合流输出（供管道喂 bridge）。
+# 每个 consumer 的 stderr（[event] ready / 状态）汇入 CONNECT_LOG 便于健康检查看活跃度。
+# 子进程都在本函数的子 shell 里，脚本退出（SIGTERM）时随之被清理。
+_run_consumers() {
+    local pids=()
+    # 群消息 consumer
+    if [[ "$_want_group" -eq 1 ]]; then
+        dws event consume "$DWS_EVENT_KEY" --group "$DWS_EVENT_GROUP" \
+            --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
+        pids+=($!)
+    fi
+    # 单聊 consumer：每个对端 userId 一个（o2o 只能按对端订阅）
+    if [[ "$_want_o2o" -eq 1 ]]; then
+        local IFS=','
+        local u
+        for u in $DWS_EVENT_O2O_USERS; do
+            u="${u// /}"   # 去空格
+            [[ -z "$u" ]] && continue
+            dws event consume user_im_message_receive_o2o --user "$u" \
+                --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
+            pids+=($!)
+        done
+    fi
+    # 任一 consumer 退出即整体结束，让 monitor 兜底重启（bash 3.2 无 `wait -n`，用轮询：
+    # 任一子进程不再存活就 kill 其余并返回）。
+    while :; do
+        local alive=0 p
+        for p in "${pids[@]}"; do
+            if kill -0 "$p" 2>/dev/null; then
+                alive=$((alive + 1))
+            fi
+        done
+        # 有 consumer 死了（存活数 < 总数）→ 收尾
+        if [[ "$alive" -lt "${#pids[@]}" ]]; then
+            for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
+            break
+        fi
+        sleep 5
+    done
+}
 
-# 不把敏感 group/profile 打进日志（只记事件类型）
-echo "[connect] dws-connect 启动: event=$DWS_EVENT_KEY" >> "$CONNECT_LOG"
+# 启动日志（不打敏感 group/users，只记开了哪些）
+echo "[connect] dws-connect 启动: group=$_want_group o2o=$_want_o2o" >> "$CONNECT_LOG"
 
-# dws event consume 的 stderr（[event] ready / 状态）汇入 CONNECT_LOG 便于健康检查看活跃度
-# bridge 的 stdout（connect-log 行）追加到 CONNECT_LOG，stderr（诊断）也进同一文件
-exec dws "${consume_args[@]}" 2>>"$CONNECT_LOG" \
-    | python3 "$BRIDGE" >> "$CONNECT_LOG" 2>>"$CONNECT_LOG"
+# 所有 consumer 合流 → bridge → CONNECT_LOG
+_run_consumers | python3 "$BRIDGE" >> "$CONNECT_LOG" 2>>"$CONNECT_LOG"

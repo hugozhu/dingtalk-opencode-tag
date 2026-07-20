@@ -24,7 +24,7 @@ def send_reply(conv_id, conv_type, text, *, at_user_id=None):
 
     Args:
         conv_id:  来源 openConversationId
-        conv_type: 会话类型（1=单聊 2=群聊，目前仅群聊路径实现）
+        conv_type: 会话类型（1=单聊 2=群聊；send --group 对两者通用，均按 conv_id 发）
         text:     回复正文
         at_user_id: 可选，群里 @ 回某人的 userId
     """
@@ -68,7 +68,7 @@ def _reply_bot(conv_id, text, at_user_id):
 
 
 def _reply_user(conv_id, text):
-    """当前用户身份 send 发到群。"""
+    """当前用户身份 send 发到来源会话（群或单聊，均按 openConversationId 发）。"""
     cmd = ["dws", "chat", "message", "send",
            "--group", conv_id,
            "--text", text,

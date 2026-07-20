@@ -56,9 +56,12 @@ export AGENT_VISION_MODEL="${AGENT_VISION_MODEL:-opencode/mimo-v2.5-free}"
 
 # --- dws event connect（bin/custom/dws-connect.sh）---
 # 敏感值：真实的群 conversationId / profile 填在 config/constants.local.sh（gitignored），
-# 不要写进本模板文件。
+# 不要写进本模板文件。群订阅 + 单聊(o2o)订阅可同时开，至少开一种。
 export DWS_EVENT_KEY="${DWS_EVENT_KEY:-user_im_message_receive_group}"
-export DWS_EVENT_GROUP="${DWS_EVENT_GROUP:-}"   # 群 openConversationId（敏感，勿提交）
+export DWS_EVENT_GROUP="${DWS_EVENT_GROUP:-}"   # 群 openConversationId（订阅群消息必填，敏感）
+# 单聊(o2o)订阅：对端 userId 列表（逗号分隔）。钉钉 o2o 事件只能按“对端 userId”订阅，
+# 每个对端起一个 consumer。留空=不订阅单聊。例：给数字员工发单聊的真人 userId。
+export DWS_EVENT_O2O_USERS="${DWS_EVENT_O2O_USERS:-}"  # 敏感，勿提交
 export DWS_PROFILE="${DWS_PROFILE:-}"           # 组织 profile（敏感，勿提交）
 
 # --- 数字员工大脑 / 回复（src/custom/brain.py + replier.py）---
