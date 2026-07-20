@@ -98,6 +98,38 @@ else
     assert_eq "README 不硬编码版本号" "1" "1"
 fi
 
+# 测试 dws-connect.sh 的订阅选择逻辑（含新增 @我(at) 订阅）
+echo ""
+echo "Testing dws-connect.sh subscription selection..."
+DWS_CONNECT="$SCRIPT_DIR/bin/custom/dws-connect.sh"
+
+assert_eq "dws-connect.sh 语法正确" "0" "$(bash -n "$DWS_CONNECT" 2>&1; echo $?)"
+
+# dry-run 纯 env 驱动（跳过 constants.local.sh），只打印订阅计划
+_dwsplan() {
+    env DWS_CONNECT_SKIP_LOCAL=1 DWS_CONNECT_DRY_RUN=1 CONNECT_LOG=/dev/null \
+        "$@" bash "$DWS_CONNECT" 2>/dev/null
+}
+
+# 只开 @我：group/o2o 关，at 开，且起了 at consumer
+AT_ONLY="$(_dwsplan DWS_PROFILE=p DWS_EVENT_AT=1)"
+assert_eq "仅 AT: plan at=1" "1" "$(echo "$AT_ONLY" | grep -c 'plan: group=0 o2o=0 at=1')"
+assert_eq "仅 AT: 起 at consumer" "1" "$(echo "$AT_ONLY" | grep -c 'consumer: user_im_message_receive_at')"
+
+# 三种同时开
+ALL="$(_dwsplan DWS_PROFILE=p DWS_EVENT_GROUP=cidX== DWS_EVENT_O2O_USERS=u1 DWS_EVENT_AT=true)"
+assert_eq "全开: plan" "1" "$(echo "$ALL" | grep -c 'plan: group=1 o2o=1 at=1')"
+assert_eq "全开: 含 at consumer" "1" "$(echo "$ALL" | grep -c 'consumer: user_im_message_receive_at')"
+
+# AT 关（值为 0）不起 at consumer
+OFF="$(_dwsplan DWS_PROFILE=p DWS_EVENT_GROUP=cidY== DWS_EVENT_AT=0)"
+assert_eq "AT=0 不起 at consumer" "0" "$(echo "$OFF" | grep -c 'consumer: user_im_message_receive_at')"
+
+# 什么都不配 → 报错退出非 0（at 也没开）
+NONE_RC="$(env DWS_CONNECT_SKIP_LOCAL=1 DWS_CONNECT_DRY_RUN=1 CONNECT_LOG=/dev/null \
+    DWS_PROFILE=p bash "$DWS_CONNECT" >/dev/null 2>&1; echo $?)"
+assert_eq "无任何订阅 → 退出非0" "1" "$NONE_RC"
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

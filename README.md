@@ -107,7 +107,7 @@ dws profile list        # 应能看到它：  <组织名> | <corpId> | 数字员
 
 > 只是先跑通、还没建专属账号？用你本人账号也能上线（回复以你的身份发出），`AGENT_SELF_NAMES` 填你的显示名防自问自答即可，正式交付再换成专属账号。
 
-### 第 2 步：填配置（一个群 + 你的身份）
+### 第 2 步：填配置（群 / 单聊 + 你的身份）
 
 ```bash
 cp config/constants.sh config/constants.local.sh   # *.local.* 被 gitignore
@@ -118,7 +118,13 @@ dws chat search --query "你的群名"
 编辑 `config/constants.local.sh`，最少填这几个：
 
 ```bash
-export DWS_EVENT_GROUP="cid...=="                          # 上面查到的群 ID
+export DWS_EVENT_GROUP="cid...=="                          # 上面查到的群 ID（订阅群消息）
+# 可选：订阅单聊——填给数字员工发私聊的真人 userId（逗号分隔）。
+# 钉钉单聊(o2o)事件只能按「对端 userId」订阅；留空=不订阅单聊。
+# export DWS_EVENT_O2O_USERS="0420506555"
+# 可选：只在被 @ 时才响应、又不想逐个配置群？打开「@我」订阅（跨所有群捕获被 @ 的消息）：
+# export DWS_EVENT_AT=1
+# 群 / 单聊 / @我 三种订阅可任意组合，至少开一种。
 export DWS_PROFILE="dinga...:<userId>"                     # 数字员工账号的 corpId:userId（见 dws profile list）
 export AGENT_PROFILE="$DWS_PROFILE"                        # 同上（数字员工以此身份回复）
 export AGENT_BRAIN="opencode"                              # 用 opencode 大脑

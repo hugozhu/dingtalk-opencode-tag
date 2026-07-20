@@ -31,6 +31,14 @@ class TestParseLine(unittest.TestCase):
         m = inbound.parse_line(self._line("u", "[图片]", ctype=1))
         self.assertEqual(m.kind, KIND_IMAGE)
 
+    def test_at_message_parsed_as_group_text(self):
+        # @我(at) 事件经 bridge 产出 convType=2 的普通文本行，与群消息同路
+        m = inbound.parse_line(self._line("hugozhu", "@Claude Code 帮我看下", ctype=2))
+        self.assertEqual(m.user, "hugozhu")
+        self.assertEqual(m.text, "@Claude Code 帮我看下")
+        self.assertEqual(m.conv_type, "2")
+        self.assertEqual(m.kind, KIND_TEXT)
+
     def test_image_marker_kind(self):
         # event-consume 格式：[图片消息](mediaId=...)，可带 caption
         m = inbound.parse_line(self._line("u", "[图片消息](mediaId=$abc)"))
