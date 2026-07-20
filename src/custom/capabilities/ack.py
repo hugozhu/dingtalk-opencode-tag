@@ -30,10 +30,10 @@ DingTalk 约定（实测）：
   绝不影响正常回复链路。
 - **防回环 + 去重**：跳过 AGENT_SELF_NAMES 自己发的；msgId 去重（对齐 text_reply/image）。
 
-开关：CAP_ACK_ENABLED（**默认关**）。文字表情依赖 DingTalk `create-text-emotion`，
-实测部分 (表情名, 文案) 组合会报"暂不支持保存该文字表情"（如默认的 "🈺 已收到，正在处理…"）；
-且需数字员工 profile 有权限。确认你钉钉可用的表情名 + 文案 + 权限后，在 config/constants.local.sh
-设 CAP_ACK_ENABLED=1 开启（先用 `dws chat message create-text-emotion` 手测文案能否保存）。
+开关：CAP_ACK_ENABLED（**默认开**）。默认文案已实测可被 DingTalk `create-text-emotion`
+保存；改文案后建议先用 `dws chat message create-text-emotion --emotion-name <名> --text <文>`
+手测能否保存（部分含特殊 emoji/标点的文案会报"暂不支持保存该文字表情"）。需数字员工 profile
+有回执权限。停用设 CAP_ACK_ENABLED=0。
 """
 
 import json
@@ -354,7 +354,7 @@ CAPABILITY = Capability(
     on_reply_sent=on_reply_sent,
     handles_kinds=set(),       # 所有 kind（文本/图片/文件…）都回执
     priority=1,                # 最先跑，抢在业务能力消费之前贴"处理中"
-    default_enabled=False,     # 默认关：文字表情需按你的钉钉实测可用表情名+文案（部分文案
-                               # 报"暂不支持保存该文字表情"）+ 确认权限后，再置 CAP_ACK_ENABLED=1 开启
+    default_enabled=True,      # 默认开：收到消息即 mark-read + 贴状态文字表情（默认文案实测
+                               # 可存）。全 best-effort，失败只记日志不阻断回复。停用设 CAP_ACK_ENABLED=0
 )
 register(CAPABILITY)
