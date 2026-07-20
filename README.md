@@ -229,48 +229,55 @@ register(Capability(name="my_cap", on_inbound=on_inbound,
 
 ## 数字员工架构图
 
-一条消息从钉钉群进来、经能力处理、再回到群里的完整数据流：
+一条消息从钉钉群进来、经能力处理、再回到群里的完整数据流（GitHub 上渲染为流程图）：
 
-```
-   钉钉群（数字员工账号在群里）
-        │  ▲
-   ①消息 │  │ ⑥回复
-        ▼  │
-┌───────────────────────────────────────────────────────────────────┐
-│  dws CLI（钉钉工作台 CLI）                                             │
-│    connect: dws event consume ──► dws_event_bridge.py               │
-│             （订阅群消息，转成 connect-log 行）                         │
-│    replier: dws chat message send ◄─ 把回复发回来源群                  │
-└───────────────────────────────────────────────────────────────────┘
-        │ ② connect-log                          ▲ ⑤ send_reply
-        ▼  "[connect] 收到 @user: text …"         │
-┌───────────────────────────────────────────────────────────────────┐
-│  event_watcher（core，事件监听主进程）                                 │
-│    log-tail ──► inbound.parse_line ──► InboundMessage(kind=…)        │
-│                        │ ③ dispatch                                  │
-│                        ▼                                            │
-│    ┌─── 能力注册表（core.capabilities，按 kind + priority 分发）───┐   │
-│    │  text_reply · image · file · forward · question · aggregation │  │
-│    │  （custom 插件，各自 CAP_*_ENABLED 开关，可组装/可选配）        │   │
-│    └───────────────────────────┬───────────────────────────────┘   │
-│    SSE /event ◄── question 等能力挂 on_sse_event（人在回路作答）      │
-└────────────────────────────────┼──────────────────────────────────┘
-                                 │ ④ brain.generate_reply
-                                 ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  opencode serve（本机常驻，"想 + 做" 的大脑）                          │
-│    POST /session/{id}/message  → 免费模型（deepseek / mimo 看图 …）    │
-│    推理 · 工具调用 · 会话 · 权限 —— 由 opencode 生态负责                │
-└───────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    G(["💬 钉钉群<br/>数字员工账号在群里"])
 
-╔═══════════════════════════════════════════════════════════════════╗
-║  monitor.sh（launchd / systemd 托管）—— 全程守护                      ║
-║   拉起 & 兜底：serve · connect · event_watcher                       ║
-║   healthcheck（6 项，30 分钟自检）· 崩溃自愈 · 熔断 · /reboot 远程重启  ║
-╚═══════════════════════════════════════════════════════════════════╝
+    subgraph DWS["dws CLI · 钉钉侧收发"]
+        direction TB
+        C["connect：dws event consume<br/>→ dws_event_bridge.py"]
+        R["replier：dws chat message send"]
+    end
+
+    subgraph EW["event_watcher · core 事件监听主进程"]
+        direction TB
+        LT["log-tail → inbound.parse_line<br/>→ InboundMessage(kind)"]
+        REG{{"能力注册表 core.capabilities<br/>按 kind + priority 分发"}}
+        CAPS["能力插件 · custom · 各自 CAP_*_ENABLED 开关<br/>text_reply · image · file · forward · question · aggregation"]
+        LT --> REG --> CAPS
+    end
+
+    subgraph OC["opencode serve · 本机常驻 · 想+做的大脑"]
+        BRAIN["POST /session/id/message → 免费模型<br/>deepseek 文本 · mimo 看图 · 推理/工具/会话/权限"]
+    end
+
+    G -->|"① 消息"| C
+    C -->|"② connect-log"| LT
+    CAPS -->|"④ brain.generate_reply"| BRAIN
+    BRAIN -->|"⑤ 回复文本"| R
+    R -->|"⑥ 发回来源群"| G
+    BRAIN -.->|"SSE /event · question 人在回路作答"| LT
+
+    MON["🛡️ monitor.sh（launchd / systemd 托管）· 全程守护<br/>拉起兜底 serve·connect·event_watcher · healthcheck 自检<br/>崩溃自愈 · 熔断 · /reboot 远程重启"]
+    MON -.->|"托管"| C
+    MON -.->|"托管"| LT
+    MON -.->|"托管"| BRAIN
+
+    classDef core fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a;
+    classDef custom fill:#dcfce7,stroke:#22c55e,color:#14532d;
+    classDef ext fill:#fef9c3,stroke:#eab308,color:#713f12;
+    classDef mon fill:#fee2e2,stroke:#ef4444,color:#7f1d1d;
+    class LT,REG core;
+    class CAPS,C,R custom;
+    class BRAIN ext;
+    class MON mon;
 ```
 
 **分工**：`dws` 管钉钉侧收发与富媒体下载；`event_watcher` + 能力插件做**人机协同层**（受控识别/解读、路由、作答、聚合）；`opencode serve` 做**推理与任务执行**；`monitor` 保证全程在线。
+
+> 🟦 core（不改） · 🟩 custom（FDE 改这里） · 🟨 opencode 生态 · 🟥 守护
 
 ## 架构：core / custom 分层
 
