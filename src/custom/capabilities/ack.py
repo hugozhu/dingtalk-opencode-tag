@@ -47,6 +47,7 @@ from core.capabilities import Capability, register
 
 # --- 配置（constants.local.sh 覆盖）---
 _O2O_ONLY = env_flag("ACK_O2O_ONLY", default=True)       # 默认只单聊（群里逐条贴噪音大）
+_AT_MENTION = env_flag("ACK_AT_MENTION", default=True)   # 群里被 @ 数字员工时也回执（#46）
 _MARK_READ = env_flag("ACK_MARK_READ", default=True)      # 是否同时标记已读
 
 
@@ -142,29 +143,45 @@ class _Pending:
         self.cur = None           # 当前贴着的 (表情, 文字)（worker 独占，无需锁）
 
 
-def _seen_before(msg_id):
-    """msgId 去重：见过返回 True。空 msgId 不去重（放行）。"""
+def _note_and_should_begin(msg_id, acked):
+    """登记 msgId 并判定是否应为它启动一次回执 worker（含“被 @ 群消息经 group+at 双投、
+    行序不定”的竞态处理，见 #46）。
+
+    _seen 的值 = “是否已为该 msgId 启动过回执”（bool）。同一 msgId 可能被投递两次
+    （群订阅未打标 + @我订阅打标），两行合流进单一 log-tail、顺序不定：
+      - 未打标(未 acked)先到：记 False，不启动；随后打标(acked)到 → 启动（升级）。
+      - 打标先到：启动、记 True；随后未打标到 acked=False → 不重复启动，且 True 保留。
+    返回 True 表示“现在应启动”（此前没启动过 且 本次 acked）。空 msgId 不去重，按 acked 决定。
+    """
     if not msg_id:
-        return False
+        return acked
     with _seen_lock:
-        if msg_id in _seen:
-            return True
-        _seen[msg_id] = None
+        prev_acked = _seen.get(msg_id, False)
+        _seen[msg_id] = bool(prev_acked or acked)
+        _seen.move_to_end(msg_id)
         if len(_seen) > _SEEN_MAX:
             _seen.popitem(last=False)
-    return False
+    return bool(acked and not prev_acked)
 
 
 def _should_ack(msg):
     """纯判定：这条消息是否要回执（不含自过滤/去重，那两步在 on_inbound 早退）。
 
-    需要 conv_id + msg_id（回执 API 必填）；ACK_O2O_ONLY 时只认单聊(conv_type=1)。
+    需要 conv_id + msg_id（回执 API 必填）。触发范围：
+      - 单聊(conv_type=1) → 回执（#45 原行为）
+      - 群(conv_type=2) 且本条被 @ 数字员工（extra['at_mention']）且 ACK_AT_MENTION 开 → 回执（#46）
+      - ACK_O2O_ONLY=0 → 群里所有消息也回执（原逃生口，噪音大，默认关）
+      - 其它群消息（未被 @）→ 不回执
     """
     if not msg.conv_id or not msg.msg_id:
         return False
-    if _O2O_ONLY and msg.conv_type != _CONV_TYPE_O2O:
-        return False
-    return True
+    if msg.conv_type == _CONV_TYPE_O2O:
+        return True
+    if _AT_MENTION and msg.extra.get("at_mention"):
+        return True
+    if not _O2O_ONLY:
+        return True
+    return False
 
 
 # --- DingTalk 回执调用（best-effort，失败只记日志不抛）---
@@ -327,15 +344,14 @@ def _begin(msg):
 def on_inbound(msg):
     """回执入站：非消费型（返回 False 让后续能力照常回复）。
 
-    自己发的 / 不在回执范围 / 重复 msgId → 直接放行不回执。
+    自己发的 → 放行。否则登记 msgId + 判定是否该启动回执（含 #46 双投行序竞态处理），
+    该启动才 _begin。绝不消费消息（text_reply 等仍会处理并回复）。
     """
     if msg.user in _SELF_NAMES:
         return False
-    if not _should_ack(msg):
-        return False
-    if _seen_before(msg.msg_id):
-        return False
-    _begin(msg)
+    acked = _should_ack(msg)
+    if _note_and_should_begin(msg.msg_id, acked):
+        _begin(msg)
     return False   # 关键：不消费，text_reply 等仍会处理并回复
 
 

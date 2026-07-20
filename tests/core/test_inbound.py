@@ -68,6 +68,22 @@ class TestParseLine(unittest.TestCase):
         m = inbound.parse_line(self._line("u", "hi"))
         self.assertEqual(m.extra, {})
 
+    def test_at_mention_parsed_into_extra(self):
+        # bridge 给被 @ 的消息打 atMention=1（在 msgId 之后、) 之前）
+        line = ("[connect] 收到 @hugozhu: @opencode 帮我看下 "
+                "(convType=2 convId=cidAT== msgId=msgAT== atMention=1)")
+        m = inbound.parse_line(line)
+        self.assertEqual(m.extra, {"at_mention": True})
+        # atMention 标记不干扰 conv_id/msg_id 提取
+        self.assertEqual(m.conv_id, "cidAT==")
+        self.assertEqual(m.msg_id, "msgAT==")
+        self.assertEqual(m.conv_type, "2")
+
+    def test_no_at_mention_extra_empty(self):
+        # 普通群消息（无标记）→ extra 空
+        m = inbound.parse_line(self._line("u", "普通群消息"))
+        self.assertEqual(m.extra, {})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

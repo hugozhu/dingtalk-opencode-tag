@@ -59,10 +59,11 @@ echo "    $LINE"
 if echo "$LINE" | grep -q '收到 @hugozhu: @Claude Code 帮我算下 3+4' \
    && echo "$LINE" | grep -q 'convType=2' \
    && echo "$LINE" | grep -q 'convId=cidE2EAT==' \
-   && echo "$LINE" | grep -q 'msgId=msgE2EAT=='; then
-    pass "bridge 转换正确（convType=2 + 发送人/正文/会话/消息ID 齐全）"
+   && echo "$LINE" | grep -q 'msgId=msgE2EAT==' \
+   && echo "$LINE" | grep -q 'atMention=1'; then
+    pass "bridge 转换正确（convType=2 + atMention=1 + 发送人/正文/会话/消息ID 齐全）"
 else
-    fail "bridge 转换结果不符预期"
+    fail "bridge 转换结果不符预期（应含 atMention=1）"
 fi
 
 echo ""
@@ -78,7 +79,8 @@ assert m is not None, "inbound.parse_line 返回 None"
 assert m.kind == inbound.KIND_TEXT, f"kind 应为 text，实际 {m.kind}"
 assert m.conv_type == "2", f"conv_type 应为 2，实际 {m.conv_type}"
 assert m.user == "hugozhu", f"user 解析错误：{m.user}"
-print(f"    parsed: user={m.user} kind={m.kind} conv_type={m.conv_type} msg_id={m.msg_id}")
+assert m.extra.get("at_mention") is True, f"extra.at_mention 应为 True，实际 {m.extra}"
+print(f"    parsed: user={m.user} kind={m.kind} conv_type={m.conv_type} msg_id={m.msg_id} at_mention={m.extra.get('at_mention')}")
 
 # 用一个 stub 能力证明 dispatch_inbound 会把 AT 消息路由过来（不依赖 brain/replier）
 seen = {}

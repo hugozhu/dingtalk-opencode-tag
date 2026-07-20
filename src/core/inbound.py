@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 _REPLY_RE = re.compile(r'\[connect\] 收到 @(.+?):\s*(.+?)\s+\(convType=(\d+)')
 _CONVID_RE = re.compile(r"convId=([^\s)]+)")
 _MSGID_RE = re.compile(r"msgId=([^\s)]+)")
+# bridge 对“被 @ 我”的消息打标 atMention=1（见 dws_event_bridge）。解析进 extra['at_mention']
+# 供能力判定“群里被 @”（#46）；普通群/单聊消息无此标记，extra 保持空。
+_AT_MENTION_RE = re.compile(r"\batMention=1\b")
 
 # kind 常量（避免裸字符串到处飞）
 KIND_TEXT = "text"        # 普通文本消息
@@ -95,9 +98,12 @@ def parse_line(line):
     conv_type = m.group(3)
     conv_id, msg_id = _extract_ids(line)
     kind = classify(text)
+    extra = {}
+    if _AT_MENTION_RE.search(line):
+        extra["at_mention"] = True
     return InboundMessage(
         user=user, text=text, conv_type=conv_type,
-        conv_id=conv_id, msg_id=msg_id, kind=kind, raw_line=line,
+        conv_id=conv_id, msg_id=msg_id, kind=kind, raw_line=line, extra=extra,
     )
 
 

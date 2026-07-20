@@ -28,9 +28,11 @@ from custom.capabilities import ack
 from core.inbound import InboundMessage, KIND_TEXT, KIND_IMAGE
 
 
-def _msg(user="hugozhu", conv_type="1", conv_id="cidO2O==", msg_id="msg1==", kind=KIND_TEXT):
+def _msg(user="hugozhu", conv_type="1", conv_id="cidO2O==", msg_id="msg1==",
+         kind=KIND_TEXT, extra=None):
     return InboundMessage(user=user, text="hi", conv_type=conv_type,
-                          conv_id=conv_id, msg_id=msg_id, kind=kind)
+                          conv_id=conv_id, msg_id=msg_id, kind=kind,
+                          extra=extra if extra is not None else {})
 
 
 def _wait_gone(conv_id, tries=100, interval=0.02):
@@ -71,11 +73,24 @@ class TestShouldAck(unittest.TestCase):
     def test_o2o_triggers(self):
         self.assertTrue(ack._should_ack(_msg(conv_type="1")))
 
-    def test_group_gated_by_o2o_only(self):
-        with patch.object(ack, "_O2O_ONLY", True):
+    def test_group_no_at_gated_by_o2o_only(self):
+        # 普通群消息（未被@）：ACK_O2O_ONLY=1 不回执；=0 回执（逃生口）
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True):
             self.assertFalse(ack._should_ack(_msg(conv_type="2")))
         with patch.object(ack, "_O2O_ONLY", False):
             self.assertTrue(ack._should_ack(_msg(conv_type="2")))
+
+    def test_group_at_mention_triggers(self):
+        # 群里被@：ACK_AT_MENTION 开 → 回执（即便 ACK_O2O_ONLY=1）
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True):
+            self.assertTrue(ack._should_ack(
+                _msg(conv_type="2", extra={"at_mention": True})))
+
+    def test_group_at_mention_flag_off(self):
+        # ACK_AT_MENTION 关 + 普通只单聊 → 被@的群消息也不回执
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", False):
+            self.assertFalse(ack._should_ack(
+                _msg(conv_type="2", extra={"at_mention": True})))
 
     def test_missing_ids(self):
         self.assertFalse(ack._should_ack(_msg(conv_id="")))
@@ -108,8 +123,40 @@ class TestOnInbound(unittest.TestCase):
             self.assertEqual(beg.call_count, 1)
 
     def test_out_of_scope_skipped(self):
-        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_begin") as beg:
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
+             patch.object(ack, "_begin") as beg:
             self.assertFalse(ack.on_inbound(_msg(conv_type="2")))
+            beg.assert_not_called()
+
+
+class TestRaceUpgrade(unittest.TestCase):
+    """群里被@时 group+at 双投同一 msgId、行序不定 → 恰好启动一次回执（#46）。"""
+    def setUp(self):
+        ack._seen.clear()
+
+    def _grp(self, mid, at):
+        return _msg(conv_type="2", conv_id="cidG==", msg_id=mid,
+                    extra={"at_mention": True} if at else {})
+
+    def test_untagged_then_tagged_begins_once(self):
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
+             patch.object(ack, "_begin") as beg:
+            ack.on_inbound(self._grp("m==", at=False))   # 群投递（未打标）先到
+            ack.on_inbound(self._grp("m==", at=True))    # @我投递（打标）后到 → 升级启动
+            self.assertEqual(beg.call_count, 1)
+
+    def test_tagged_then_untagged_begins_once(self):
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
+             patch.object(ack, "_begin") as beg:
+            ack.on_inbound(self._grp("m==", at=True))    # 打标先到 → 启动
+            ack.on_inbound(self._grp("m==", at=False))   # 未打标后到 → 不重复启动
+            self.assertEqual(beg.call_count, 1)
+
+    def test_both_untagged_group_never_begins(self):
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
+             patch.object(ack, "_begin") as beg:
+            ack.on_inbound(self._grp("m==", at=False))
+            ack.on_inbound(self._grp("m==", at=False))
             beg.assert_not_called()
 
 
