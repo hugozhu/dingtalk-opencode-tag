@@ -13,10 +13,10 @@
 自己从零搭一个"群消息监听 → LLM 生成回复 → 发回群"的数字员工，你要处理进程守护、断线重连、图片/文件多模态、会话注入、测试隔离一堆脏活。这个 harness 把这些**生产环境打磨过的坑**全封装好了，你只填几个配置就能上线，想定制业务再写自己的能力插件。
 
 - 🆓 **零成本起步**：默认跑 opencode 免费模型（文本 `deepseek-v4-flash-free`、看图 `mimo-v2.5-free`），不需要 API key、不烧钱。
-- ⚡ **几分钟上线**：装两个工具 + 钉钉扫码，填一个群 ID 就能收发消息。
-- 🧩 **开箱即用的 6 个能力**：文本对话、图片识别、文件解读、合并转发解析、Question 交互、群消息聚合 —— 都是可开关的插件。
-- 🛡️ **生产级守护**：launchd 托管，崩溃自愈、健康检查、熔断、`/reboot` 远程重启。
-- 🔧 **可定制、可 merge**：core/custom 分层，你只改 custom，upstream 的修复能干净合并回来。
+- ⚡ **几分钟上线**：装两个工具 + 钉钉扫码，填一个群 ID 就能收发消息（群 / 单聊 / @我 三种订阅任选）。
+- 🧩 **开箱即用的 7 个能力**：文本对话、Question 交互、群消息聚合、图片识别、文件解读、合并转发、已读+状态回执 —— 都是可开关的插件。
+- 🛡️ **生产级守护**：launchd / systemd 托管，崩溃自愈、健康检查、熔断、`/reboot` 远程重启。
+- 🔧 **可定制、可 merge、可换平台**：core/custom 分层，你只改 custom；生成/发送走 core 协议 + 注册点，换 IM 平台只替换 custom 的发送实现。
 
 ---
 
@@ -32,18 +32,20 @@
 
 ## 开箱即用的能力
 
-每个都是 `src/custom/capabilities/` 下的插件，用 `CAP_<NAME>_ENABLED` 开关，可组装、可选配：
+每个能力是一个插件，用 `CAP_<NAME>_ENABLED` 开关，可组装、可选配。**core 自带**的是平台无关的通用原语（`src/core/builtin_caps/`），**custom** 的是钉钉强耦合、供 FDE 定制（`src/custom/capabilities/`）：
 
-| 能力 | 做什么 | 默认 |
-|------|--------|:---:|
-| **文本对话** | 群里发消息，数字员工用 LLM 回复 | 开 |
-| **图片识别** | 发图片 → 免费多模态模型识别内容 → 基于内容回应 | 开 |
-| **文件解读** | 发文档（txt/md/csv/json/代码…）→ 受控下载读正文 → 解读 | 开 |
-| **合并转发** | 转发一段聊天记录 → 反查逐条解析（含图/文件）→ 总结 | 开 |
-| **Question 交互** | agent 反问时，你在群里回复序号/选项作答 | 开 |
-| **群消息聚合** | 短时多条消息合并成一次摘要回复，不逐条打扰 | 关 |
+| 能力 | 做什么 | 归属 | 默认 |
+|------|--------|:---:|:---:|
+| **文本对话** | 群/单聊发消息，数字员工用 LLM 回复 | core | 开 |
+| **Question 交互** | agent 反问时，你在群里回复序号/选项作答 | core | 开 |
+| **群消息聚合** | 短时多条消息合并成一次摘要回复，不逐条打扰 | core | 关 |
+| **图片识别** | 发图片 → 免费多模态模型识别内容 → 基于内容回应 | custom | 开 |
+| **文件解读** | 发文档（txt/md/csv/json/代码…）→ 受控下载读正文 → 解读 | custom | 开 |
+| **合并转发** | 转发一段聊天记录 → 反查逐条解析（含图/文件）→ 总结 | custom | 开 |
+| **已读+状态回执** | 收到消息即标记已读；单聊/被@时贴「处理中→完成」状态表情 | custom | 开 |
 
 > 富媒体都是**受控处理**：harness 主动下载、识别、注入，不让 agent 自己乱下东西或执行 shell。
+> 加能力零样板：`Capability(..., dedup=True, loop_guard=True)` 一行即得 msgId 去重 + 防自问自答（core 统一处理）。
 
 ---
 
@@ -208,7 +210,7 @@ for t in tests/core/*.py tests/custom/*.py; do python3 "$t"; done   # Python 单
 - 跑一遍单测确认通过。
 ```
 
-Agent 会照着现有 6 个能力（`text_reply` / `image` / `file` / `forward` / `question` / `aggregation`）的范式实现、写测试、验证。**AGENTS.md 里写好了边界（哪些能改、约定），Agent 读了就知道怎么改不越界。** 你只负责给方向和验收（最好去真实群里发条消息端到端验一下）。
+Agent 会照着现有 7 个能力（core 原语 `text_reply` / `question` / `aggregation`，custom 定制 `ack` / `forward` / `image` / `file`）的范式实现、写测试、验证。**AGENTS.md 里写好了边界（哪些能改、约定），Agent 读了就知道怎么改不越界。** 你只负责给方向和验收（最好去真实群里发条消息端到端验一下）。
 
 > 想更省事：把上面这段连同"发一条 XX 消息测试一下效果"一起给 Agent，它能自己触发真实链路验证。
 
@@ -220,13 +222,16 @@ Agent 会照着现有 6 个能力（`text_reply` / `image` / `file` / `forward` 
 # src/custom/capabilities/my_cap.py
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
+from core.brain import generate_reply       # 生成回复（走 core 协议，平台无关）
+from core.replier import send_reply         # 发回来源会话
 
 def on_inbound(msg):          # msg: InboundMessage(user/text/conv_id/msg_id/kind…)
     ...                        # 处理并回复；return True=已消费，False=放行给下一个能力
     return True
 
 register(Capability(name="my_cap", on_inbound=on_inbound,
-                    handles_kinds={KIND_TEXT}, priority=50, default_enabled=True))
+                    handles_kinds={KIND_TEXT}, priority=50, default_enabled=True,
+                    dedup=True, loop_guard=True))   # msgId 去重 + 防自问自答由 core 统一处理
 ```
 
 然后在 `src/custom/capabilities/__init__.py` 里 `import` 它即生效。
