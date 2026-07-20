@@ -26,8 +26,8 @@ import urllib.request
 from core.agent_common import _proxy_vision, _run_cli, find_serve_credentials, log, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_IMAGE
-from custom.brain import generate_reply, _register_textreply_sid
-from custom.replier import send_reply
+from core.brain import generate_reply, register_session as _register_textreply_sid
+from core.replier import send_reply
 
 # 图片 mediaId 提取（content 形如 "[图片消息](mediaId=$xxx)"，ID 含 $@/_- 等，止于 )）
 _RE_MEDIA_ID = re.compile(r"mediaId=([^\s)]+)")

@@ -22,10 +22,8 @@ import base64
 import json
 import os
 import subprocess
-import threading
 import time
 import urllib.request
-from collections import OrderedDict
 
 from core.agent_common import PROXY_URL, PROXY_KEY, find_serve_credentials, log
 
@@ -46,50 +44,14 @@ _PROJECT_ROOT = os.environ.get(
 _OPENCODE_LOG = os.environ.get(
     "AGENT_OPENCODE_LOG", os.path.join(_PROJECT_ROOT, "opencode.log"))
 
-# brain 文本回复的临时 session id 登记表（有界 FIFO）。
-# brain 现在与 event_watcher 的 SSE 循环同进程共享内存：brain 在托管 serve 上建的
-# 临时 session 会在 SSE 流里冒出 session.status/idle 事件，若不区分会触发 core
-# format_and_forward 的"收到新请求/会话完成"业务通知（刷屏）。这里登记 brain 自己的
-# session id（连同来源会话 conv 上下文），供：
-#   - custom.routes.route_sse_event 抑制这些事件（不影响合并转发业务 session）；
-#   - question 能力把 question.asked / 答案路由回**来源群**（事件只有 sessionID，无 conv_id）。
-# 值是 ctx dict（含 conv_id/conv_type），无 ctx 时为 {}。有界 + FIFO。
-_TEXTREPLY_SIDS = OrderedDict()
-_TEXTREPLY_SIDS_MAX = 256
-_textreply_lock = threading.Lock()
-
-
-def _register_textreply_sid(sid, ctx=None):
-    """登记 brain 临时 session；ctx 可含来源会话（conv_id/conv_type）供事件回程路由。"""
-    if not sid:
-        return
-    with _textreply_lock:
-        _TEXTREPLY_SIDS[sid] = dict(ctx or {})
-        while len(_TEXTREPLY_SIDS) > _TEXTREPLY_SIDS_MAX:
-            _TEXTREPLY_SIDS.popitem(last=False)
-
-
-def is_textreply_session(sid):
-    """判断某 SSE sessionID 是否是 brain 文本回复的临时 session。
-
-    供 custom.routes.route_sse_event 调用：命中则抑制该事件的业务通知。
-    """
-    if not sid:
-        return False
-    with _textreply_lock:
-        return sid in _TEXTREPLY_SIDS
-
-
-def session_conv(sid):
-    """取某 session 登记的来源会话 ctx（{conv_id, conv_type, ...}）；未登记返回 None。
-
-    question 能力用它把 question.asked / 答案路由回来源群。
-    """
-    if not sid:
-        return None
-    with _textreply_lock:
-        v = _TEXTREPLY_SIDS.get(sid)
-        return dict(v) if v is not None else None
+# 临时 session 登记表已上浮到 core.brain（纯机制，供 text_reply 抑制 SSE 通知 +
+# question 回程路由）。这里 re-export，保持本模块内 _register_textreply_sid 等调用不变，
+# 且能力 `from custom.brain import ...` 向后兼容。
+from core.brain import (                                # noqa: E402
+    register_session as _register_textreply_sid,
+    is_textreply_session,
+    session_conv,
+)
 # 系统提示词（proxy/opencode 后端），可用环境变量覆盖
 _SYSTEM_PROMPT = os.environ.get(
     "AGENT_SYSTEM_PROMPT",
@@ -322,3 +284,8 @@ def _brain_proxy(user, text, ctx, raw=False):
     r = urllib.request.urlopen(req, timeout=60)
     d = json.loads(r.read().decode("utf-8"))
     return (d.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+
+
+# 把 opencode/proxy/echo 生成实现注册给 core.brain，让能力经 core.brain.generate_reply 统一调用。
+from core.brain import register_brain  # noqa: E402
+register_brain(generate_reply)

@@ -28,9 +28,9 @@ from collections import OrderedDict
 from core.agent_common import _run_cli, log, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
-from custom.brain import generate_reply
+from core.brain import generate_reply
 from custom.handler import fetch_attachments, _fetch_senders
-from custom.replier import send_reply
+from core.replier import send_reply
 
 # 合并转发聊天记录的 content 摘要特征。DingTalk 合并转发（chatRecord）的 content 是一段
 # 摘要，含「聊天记录」（如「群聊的聊天记录」「X与Y的聊天记录」）。可用环境变量覆盖。

@@ -8,6 +8,13 @@
 删/停用能力：注掉 import，或设 CAP_<NAME>_ENABLED=0（推荐后者，保留代码）。
 """
 
+# 先注入平台实现：import custom.brain / custom.replier 会 register_brain / register_replier，
+# 让能力经 core.brain.generate_reply / core.replier.send_reply 拿到 opencode/dws 实现（#52 P2）。
+# 必须在能力 import 之前（能力模块顶层从 core.brain/replier 取函数引用；实现注册是运行时状态，
+# 顺序其实不敏感——能力调用发生在运行时——但显式先注册更清晰）。
+from custom import brain as _brain    # noqa: F401  注册 opencode/proxy/echo 大脑实现
+from custom import replier as _replier  # noqa: F401  注册 dws 发送实现
+
 # 顺序不影响分发（分发按 Capability.priority），只影响注册日志顺序。
 from custom.capabilities import ack         # noqa: F401  回执：已读+状态表情（默认开）
 from custom.capabilities import text_reply  # noqa: F401  文本回复（brain→replier）

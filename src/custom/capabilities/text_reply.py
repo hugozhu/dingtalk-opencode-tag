@@ -14,8 +14,8 @@
 from core.agent_common import log, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
-from custom.brain import generate_reply, is_textreply_session
-from custom.replier import send_reply
+from core.brain import generate_reply, is_textreply_session
+from core.replier import send_reply
 
 
 def _handle_text_reply(user, text, conv_type, conv_id, msg_id):
