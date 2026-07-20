@@ -9,7 +9,7 @@
 """
 
 # 顺序不影响分发（分发按 Capability.priority），只影响注册日志顺序。
-from custom.capabilities import ack         # noqa: F401  回执：已读+状态表情（默认关）
+from custom.capabilities import ack         # noqa: F401  回执：已读+状态表情（默认开）
 from custom.capabilities import text_reply  # noqa: F401  文本回复（brain→replier）
 from custom.capabilities import forward     # noqa: F401  合并转发（chatRecord）
 from custom.capabilities import image       # noqa: F401  图片识别（vision 兜底）
