@@ -15,7 +15,7 @@ SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from custom.capabilities import aggregation as A
+from core.builtin_caps import aggregation as A
 from core.capabilities import Capability
 from core.inbound import InboundMessage, KIND_TEXT
 

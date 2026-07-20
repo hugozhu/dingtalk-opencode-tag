@@ -15,7 +15,7 @@ SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from custom.capabilities import question as Q
+from core.builtin_caps import question as Q
 from core.inbound import InboundMessage, KIND_TEXT
 
 _SINGLE = [{"question": "晚饭吃什么？", "header": "", "multiple": False,
