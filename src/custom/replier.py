@@ -13,6 +13,7 @@ import os
 import subprocess
 
 from core.agent_common import ROBOT_CODE, PROFILE, log
+from core.capabilities import dispatch_reply_sent
 
 _REPLY_MODE = os.environ.get("AGENT_REPLY_MODE", "log")
 # 回复标题（send-by-bot 需要 title）
@@ -43,12 +44,18 @@ def send_reply(conv_id, conv_type, text, *, at_user_id=None):
         return False
 
     if _REPLY_MODE == "bot":
-        return _reply_bot(conv_id, text, at_user_id)
-    if _REPLY_MODE == "user":
-        return _reply_user(conv_id, text)
-    # 默认 log 模式：只记录不发送
-    log(f"[reply:log] → conv={conv_id[:16]} text={text[:120]!r}")
-    return True
+        ok = _reply_bot(conv_id, text, at_user_id)
+    elif _REPLY_MODE == "user":
+        ok = _reply_user(conv_id, text)
+    else:
+        # 默认 log 模式：只记录不发送（仍视为"已回复"，让回执状态机收尾）
+        log(f"[reply:log] → conv={conv_id[:16]} text={text[:120]!r}")
+        ok = True
+
+    # 通知回执能力（ack）"回复已发出"，把处理中表情换成完成/失败。best-effort，
+    # 广播里的异常已被 dispatch 隔离，绝不影响本次回复结果。
+    dispatch_reply_sent(conv_id, conv_type, ok)
+    return ok
 
 
 def _reply_bot(conv_id, text, at_user_id):
