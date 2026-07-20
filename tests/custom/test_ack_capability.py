@@ -122,15 +122,19 @@ class TestOnInbound(unittest.TestCase):
             ack.on_inbound(_msg(msg_id="d=="))
             self.assertEqual(beg.call_count, 1)
 
-    def test_out_of_scope_skipped(self):
+    def test_group_non_at_marks_read_not_begin(self):
+        # 群普通消息：不完整回执，但标记已读（本次需求）
         with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
-             patch.object(ack, "_begin") as beg:
+             patch.object(ack, "_MARK_READ", True), \
+             patch.object(ack, "_begin") as beg, patch.object(ack, "_mark_read") as mr:
             self.assertFalse(ack.on_inbound(_msg(conv_type="2")))
             beg.assert_not_called()
+            mr.assert_called_once()
 
 
 class TestRaceUpgrade(unittest.TestCase):
-    """群里被@时 group+at 双投同一 msgId、行序不定 → 恰好启动一次回执（#46）。"""
+    """群里被@时 group+at 双投同一 msgId、行序不定 → 恰好启动一次回执（#46）。
+    群投递(非AT)先到会先标记已读，@投递到后升级为完整回执。"""
     def setUp(self):
         ack._seen.clear()
 
@@ -140,24 +144,60 @@ class TestRaceUpgrade(unittest.TestCase):
 
     def test_untagged_then_tagged_begins_once(self):
         with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
-             patch.object(ack, "_begin") as beg:
-            ack.on_inbound(self._grp("m==", at=False))   # 群投递（未打标）先到
+             patch.object(ack, "_MARK_READ", True), \
+             patch.object(ack, "_begin") as beg, patch.object(ack, "_mark_read") as mr:
+            ack.on_inbound(self._grp("m==", at=False))   # 群投递（未打标）先到 → 仅标已读
             ack.on_inbound(self._grp("m==", at=True))    # @我投递（打标）后到 → 升级启动
             self.assertEqual(beg.call_count, 1)
+            self.assertEqual(mr.call_count, 1)           # 已读只标一次（begin 自带已读）
 
     def test_tagged_then_untagged_begins_once(self):
         with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
-             patch.object(ack, "_begin") as beg:
+             patch.object(ack, "_MARK_READ", True), \
+             patch.object(ack, "_begin") as beg, patch.object(ack, "_mark_read") as mr:
             ack.on_inbound(self._grp("m==", at=True))    # 打标先到 → 启动
-            ack.on_inbound(self._grp("m==", at=False))   # 未打标后到 → 不重复启动
+            ack.on_inbound(self._grp("m==", at=False))   # 未打标后到 → 不重复启动、不再标已读
             self.assertEqual(beg.call_count, 1)
+            self.assertEqual(mr.call_count, 0)           # begin 内部标已读；这里不额外标
 
-    def test_both_untagged_group_never_begins(self):
+    def test_both_untagged_group_marks_read_once_no_begin(self):
         with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
-             patch.object(ack, "_begin") as beg:
+             patch.object(ack, "_MARK_READ", True), \
+             patch.object(ack, "_begin") as beg, patch.object(ack, "_mark_read") as mr:
             ack.on_inbound(self._grp("m==", at=False))
             ack.on_inbound(self._grp("m==", at=False))
             beg.assert_not_called()
+            self.assertEqual(mr.call_count, 1)           # 普通群消息：仅标已读一次
+
+
+class TestMarkReadOnly(unittest.TestCase):
+    """订阅群里的普通(非@)消息：只标记已读，不贴状态表情、不起 worker（本次需求）。"""
+    def setUp(self):
+        ack._seen.clear()
+
+    def test_group_non_at_marks_read_no_emotion(self):
+        with patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True), \
+             patch.object(ack, "_MARK_READ", True), \
+             patch.object(ack, "_begin") as beg, patch.object(ack, "_mark_read") as mr:
+            ack.on_inbound(_msg(conv_type="2", conv_id="cG==", msg_id="mg=="))
+            beg.assert_not_called()
+            mr.assert_called_once_with("cG==", "mg==")
+
+    def test_mark_read_off_disables_group_read(self):
+        with patch.object(ack, "_MARK_READ", False), \
+             patch.object(ack, "_begin") as beg, patch.object(ack, "_mark_read") as mr:
+            ack.on_inbound(_msg(conv_type="2", conv_id="cG==", msg_id="mg2=="))
+            beg.assert_not_called()
+            mr.assert_not_called()
+
+    def test_should_mark_read_scope(self):
+        with patch.object(ack, "_MARK_READ", True):
+            self.assertTrue(ack._should_mark_read(_msg(conv_type="2")))   # 群
+            self.assertTrue(ack._should_mark_read(_msg(conv_type="1")))   # 单聊
+            self.assertFalse(ack._should_mark_read(_msg(conv_id="")))     # 缺 id
+        with patch.object(ack, "_MARK_READ", False):
+            self.assertFalse(ack._should_mark_read(_msg(conv_type="2")))
+
 
 
 class TestEmotionCache(unittest.TestCase):

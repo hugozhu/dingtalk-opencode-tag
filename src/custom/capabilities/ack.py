@@ -143,35 +143,45 @@ class _Pending:
         self.cur = None           # 当前贴着的 (表情, 文字)（worker 独占，无需锁）
 
 
-def _note_and_should_begin(msg_id, acked):
-    """登记 msgId 并判定是否应为它启动一次回执 worker（含“被 @ 群消息经 group+at 双投、
-    行序不定”的竞态处理，见 #46）。
+def _note_and_plan(msg_id, want_begin, want_read):
+    """登记 msgId 并返回本次应执行的动作 (do_begin, do_read)，处理双投行序竞态（#46）。
 
-    _seen 的值 = “是否已为该 msgId 启动过回执”（bool）。同一 msgId 可能被投递两次
-    （群订阅未打标 + @我订阅打标），两行合流进单一 log-tail、顺序不定：
-      - 未打标(未 acked)先到：记 False，不启动；随后打标(acked)到 → 启动（升级）。
-      - 打标先到：启动、记 True；随后未打标到 acked=False → 不重复启动，且 True 保留。
-    返回 True 表示“现在应启动”（此前没启动过 且 本次 acked）。空 msgId 不去重，按 acked 决定。
+    _seen 的值是该 msgId 已达到的最高状态：
+      None(未见) < "read"(已标记已读) < "begun"(已启动完整回执 worker)
+    同一 msgId 可能被投递两次（群订阅未打标 + @我订阅打标），合流进单一 log-tail、顺序不定：
+      - 群非AT(want_begin=False,want_read=True) 先到 → 标记已读，记 "read"；
+        随后 @我(want_begin=True) 到 → 升级启动 worker（worker 会再 mark-read，幂等无害）。
+      - @我 先到 → 启动 worker，记 "begun"；随后群非AT 到 → 已是 begun，什么都不做。
+    返回 (do_begin, do_read)：
+      do_begin = want_begin 且 之前未 begun
+      do_read  = want_read 且 之前既未 read 也未 begun（避免重复 mark-read；begin 内部自带 mark-read）
     """
+    order = {None: 0, "read": 1, "begun": 2}
     if not msg_id:
-        return acked
+        # 无 msgId 不去重：按意愿直接执行（begin 优先，其自带 mark-read）
+        return (want_begin, want_read and not want_begin)
     with _seen_lock:
-        prev_acked = _seen.get(msg_id, False)
-        _seen[msg_id] = bool(prev_acked or acked)
-        _seen.move_to_end(msg_id)
-        if len(_seen) > _SEEN_MAX:
-            _seen.popitem(last=False)
-    return bool(acked and not prev_acked)
+        prev = _seen.get(msg_id)
+        do_begin = want_begin and order[prev] < order["begun"]
+        do_read = want_read and not want_begin and prev is None
+        new_state = "begun" if (want_begin or prev == "begun") else \
+                    ("read" if (want_read or prev == "read") else prev)
+        if new_state is not None:
+            _seen[msg_id] = new_state
+            _seen.move_to_end(msg_id)
+            if len(_seen) > _SEEN_MAX:
+                _seen.popitem(last=False)
+    return (do_begin, do_read)
 
 
 def _should_ack(msg):
-    """纯判定：这条消息是否要回执（不含自过滤/去重，那两步在 on_inbound 早退）。
+    """纯判定：这条消息是否要**完整回执**（已读 + 状态文字表情）。
 
-    需要 conv_id + msg_id（回执 API 必填）。触发范围：
+    需要 conv_id + msg_id（回执 API 必填）。完整回执范围：
       - 单聊(conv_type=1) → 回执（#45 原行为）
       - 群(conv_type=2) 且本条被 @ 数字员工（extra['at_mention']）且 ACK_AT_MENTION 开 → 回执（#46）
-      - ACK_O2O_ONLY=0 → 群里所有消息也回执（原逃生口，噪音大，默认关）
-      - 其它群消息（未被 @）→ 不回执
+      - ACK_O2O_ONLY=0 → 群里所有消息也完整回执（原逃生口，噪音大，默认关）
+      - 其它群消息（未被 @）→ 不做完整回执（但可能只标记已读，见 _should_mark_read）
     """
     if not msg.conv_id or not msg.msg_id:
         return False
@@ -182,6 +192,17 @@ def _should_ack(msg):
     if not _O2O_ONLY:
         return True
     return False
+
+
+def _should_mark_read(msg):
+    """纯判定：这条消息是否要**标记已读**（比完整回执更宽——订阅群里的普通消息也标已读，
+    只是不贴状态表情，避免群里逐条贴表情的噪音）。ACK_MARK_READ 总开关；需 conv_id+msg_id。
+    订阅到的消息（单聊/群 @/群普通）都在范围内。"""
+    if not _MARK_READ:
+        return False
+    if not msg.conv_id or not msg.msg_id:
+        return False
+    return True
 
 
 # --- DingTalk 回执调用（best-effort，失败只记日志不抛）---
@@ -344,14 +365,21 @@ def _begin(msg):
 def on_inbound(msg):
     """回执入站：非消费型（返回 False 让后续能力照常回复）。
 
-    自己发的 → 放行。否则登记 msgId + 判定是否该启动回执（含 #46 双投行序竞态处理），
-    该启动才 _begin。绝不消费消息（text_reply 等仍会处理并回复）。
+    自己发的 → 放行。否则按范围判定：
+      - 完整回执（单聊 / 群被@）→ 启动 worker（已读 + 状态表情，随处理进度更新）；
+      - 仅标记已读（订阅群里的普通消息）→ 只 mark-read，不贴表情、不起 worker。
+    双投同一 msgId（群+@我）行序不定时，_note_and_plan 保证 begin 恰好一次、mark-read 不重复。
+    绝不消费消息（text_reply 等仍会处理并回复）。
     """
     if msg.user in _SELF_NAMES:
         return False
-    acked = _should_ack(msg)
-    if _note_and_should_begin(msg.msg_id, acked):
-        _begin(msg)
+    want_begin = _should_ack(msg)
+    want_read = _should_mark_read(msg)
+    do_begin, do_read = _note_and_plan(msg.msg_id, want_begin, want_read)
+    if do_begin:
+        _begin(msg)          # 完整回执（worker 内部会 mark-read + 贴表情）
+    elif do_read:
+        _mark_read(msg.conv_id, msg.msg_id)   # 仅标记已读（best-effort，失败只记日志）
     return False   # 关键：不消费，text_reply 等仍会处理并回复
 
 
