@@ -24,8 +24,8 @@ import time
 from core.agent_common import log, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
-from custom.brain import generate_reply
-from custom.replier import send_reply
+from core.brain import generate_reply
+from core.replier import send_reply
 
 # 时间窗（秒）：缓冲第一条后多久 flush
 _AGG_WINDOW = float(os.environ.get("CAP_AGGREGATION_WINDOW", "300"))

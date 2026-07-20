@@ -24,8 +24,8 @@ import tempfile
 from core.agent_common import _run_cli, log, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_FILE
-from custom.brain import generate_reply
-from custom.replier import send_reply
+from core.brain import generate_reply
+from core.replier import send_reply
 
 # 从 content 提取 fileId 和文件名
 # 格式：[文件] <文件名> fileId: <fileId> 注意：...

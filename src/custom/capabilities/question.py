@@ -29,8 +29,8 @@ import urllib.request
 from core.agent_common import find_serve_credentials, log
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
-from custom.brain import session_conv
-from custom.replier import send_reply
+from core.brain import session_conv
+from core.replier import send_reply
 
 # 超时未答自动 reject 的秒数（serve 端 question 无 TTL，这是安全网防会话卡死）
 _Q_TIMEOUT = int(os.environ.get("CAP_QUESTION_TIMEOUT", os.environ.get("Q_TIMEOUT", "60")))
