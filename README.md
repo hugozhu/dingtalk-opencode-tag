@@ -199,7 +199,7 @@ for t in tests/core/*.py tests/custom/*.py; do python3 "$t"; done   # Python 单
 "收到含关键词 '排班' 的群消息时，查考勤 API 并回复本周排班表">。
 
 要求：
-- 参照现有能力的写法（如 src/custom/capabilities/text_reply.py / image.py），
+- 参照现有能力的写法（如 src/custom/capabilities/image.py / file.py），
   声明一个 Capability 并 register()，挂到合适的钩子（on_inbound / on_sse_event / on_cleanup）。
 - 在 src/custom/capabilities/__init__.py 里 import 它。
 - 加一个 CAP_<NAME>_ENABLED 开关（默认值自定），并在 config/constants.sh 文档化。
@@ -251,7 +251,7 @@ flowchart TB
         direction TB
         LT["log-tail → inbound.parse_line<br/>→ InboundMessage(kind)"]
         REG{{"能力注册表 core.capabilities<br/>按 kind + priority 分发"}}
-        CAPS["能力插件 · custom · 各自 CAP_*_ENABLED 开关<br/>text_reply · image · file · forward · question · aggregation"]
+        CAPS["能力（各自 CAP_*_ENABLED 开关）<br/>core 原语：text_reply · question · aggregation<br/>custom 定制：ack · forward · image · file"]
         LT --> REG --> CAPS
     end
 
@@ -299,13 +299,15 @@ FDE 交付时通过物理分层实现"改得动 + merge 得回"：
 src/
 ├── core/                     ← harness 核心（不改）
 │   ├── event_watcher.py      ← 事件监听主进程（SSE 重连 + log-tail + 能力分发）
-│   ├── capabilities.py       ← 能力注册表（可组装/可选配的插件框架）
+│   ├── capabilities.py       ← 能力注册表（可组装/可选配的插件框架 + 声明式去重/防回环）
 │   ├── inbound.py            ← 统一 InboundMessage（消息归一 + kind 分类）
+│   ├── brain.py / replier.py ← 生成/发送**协议** + 注册点（默认 echo/log；custom 注入实现）
+│   ├── builtin_caps/         ← 自带通用能力原语（text_reply / question / aggregation，0 平台耦合）
 │   └── agent_common.py       ← 共享工具（serve 访问 / 通知 / inject_and_forward）
 ├── custom/                   ← FDE 改这里
-│   ├── capabilities/         ← 能力插件（text_reply / image / file / forward / question / aggregation）
-│   ├── brain.py              ← "大脑"：调 opencode serve 生成回复（免费模型）
-│   └── replier.py            ← 把回复发回钉钉
+│   ├── capabilities/         ← 钉钉强耦合能力（ack / forward / image / file）+ 启用清单 __init__
+│   ├── brain.py              ← 注册 opencode serve 生成实现（免费模型）
+│   └── replier.py            ← 注册 dws 发送实现
 bin/
 ├── core/                     ← 守护/健康检查（不改）：monitor / healthcheck / reboot / lib
 └── custom/                   ← start_funcs.sh（组件启动）/ dws-connect.sh（群订阅）/ plist + service（托管模板）

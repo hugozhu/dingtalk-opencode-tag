@@ -15,13 +15,17 @@
 from custom import brain as _brain    # noqa: F401  注册 opencode/proxy/echo 大脑实现
 from custom import replier as _replier  # noqa: F401  注册 dws 发送实现
 
+# core 自带的通用能力原语（0 平台耦合）——由 custom 决定启用（#52 P3）。
+# 各自受 CAP_<NAME>_ENABLED 开关控制，注释掉即停用。
+from core.builtin_caps import text_reply    # noqa: F401  文本回复（brain→replier 骨架）
+from core.builtin_caps import question      # noqa: F401  Question 交互（serve /question）
+from core.builtin_caps import aggregation   # noqa: F401  群消息聚合（默认关）
+
 # 顺序不影响分发（分发按 Capability.priority），只影响注册日志顺序。
+# 钉钉强耦合能力留 custom（FDE 定制）：
 from custom.capabilities import ack         # noqa: F401  回执：已读+状态表情（默认开）
-from custom.capabilities import text_reply  # noqa: F401  文本回复（brain→replier）
 from custom.capabilities import forward     # noqa: F401  合并转发（chatRecord）
 from custom.capabilities import image       # noqa: F401  图片识别（vision 兜底）
 from custom.capabilities import file        # noqa: F401  文档/文件处理（受控下载+注入）
-from custom.capabilities import question    # noqa: F401  Question 交互（钉钉端答 agent 提问）
-from custom.capabilities import aggregation  # noqa: F401  群消息聚合（默认关）
 
 __all__ = ["ack", "text_reply", "forward", "image", "file", "question", "aggregation"]

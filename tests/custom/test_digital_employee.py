@@ -22,7 +22,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from custom import brain, replier, routes
-from custom.capabilities import text_reply
+from core.builtin_caps import text_reply
 from core import inbound
 
 # 测试隔离：把 opencode 调用日志重定向到临时文件，避免污染项目根的运行时 opencode.log
