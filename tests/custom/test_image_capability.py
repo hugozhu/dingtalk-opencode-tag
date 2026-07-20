@@ -32,9 +32,6 @@ class TestImageDetection(unittest.TestCase):
 
 
 class TestImageRouting(unittest.TestCase):
-    def setUp(self):
-        image._seen.clear()
-
     def _msg(self, user="hugozhu", mid="msgIMG==", text="[图片消息](mediaId=$x)"):
         return InboundMessage(user=user, text=text, conv_type="2",
                               conv_id="cid==", msg_id=mid, kind=KIND_IMAGE)
@@ -45,18 +42,10 @@ class TestImageRouting(unittest.TestCase):
             self.assertTrue(image.on_inbound(self._msg()))
         self.assertEqual(len(calls), 1)
 
-    def test_self_filtered(self):
-        with patch.object(image, "_SELF_NAMES", {"opencode"}), \
-             patch.object(image, "submit_handler") as sh:
-            self.assertTrue(image.on_inbound(self._msg(user="opencode")))
-            sh.assert_not_called()
-
-    def test_dedup(self):
-        calls = []
-        with patch.object(image, "submit_handler", side_effect=lambda fn, *a: calls.append(a)):
-            image.on_inbound(self._msg(mid="dup=="))
-            image.on_inbound(self._msg(mid="dup=="))
-        self.assertEqual(len(calls), 1)
+    def test_declares_dedup_and_loop_guard(self):
+        # 防回环 + 去重由 core 依 Capability 声明处理（见 tests/core/test_capabilities）
+        self.assertTrue(image.CAPABILITY.loop_guard)
+        self.assertTrue(image.CAPABILITY.dedup)
 
 
 class TestHandleImage(unittest.TestCase):

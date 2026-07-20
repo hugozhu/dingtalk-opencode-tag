@@ -22,7 +22,9 @@
 - `on_reply_sent(conv_id, conv_type, ok) -> None`   通知型，不短路（所有能力都收到）
 """
 
+import os
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Set
 
@@ -48,6 +50,11 @@ class Capability:
             忽略、不短路（所有能力都会收到）。ack 回执能力据此把"处理中"表情换成完成/失败。
         priority: 分发顺序，**小的先**（catch-all 的文本回复用较大值兜底）
         default_enabled: 未设开关环境变量时的默认启用状态
+        loop_guard: True 时 dispatch_inbound 在调 on_inbound 前跳过“数字员工自己发的”消息
+            （msg.user ∈ AGENT_SELF_NAMES），能力无需各自写防回环样板。
+        dedup: True 时 dispatch_inbound 按 msg.msg_id **每能力独立**去重（有界 FIFO），
+            见过的直接跳过，能力无需各自写 _seen 样板。注意：需要“见过但未处理→升级”这类
+            自定义去重语义的能力（如 ack 的 read/begun 三态）不要用本项，自己在 on_inbound 内处理。
     """
     name: str
     on_inbound: Optional[Callable] = None
@@ -58,6 +65,8 @@ class Capability:
     on_reply_sent: Optional[Callable] = None
     priority: int = 100
     default_enabled: bool = True
+    loop_guard: bool = False
+    dedup: bool = False
 
     def enabled(self):
         """读 CAP_<NAME>_ENABLED 开关；未设置用 default_enabled。"""
@@ -84,6 +93,48 @@ def clear():
     """清空注册表（测试用）。"""
     with _lock:
         _registry.clear()
+    _dedup_clear()
+
+
+# ---------------------------------------------------------------------------
+# 声明式预处理：防回环（loop_guard）+ 去重（dedup）—— 供能力零样板复用
+# ---------------------------------------------------------------------------
+
+# 防回环：数字员工自己的发送名（AGENT_SELF_NAMES，逗号分隔）。每次读取（便于测试改 env）。
+def _self_names():
+    return {
+        n.strip()
+        for n in os.environ.get("AGENT_SELF_NAMES", "数字员工,Claude Code").split(",")
+        if n.strip()
+    }
+
+
+# 去重：每能力独立命名空间的有界 FIFO（避免能力间 msgId 互相干扰）。
+_DEDUP_MAX = int(os.environ.get("CAP_DEDUP_MAX", "2048"))
+_dedup = {}                 # cap_name -> OrderedDict(msg_id -> None)
+_dedup_lock = threading.Lock()
+
+
+def _dedup_seen(cap_name, msg_id):
+    """本能力是否已见过该 msg_id（见过返回 True）。空 msg_id 不去重（放行）。"""
+    if not msg_id:
+        return False
+    with _dedup_lock:
+        seen = _dedup.get(cap_name)
+        if seen is None:
+            seen = _dedup[cap_name] = OrderedDict()
+        if msg_id in seen:
+            return True
+        seen[msg_id] = None
+        if len(seen) > _DEDUP_MAX:
+            seen.popitem(last=False)
+    return False
+
+
+def _dedup_clear():
+    """清空去重状态（测试用）。"""
+    with _dedup_lock:
+        _dedup.clear()
 
 
 def enabled_capabilities():
@@ -117,12 +168,19 @@ def dispatch_inbound(msg):
     """把 InboundMessage 交给启用能力按序分发。返回 True 表示被某能力消费。
 
     按 kind 路由：能力 handles_kinds 非空时，只有 msg.kind 命中才调用它。
+    声明式预处理（调 on_inbound 前）：
+      - loop_guard=True：msg.user ∈ AGENT_SELF_NAMES → 跳过本能力（防自问自答）。
+      - dedup=True：本能力已见过 msg.msg_id → 跳过（每能力独立有界 FIFO 去重）。
     短路：第一个 on_inbound 返回 True 的能力消费该消息，后续不再收到。
     """
     for cap in enabled_capabilities():
         if cap.on_inbound is None:
             continue
         if cap.handles_kinds and msg.kind not in cap.handles_kinds:
+            continue
+        if cap.loop_guard and msg.user and msg.user in _self_names():
+            continue
+        if cap.dedup and _dedup_seen(cap.name, msg.msg_id):
             continue
         try:
             if cap.on_inbound(msg):

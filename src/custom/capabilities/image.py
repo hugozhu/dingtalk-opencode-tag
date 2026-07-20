@@ -21,9 +21,7 @@ import json
 import os
 import re
 import tempfile
-import threading
 import urllib.request
-from collections import OrderedDict
 
 from core.agent_common import _proxy_vision, _run_cli, find_serve_credentials, log, submit_handler
 from core.capabilities import Capability, register
@@ -48,16 +46,7 @@ _VISION_PROMPT = os.environ.get(
     "不要做主观总结或解读。",
 )
 
-# 防回环：数字员工自己发的图不处理
-_SELF_NAMES = {
-    n.strip() for n in os.environ.get("AGENT_SELF_NAMES", "数字员工,Claude Code").split(",")
-    if n.strip()
-}
-
-# msgId 去重（断线重连可能重投）—— 有界 FIFO
-_seen = OrderedDict()
-_seen_lock = threading.Lock()
-_SEEN_MAX = 2048
+# msgId 去重（断线重连可能重投）+ 防回环由 core 声明式处理（见 Capability(dedup/loop_guard)）。
 
 # prompt 末句：点明这是图片、内容是 vision 识别的，让 agent 基于内容回应（别再说看不到图）
 _IMAGE_PROMPT_FOOTER = os.environ.get(
@@ -65,18 +54,6 @@ _IMAGE_PROMPT_FOOTER = os.environ.get(
     "以上「图片识别内容」由多模态模型从用户发送的图片中提取/描述得到（你本身看不到原图，"
     "但可据此内容回应）。请结合用户随图的说明（若有），对用户的意图做出有帮助的回应。",
 )
-
-
-def _seen_before(msg_id):
-    if not msg_id:
-        return False
-    with _seen_lock:
-        if msg_id in _seen:
-            return True
-        _seen[msg_id] = None
-        if len(_seen) > _SEEN_MAX:
-            _seen.popitem(last=False)
-    return False
 
 
 def _download_image(media_id, msg_id, conv_id):
@@ -226,11 +203,10 @@ def handle_image(user, text, msg_id, conv_id, conv_type):
 
 
 def on_inbound(msg):
-    """图片消息入站：防回环 → 去重 → 提交 handle_image。返回 True=已消费。"""
-    if msg.user in _SELF_NAMES:
-        return True
-    if _seen_before(msg.msg_id):
-        return True
+    """图片消息入站：提交 handle_image。返回 True=已消费。
+
+    防回环 + msgId 去重由 core dispatch_inbound（loop_guard/dedup 声明）处理。
+    """
     submit_handler(handle_image, msg.user, msg.text, msg.msg_id, msg.conv_id, msg.conv_type)
     return True
 
@@ -241,5 +217,7 @@ CAPABILITY = Capability(
     handles_kinds={KIND_IMAGE},
     priority=40,             # 图片检测最明确，先于转发(50)/文本(100)
     default_enabled=True,
+    loop_guard=True,         # core 统一防回环
+    dedup=True,              # core 统一 msgId 去重
 )
 register(CAPABILITY)

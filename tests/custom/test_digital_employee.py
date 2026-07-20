@@ -181,10 +181,7 @@ class TestReplierLogMode(unittest.TestCase):
 
 
 class TestTextReplyCapability(unittest.TestCase):
-    """text_reply 能力：InboundMessage(kind=text) → 防回环 + 去重 + 提交大脑。"""
-
-    def setUp(self):
-        text_reply._reply_seen.clear()
+    """text_reply 能力：InboundMessage(kind=text) → 提交大脑（防回环+去重由 core 声明式处理）。"""
 
     def _msg(self, user, text, conv="cidXYZ==", mid="msg1=="):
         line = f"[connect] 收到 @{user}: {text} (convType=2 convId={conv} msgId={mid})"
@@ -202,23 +199,10 @@ class TestTextReplyCapability(unittest.TestCase):
         self.assertEqual(calls[0][3], "cidXYZ==")
         self.assertEqual(calls[0][4], "msg1==")
 
-    def test_self_message_filtered(self):
-        calls = []
-        with patch.object(text_reply, "_SELF_NAMES", {"数字员工"}), \
-             patch.object(text_reply, "submit_handler",
-                          side_effect=lambda fn, *a: calls.append(a)):
-            consumed = text_reply.on_inbound(self._msg("数字员工", "你好"))
-        self.assertTrue(consumed)      # 消费掉（不再往下传）
-        self.assertEqual(calls, [])    # 但不提交大脑（自己发的）
-
-    def test_duplicate_msgid_dedup(self):
-        calls = []
-        with patch.object(text_reply, "submit_handler",
-                          side_effect=lambda fn, *a: calls.append(a)):
-            m = self._msg("张三", "你好", mid="dupmsg==")
-            text_reply.on_inbound(m)
-            text_reply.on_inbound(self._msg("张三", "你好", mid="dupmsg=="))
-        self.assertEqual(len(calls), 1)  # 第二次去重
+    def test_declares_dedup_and_loop_guard(self):
+        # 防回环 + 去重交给 core（见 tests/core/test_capabilities）
+        self.assertTrue(text_reply.CAPABILITY.loop_guard)
+        self.assertTrue(text_reply.CAPABILITY.dedup)
 
     def test_handle_text_reply_calls_brain_and_replier(self):
         with patch.object(text_reply, "generate_reply", return_value="生成的回复") as g, \
