@@ -53,12 +53,18 @@ def _to_connect_line(evt):
     conv_id = body.get("openConversationId", "")
     msg_id = body.get("openMessageId", "")
     conv_type = _CONV_TYPE_BY_EVENT.get(etype, 2)
+    # @我(at) 事件天然是“被 @ 的消息”（payload 无显式 atUsers 字段，唯一可靠信号是事件类型）。
+    # 打标 atMention=1 让 core.inbound.parse_line 解析进 extra['at_mention']，供 ack 回执判定
+    # “群里被 @”这一路（#46）。放在 msgId 之后、) 之前——_CONVID_RE/_MSGID_RE 止于空白/)，不受影响。
+    at_mention = etype == "user_im_message_receive_at"
 
     if not content:
         return None
     # 格式对齐 event_watcher.REPLY_RE：'\[connect\] 收到 @(.+?):\s*(.+?)\s+\(convType=(\d+)'
-    return (f"[connect] 收到 @{sender}: {content} "
-            f"(convType={conv_type} convId={conv_id} msgId={msg_id})")
+    tail = f"convType={conv_type} convId={conv_id} msgId={msg_id}"
+    if at_mention:
+        tail += " atMention=1"
+    return f"[connect] 收到 @{sender}: {content} ({tail})"
 
 
 def main():

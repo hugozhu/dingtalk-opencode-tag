@@ -41,7 +41,7 @@ def _event(etype, sender="hugozhu", content="hi", conv="cidABC==",
 
 class TestToConnectLine(unittest.TestCase):
     def test_at_event_maps_to_group_convtype(self):
-        """@我(at) 事件 → convType=2（群语境），字段齐全。"""
+        """@我(at) 事件 → convType=2（群语境）+ atMention=1 打标，字段齐全。"""
         line = bridge._to_connect_line(
             _event("user_im_message_receive_at",
                    sender="hugozhu", content="@Claude Code 帮我看下",
@@ -51,9 +51,11 @@ class TestToConnectLine(unittest.TestCase):
         self.assertIn("convType=2", line)
         self.assertIn("convId=cidAT==", line)
         self.assertIn("msgId=msgAT==", line)
+        self.assertIn("atMention=1", line)   # #46：被 @ 打标
 
     def test_at_line_is_parseable_by_inbound(self):
-        """bridge 产出的 @我 行必须能被 core.inbound.parse_line 解析（契约对齐）。"""
+        """bridge 产出的 @我 行必须能被 core.inbound.parse_line 解析（契约对齐），
+        且 extra['at_mention']=True。"""
         import sys
         src = os.path.join(PROJECT_ROOT, "src")
         if src not in sys.path:
@@ -67,15 +69,18 @@ class TestToConnectLine(unittest.TestCase):
         self.assertEqual(m.user, "u")
         self.assertEqual(m.text, "1+1")
         self.assertEqual(m.conv_type, "2")
-        self.assertEqual(m.conv_id, "cidX==")
+        self.assertEqual(m.conv_id, "cidX==")   # atMention 标记不干扰 id 提取
         self.assertEqual(m.msg_id, "msgY==")
         self.assertEqual(m.kind, inbound.KIND_TEXT)
+        self.assertEqual(m.extra.get("at_mention"), True)
 
     def test_group_and_o2o_convtype(self):
         g = bridge._to_connect_line(_event("user_im_message_receive_group"))
         self.assertIn("convType=2", g)
+        self.assertNotIn("atMention", g)   # 普通群消息不打标
         o = bridge._to_connect_line(_event("user_im_message_receive_o2o"))
         self.assertIn("convType=1", o)
+        self.assertNotIn("atMention", o)   # 单聊不打标
 
     def test_unknown_event_defaults_group(self):
         line = bridge._to_connect_line(_event("some_future_event"))
