@@ -13,11 +13,13 @@
 - `dispatch_inbound(msg)`  —— log-tail 解析出的 InboundMessage（按 kind 路由）
 - `dispatch_sse(event, port, pwd)` —— serve SSE 事件
 - `dispatch_cleanup(event, state, lock)` —— spurious 轮次清理状态机
+- `dispatch_reply_sent(conv_id, conv_type, ok)` —— 回复发出后通知（custom.replier 调用）
 
 能力 hook 约定（都可选；不实现即不参与该分发）：
 - `on_inbound(msg) -> bool`         True=已消费，停止继续分发
 - `on_sse_event(event, port, pwd) -> bool`
 - `on_cleanup(event, state, lock) -> bool`
+- `on_reply_sent(conv_id, conv_type, ok) -> None`   通知型，不短路（所有能力都收到）
 """
 
 import threading
@@ -41,6 +43,9 @@ class Capability:
             可有状态（跨行），故只应由 core 的 log-tail 单线程调用。
         on_sse_event: 处理 serve SSE 事件，返回 True 表示已消费
         on_cleanup: spurious 轮次清理 hook，返回 True 表示已消费
+        on_reply_sent: 回复已发出通知 hook（replier.send_reply 后调用）。签名
+            (conv_id, conv_type, ok) -> None；ok 表示发送是否成功。**通知型**，返回值
+            忽略、不短路（所有能力都会收到）。ack 回执能力据此把"处理中"表情换成完成/失败。
         priority: 分发顺序，**小的先**（catch-all 的文本回复用较大值兜底）
         default_enabled: 未设开关环境变量时的默认启用状态
     """
@@ -50,6 +55,7 @@ class Capability:
     classify_line: Optional[Callable] = None
     on_sse_event: Optional[Callable] = None
     on_cleanup: Optional[Callable] = None
+    on_reply_sent: Optional[Callable] = None
     priority: int = 100
     default_enabled: bool = True
 
@@ -150,3 +156,19 @@ def dispatch_cleanup(event, state, lock):
         except Exception as e:
             log(f"capability {cap.name} on_cleanup err: {e}")
     return False
+
+
+def dispatch_reply_sent(conv_id, conv_type, ok):
+    """回复发出通知按序广播给所有启用能力（通知型，不短路）。
+
+    custom.replier.send_reply 发送后调用。ack 回执能力据此把"处理中"表情换成
+    完成/失败。异常隔离——单个能力抛错不影响其它能力，也绝不回传给 replier
+    （回执是 best-effort，不能拖累正常回复链路）。
+    """
+    for cap in enabled_capabilities():
+        if cap.on_reply_sent is None:
+            continue
+        try:
+            cap.on_reply_sent(conv_id, conv_type, ok)
+        except Exception as e:
+            log(f"capability {cap.name} on_reply_sent err: {e}")
