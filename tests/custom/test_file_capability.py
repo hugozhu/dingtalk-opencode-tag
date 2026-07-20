@@ -40,9 +40,6 @@ class TestDetection(unittest.TestCase):
 
 
 class TestRouting(unittest.TestCase):
-    def setUp(self):
-        F._seen.clear()
-
     def _msg(self, user="hugozhu", mid="msgF==", text=_FILE_LINE_CONTENT):
         return InboundMessage(user=user, text=text, conv_type="2", conv_id="cid==",
                               msg_id=mid, kind=KIND_FILE)
@@ -53,17 +50,10 @@ class TestRouting(unittest.TestCase):
             self.assertTrue(F.on_inbound(self._msg()))
         self.assertEqual(len(calls), 1)
 
-    def test_self_filtered(self):
-        with patch.object(F, "_SELF_NAMES", {"opencode"}), patch.object(F, "submit_handler") as sh:
-            self.assertTrue(F.on_inbound(self._msg(user="opencode")))
-            sh.assert_not_called()
-
-    def test_dedup(self):
-        calls = []
-        with patch.object(F, "submit_handler", side_effect=lambda fn, *a: calls.append(a)):
-            F.on_inbound(self._msg(mid="dup"))
-            F.on_inbound(self._msg(mid="dup"))
-        self.assertEqual(len(calls), 1)
+    def test_declares_dedup_and_loop_guard(self):
+        # 防回环 + 去重由 core 依 Capability 声明处理（见 tests/core/test_capabilities）
+        self.assertTrue(F.CAPABILITY.loop_guard)
+        self.assertTrue(F.CAPABILITY.dedup)
 
 
 class TestHandleFile(unittest.TestCase):

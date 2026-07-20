@@ -115,5 +115,62 @@ class TestRegistry(unittest.TestCase):
         self.assertTrue(C.dispatch_cleanup({"chit": True}, {}, None))
 
 
+class TestDeclarativeGuards(unittest.TestCase):
+    """dedup / loop_guard 声明式预处理（能力零样板，#52 P1）。"""
+    def setUp(self):
+        C.clear()
+        os.environ["AGENT_SELF_NAMES"] = "opencode,数字员工"
+
+    def tearDown(self):
+        C.clear()
+        os.environ.pop("AGENT_SELF_NAMES", None)
+
+    def _m(self, user="hugozhu", mid="m1"):
+        return InboundMessage(user=user, text="x", conv_type="1",
+                              conv_id="c", msg_id=mid, kind=KIND_TEXT)
+
+    def test_loop_guard_skips_self(self):
+        seen = []
+        C.register(C.Capability(name="t", loop_guard=True,
+                                on_inbound=lambda m: (seen.append(m.user), True)[1],
+                                handles_kinds={KIND_TEXT}, priority=10))
+        C.dispatch_inbound(self._m(user="opencode"))   # 自己发的 → 跳过
+        C.dispatch_inbound(self._m(user="hugozhu"))    # 他人 → 命中
+        self.assertEqual(seen, ["hugozhu"])
+
+    def test_dedup_skips_duplicate_msgid(self):
+        seen = []
+        C.register(C.Capability(name="t", dedup=True,
+                                on_inbound=lambda m: (seen.append(m.msg_id), True)[1],
+                                handles_kinds={KIND_TEXT}, priority=10))
+        C.dispatch_inbound(self._m(mid="a"))
+        C.dispatch_inbound(self._m(mid="a"))   # 重复 → 跳过
+        C.dispatch_inbound(self._m(mid="b"))
+        self.assertEqual(seen, ["a", "b"])
+
+    def test_dedup_namespace_per_capability(self):
+        # 不同能力的去重互不影响：同一 msgId 两个能力都能各看一次
+        s1, s2 = [], []
+        C.register(C.Capability(name="c1", dedup=True,
+                                on_inbound=lambda m: (s1.append(m.msg_id), False)[1],
+                                handles_kinds={KIND_TEXT}, priority=5))
+        C.register(C.Capability(name="c2", dedup=True,
+                                on_inbound=lambda m: (s2.append(m.msg_id), False)[1],
+                                handles_kinds={KIND_TEXT}, priority=10))
+        C.dispatch_inbound(self._m(mid="z"))
+        self.assertEqual(s1, ["z"])
+        self.assertEqual(s2, ["z"])
+
+    def test_no_flags_no_guard(self):
+        # 不声明则不预处理（保持旧默认行为）
+        seen = []
+        C.register(C.Capability(name="t",
+                                on_inbound=lambda m: (seen.append(m.msg_id), True)[1],
+                                handles_kinds={KIND_TEXT}, priority=10))
+        C.dispatch_inbound(self._m(user="opencode", mid="a"))
+        C.dispatch_inbound(self._m(user="opencode", mid="a"))
+        self.assertEqual(seen, ["a", "a"])   # 无 dedup/loop_guard → 都命中
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

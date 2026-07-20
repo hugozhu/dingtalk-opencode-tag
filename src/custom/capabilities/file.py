@@ -20,8 +20,6 @@ import os
 import re
 import shutil
 import tempfile
-import threading
-from collections import OrderedDict
 
 from core.agent_common import _run_cli, log, submit_handler
 from core.capabilities import Capability, register
@@ -45,16 +43,7 @@ _TEXT_EXTS = {
     ".sql", ".html", ".css", ".env", ".properties", ".gitignore",
 }
 
-# 防回环
-_SELF_NAMES = {
-    n.strip() for n in os.environ.get("AGENT_SELF_NAMES", "数字员工,Claude Code").split(",")
-    if n.strip()
-}
-
-# msgId 去重
-_seen = OrderedDict()
-_seen_lock = threading.Lock()
-_SEEN_MAX = 2048
+# 防回环 + msgId 去重由 core 声明式处理（见 Capability(loop_guard/dedup)）。
 
 # prompt 末句
 _FILE_PROMPT_FOOTER = os.environ.get(
@@ -62,18 +51,6 @@ _FILE_PROMPT_FOOTER = os.environ.get(
     "以上是用户发送的文件内容（由系统下载并读取，可能已截断）。请结合用户随文件的说明（若有），"
     "对用户的意图做出有帮助的回应（该答疑答疑、该归纳归纳）。",
 )
-
-
-def _seen_before(msg_id):
-    if not msg_id:
-        return False
-    with _seen_lock:
-        if msg_id in _seen:
-            return True
-        _seen[msg_id] = None
-        if len(_seen) > _SEEN_MAX:
-            _seen.popitem(last=False)
-    return False
 
 
 def _is_text_file(filename):
@@ -160,11 +137,10 @@ def handle_file(user, text, msg_id, conv_id, conv_type):
 
 
 def on_inbound(msg):
-    """文件消息入站：防回环 → 去重 → 提交 handle_file。返回 True=已消费。"""
-    if msg.user in _SELF_NAMES:
-        return True
-    if _seen_before(msg.msg_id):
-        return True
+    """文件消息入站：提交 handle_file。返回 True=已消费。
+
+    防回环 + msgId 去重由 core dispatch_inbound（loop_guard/dedup 声明）处理。
+    """
     submit_handler(handle_file, msg.user, msg.text, msg.msg_id, msg.conv_id, msg.conv_type)
     return True
 
@@ -175,5 +151,7 @@ CAPABILITY = Capability(
     handles_kinds={KIND_FILE},
     priority=40,             # 与 image 同级，先于 forward(50)/text(100)
     default_enabled=True,
+    loop_guard=True,         # core 统一防回环
+    dedup=True,              # core 统一 msgId 去重
 )
 register(CAPABILITY)
