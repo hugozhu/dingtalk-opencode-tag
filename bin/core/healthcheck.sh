@@ -16,6 +16,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$SCRIPT_DIR/bin/core/lib.sh"
 
+# 加载可配置常量（真实值在 config/constants.local.sh，被 .gitignore 忽略）——
+# 与 monitor.sh 一致，保证单独手动运行时 CONNECT_CHECK_PATTERN 等覆盖也生效
+if [[ -f "$SCRIPT_DIR/config/constants.local.sh" ]]; then
+    source "$SCRIPT_DIR/config/constants.local.sh"
+elif [[ -f "$SCRIPT_DIR/config/constants.sh" ]]; then
+    source "$SCRIPT_DIR/config/constants.sh"
+fi
+
 COMPONENT_NAME="healthcheck"
 
 # 加载组件配置
