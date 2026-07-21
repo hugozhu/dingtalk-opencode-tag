@@ -19,6 +19,7 @@ from custom import replier as _replier  # noqa: F401  注册 dws 发送实现
 # 各自受 CAP_<NAME>_ENABLED 开关控制，注释掉即停用。
 from core.builtin_caps import text_reply    # noqa: F401  文本回复（brain→replier 骨架）
 from core.builtin_caps import question      # noqa: F401  Question 交互（serve /question）
+from core.builtin_caps import permission    # noqa: F401  工具授权审批（serve permission ask）
 from core.builtin_caps import aggregation   # noqa: F401  群消息聚合（默认关）
 
 # 顺序不影响分发（分发按 Capability.priority），只影响注册日志顺序。
@@ -28,4 +29,4 @@ from custom.capabilities import forward     # noqa: F401  合并转发（chatRec
 from custom.capabilities import image       # noqa: F401  图片识别（vision 兜底）
 from custom.capabilities import file        # noqa: F401  文档/文件处理（受控下载+注入）
 
-__all__ = ["ack", "text_reply", "forward", "image", "file", "question", "aggregation"]
+__all__ = ["ack", "text_reply", "forward", "image", "file", "question", "permission", "aggregation"]

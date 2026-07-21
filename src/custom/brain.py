@@ -15,6 +15,9 @@
 opencode.log（默认 <项目根>/opencode.log，可用 AGENT_OPENCODE_LOG 覆盖）：
 transport / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败。错误恒记，不受开关影响。
 
+会话连续性（#56）：默认无状态（每条消息新建 session 即删）；设 AGENT_SESSION_REUSE=1 后
+同一 conv 复用 serve session 带多轮上下文（TTL 过期 + LRU 逐出 + 重置关键词断上下文）。
+
 接口：generate_reply(user, text, ctx=None) -> str（返回空串表示不回复）
 """
 
@@ -22,7 +25,9 @@ import base64
 import json
 import os
 import subprocess
+import threading
 import time
+import urllib.error
 import urllib.request
 
 from core.agent_common import PROXY_URL, PROXY_KEY, find_serve_credentials, log
@@ -35,6 +40,42 @@ _CHAT_MODEL = os.environ.get("AGENT_CHAT_MODEL", "gpt-4o-mini")
 _OPENCODE_MODEL = os.environ.get("AGENT_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free")
 _OPENCODE_BIN = os.environ.get("AGENT_OPENCODE_BIN", "opencode")
 _OPENCODE_TIMEOUT = int(os.environ.get("AGENT_OPENCODE_TIMEOUT", "90"))
+
+# 会话连续性（#56）：同一 conv_id 复用同一个 serve session，多轮历史由 serve 自带。
+#   AGENT_SESSION_REUSE   缺省开启（项目默认）；设 0 或空串回退旧的无状态语义（每条消息新建即删）。
+#   AGENT_SESSION_TTL     会话闲置多少秒后过期重建（默认 1800=30min）。
+#   AGENT_SESSION_MAX     最多同时保活多少个 conv 的 session（LRU 逐出，默认 64）。
+#   AGENT_SESSION_RESET_KEYWORDS  触发主动断上下文（删旧 session 重建）的整句关键词，逗号分隔。
+_SESSION_REUSE = os.environ.get("AGENT_SESSION_REUSE", "1") in ("1", "true", "True", "yes", "on")
+_SESSION_TTL = int(os.environ.get("AGENT_SESSION_TTL", "1800"))
+_SESSION_MAX = int(os.environ.get("AGENT_SESSION_MAX", "64"))
+_RESET_KEYWORDS = {
+    k.strip().lower()
+    for k in os.environ.get("AGENT_SESSION_RESET_KEYWORDS", "/new,新话题,重新开始,清空上下文").split(",")
+    if k.strip()
+}
+
+
+# per-session 权限规则（JSON 数组，serve v1 格式 [{"permission","pattern","action"}]）。
+# 配了 ask 规则时命中的工具调用会挂起并发 permission.asked SSE 事件 → permission 能力
+# 把审批路由到钉钉来源群（回「同意/总是/拒绝」，超时自动拒绝）。空=不传，serve 用自身
+# 默认（无全局配置时全放行）。只作用于 HTTP 路径的临时 session；CLI 回退路径不受控。
+def _parse_permission(raw):
+    """解析 AGENT_OPENCODE_PERMISSION；非法 JSON / 非数组时告警并忽略（返回 None）。"""
+    if not (raw or "").strip():
+        return None
+    try:
+        rules = json.loads(raw)
+    except ValueError:
+        log("AGENT_OPENCODE_PERMISSION 不是合法 JSON，忽略")
+        return None
+    if not isinstance(rules, list):
+        log("AGENT_OPENCODE_PERMISSION 应为规则数组，忽略")
+        return None
+    return rules or None
+
+
+_OPENCODE_PERMISSION = _parse_permission(os.environ.get("AGENT_OPENCODE_PERMISSION", ""))
 
 # 调试开关 + opencode 调用独立日志（与 agent_common 的 AGENT_DEBUG 语义一致）
 _DEBUG = os.environ.get("AGENT_DEBUG", "") in ("1", "true", "True")
@@ -93,6 +134,79 @@ def _split_model(model):
     return "", (model or "")
 
 
+# ---------------------------------------------------------------------------
+# 会话复用表（#56）：conv_id -> {sid, last, lock}
+# ---------------------------------------------------------------------------
+# LRU（OrderedDict，命中/新建移到末尾，超上限从头逐出）+ 闲置 TTL 过期。每 conv 一把锁，
+# 保证同一会话先后到达的消息串行走同一 session（serve 对 busy session 的并发 POST 未保证
+# 有序）。不同 conv 并行不受影响。CLI 回退路径不参与复用（拿不到 serve session，降级无状态）。
+from collections import OrderedDict                       # noqa: E402
+
+_conv_sessions = OrderedDict()   # conv_id -> {"sid": str, "last": float}
+_conv_locks = {}                 # conv_id -> threading.Lock（保护单会话内的顺序）
+_conv_meta_lock = threading.Lock()   # 保护上面两张表本身的结构性改动
+
+
+def _conv_lock(conv_id):
+    """取某会话的串行锁（不存在则建）。"""
+    with _conv_meta_lock:
+        lk = _conv_locks.get(conv_id)
+        if lk is None:
+            lk = _conv_locks[conv_id] = threading.Lock()
+        return lk
+
+
+def _lookup_sid(conv_id):
+    """查该 conv 未过期的 sid；过期/无则返回 None（过期项顺手删除）。"""
+    if not conv_id:
+        return None
+    with _conv_meta_lock:
+        rec = _conv_sessions.get(conv_id)
+        if not rec:
+            return None
+        if time.time() - rec["last"] > _SESSION_TTL:
+            _conv_sessions.pop(conv_id, None)   # 过期 → 丢弃，调用方重建
+            return None
+        _conv_sessions.move_to_end(conv_id)     # LRU：命中移到末尾
+        return rec["sid"]
+
+
+def _remember_sid(conv_id, sid):
+    """登记/刷新 conv→sid，并做 LRU 逐出。返回被逐出的 (conv_id, sid) 列表供删远端 session。"""
+    evicted = []
+    if not conv_id or not sid:
+        return evicted
+    with _conv_meta_lock:
+        _conv_sessions[conv_id] = {"sid": sid, "last": time.time()}
+        _conv_sessions.move_to_end(conv_id)
+        while len(_conv_sessions) > _SESSION_MAX:
+            old_cid, old_rec = _conv_sessions.popitem(last=False)
+            evicted.append((old_cid, old_rec["sid"]))
+    return evicted
+
+
+def _forget_sid(conv_id):
+    """删除某 conv 的复用记录，返回其旧 sid（无则 None）。用于 /new 重置 + 404 失效。"""
+    if not conv_id:
+        return None
+    with _conv_meta_lock:
+        rec = _conv_sessions.pop(conv_id, None)
+        return rec["sid"] if rec else None
+
+
+def _is_reset(text):
+    """整句命中重置关键词（大小写不敏感）→ 主动断上下文。"""
+    return (text or "").strip().lower() in _RESET_KEYWORDS
+
+
+def _reset_sessions():
+    """清空复用表（测试用）。"""
+    with _conv_meta_lock:
+        _conv_sessions.clear()
+        _conv_locks.clear()
+
+
+
 def generate_reply(user, text, ctx=None, raw=False):
     """根据用户消息生成回复文本。返回空串 = 不回复。
 
@@ -148,12 +262,25 @@ def _brain_opencode(user, text, ctx, raw=False):
 
     HTTP 复用常驻 serve 进程，省掉每次 CLI 冷启动（实测 ~3x）；serve 未起/凭据缺失/
     请求异常时无缝回退到一次性子进程，保证收发闭环永远有回复。
+
+    会话连续性（#56）：开启 AGENT_SESSION_REUSE 时，同一 conv 复用 serve session 带多轮
+    上下文；用户发重置关键词（/new 等）→ 断上下文重建，不打扰模型直接回确认。
     """
+    conv_id = (ctx or {}).get("conv_id", "")
+    # 重置指令：仅在复用模式下有意义（无状态模式每条本就是新会话）
+    if _SESSION_REUSE and conv_id and _is_reset(text):
+        old = _forget_sid(conv_id)
+        if old:
+            pid, port, pwd = find_serve_credentials()
+            if port:
+                _delete_session(port, pwd, old)
+        return "🆕 已开启新话题，之前的上下文已清空。"
+
     prompt = text if raw else f"{user}：{text}"
     reply = _brain_opencode_http(prompt, ctx=ctx)
     if reply is not None:
         return reply
-    # HTTP 不可用（serve 没起/凭据缺失/异常）→ 回退 CLI
+    # HTTP 不可用（serve 没起/凭据缺失/异常）→ 回退 CLI（无状态，拿不到 serve session）
     log("brain(opencode): serve HTTP 不可用，回退 opencode run CLI")
     return _brain_opencode_cli(prompt)
 
@@ -178,44 +305,78 @@ def _serve_request(method, port, pwd, path, body=None, timeout=8):
     return json.loads(raw) if raw.strip() else None
 
 
+def _create_session(port, pwd):
+    """建一个 serve session（带可选 per-session 权限规则）。返回 sid 或抛错。"""
+    body = {"title": "agent-textreply"}
+    if _OPENCODE_PERMISSION:
+        body["permission"] = _OPENCODE_PERMISSION
+    created = _serve_request("POST", port, pwd, "/session", body, timeout=10)
+    sid = (created or {}).get("id")
+    if not sid:
+        raise RuntimeError("create session 无 id")
+    return sid
+
+
+def _delete_session(port, pwd, sid):
+    """best-effort 删除 serve session（失败静默，不影响主流程）。"""
+    if not sid:
+        return
+    try:
+        _serve_request("DELETE", port, pwd, f"/session/{sid}", timeout=6)
+    except Exception:
+        pass
+
+
+def _post_message(port, pwd, sid, prompt, provider, model_id):
+    """向 session 发一条 message，拼接 text parts 返回回复文本。"""
+    d = _serve_request(
+        "POST", port, pwd, f"/session/{sid}/message",
+        {
+            "model": {"providerID": provider, "modelID": model_id},
+            "system": _SYSTEM_PROMPT,
+            "parts": [{"type": "text", "text": prompt}],
+        },
+        timeout=_OPENCODE_TIMEOUT,
+    ) or {}
+    return "".join(
+        p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
+    ).strip()
+
+
 def _brain_opencode_http(prompt, ctx=None):
     """走 opencode serve HTTP 生成回复。
 
-    流程：发现 serve 凭据 → 建临时 session → POST message（带 system + model）→
-    拼 text parts → best-effort 删 session（保持与 CLI 一样的无状态语义，避免 session 堆积）。
+    两种会话语义（AGENT_SESSION_REUSE 开关）：
+      - 关（默认，旧语义）：每条消息建临时 session → POST message → 删 session。无状态、
+        互不污染，但没有跨消息记忆。
+      - 开（#56）：同一 conv 复用 session（serve 自带多轮历史）。命中未过期 sid 直接复用；
+        POST 遇 404（session 被 serve 清了/重启失效）→ 删记录、重建一次重试。会话闲置 TTL
+        过期或 LRU 逐出时删远端 session。同一 conv 串行（_conv_lock），不同 conv 并行。
 
-    ctx（含 conv_id/conv_type）登记到 session 注册表，供 question 能力把 agent 提问/答案
-    路由回来源群。若该轮 agent 调 question 工具，POST 会阻塞到用户答复（另一线程 POST
-    reply 解阻塞），故 timeout 需覆盖等待答案的时间。
+    两种模式都把 sid（连同来源 conv ctx）登记到 core.brain 注册表，供 text_reply 抑制 SSE
+    业务通知 + question/permission 把提问/审批路由回来源群。若该轮 agent 调 question/permission
+    工具，POST 阻塞到用户答复（另一线程 POST reply 解阻塞），故 timeout 需覆盖等待时间。
 
     Returns: 回复文本（可能空串）；serve 不可用/出错返回 None（交给调用方回退 CLI）。
     """
     pid, port, pwd = find_serve_credentials()
     if not port:
         return None  # serve 没起或凭据缺失 → 回退
+    conv_id = (ctx or {}).get("conv_id", "")
+    if _SESSION_REUSE and conv_id:
+        return _http_reuse(port, pwd, conv_id, prompt, ctx)
+    return _http_oneshot(port, pwd, prompt, ctx)
+
+
+def _http_oneshot(port, pwd, prompt, ctx):
+    """旧语义：建 → 发 → 删，无状态。"""
     provider, model_id = _split_model(_OPENCODE_MODEL)
     t0 = time.time()
     sid = None
     try:
-        created = _serve_request("POST", port, pwd, "/session",
-                                 {"title": "agent-textreply"}, timeout=10)
-        sid = (created or {}).get("id")
-        if not sid:
-            raise RuntimeError("create session 无 id")
-        # 登记为 brain 临时 session（带来源会话 ctx）：抑制 SSE 业务通知 + question 回程路由
+        sid = _create_session(port, pwd)
         _register_textreply_sid(sid, ctx)
-        d = _serve_request(
-            "POST", port, pwd, f"/session/{sid}/message",
-            {
-                "model": {"providerID": provider, "modelID": model_id},
-                "system": _SYSTEM_PROMPT,
-                "parts": [{"type": "text", "text": prompt}],
-            },
-            timeout=_OPENCODE_TIMEOUT,
-        ) or {}
-        reply = "".join(
-            p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
-        ).strip()
+        reply = _post_message(port, pwd, sid, prompt, provider, model_id)
         _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
         return reply
     except Exception as e:
@@ -223,11 +384,44 @@ def _brain_opencode_http(prompt, ctx=None):
         log(f"brain opencode http err: {e}")
         return None  # 交给调用方回退 CLI
     finally:
-        if sid:
+        _delete_session(port, pwd, sid)
+
+
+def _http_reuse(port, pwd, conv_id, prompt, ctx):
+    """复用语义：同一 conv 串行走同一 session；404 失效则重建一次重试。"""
+    provider, model_id = _split_model(_OPENCODE_MODEL)
+    t0 = time.time()
+    with _conv_lock(conv_id):
+        sid = _lookup_sid(conv_id)
+        reused = sid is not None
+        try:
+            if sid is None:
+                sid = _create_session(port, pwd)
+            _register_textreply_sid(sid, ctx)   # 刷新 conv ctx（回程路由用最新来源）
             try:
-                _serve_request("DELETE", port, pwd, f"/session/{sid}", timeout=6)
-            except Exception:
-                pass  # session 清理失败不影响回复
+                reply = _post_message(port, pwd, sid, prompt, provider, model_id)
+            except urllib.error.HTTPError as he:
+                # 复用的 session 已被 serve 清（重启/GC）→ 丢记录、重建一次重试
+                if reused and he.code == 404:
+                    log(f"brain: 复用 session {sid[:12]} 失效(404)，重建 conv={conv_id[:12]}")
+                    _forget_sid(conv_id)
+                    sid = _create_session(port, pwd)
+                    _register_textreply_sid(sid, ctx)
+                    reply = _post_message(port, pwd, sid, prompt, provider, model_id)
+                else:
+                    raise
+            # 成功：登记/刷新 last，处理 LRU 逐出（删被挤掉会话的远端 session）
+            for _cid, _sid in _remember_sid(conv_id, sid):
+                _delete_session(port, pwd, _sid)
+            _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
+            return reply
+        except Exception as e:
+            # 失败别把坏 sid 留在表里，避免后续消息一直命中坏会话
+            _forget_sid(conv_id)
+            _delete_session(port, pwd, sid)
+            _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
+            log(f"brain opencode http err: {e}")
+            return None  # 交给调用方回退 CLI
 
 
 def _brain_opencode_cli(prompt):

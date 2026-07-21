@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import unittest
+import urllib.error
 from unittest.mock import patch, MagicMock
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -147,6 +148,150 @@ class TestBrainOpencodeHttp(unittest.TestCase):
              patch("subprocess.run", return_value=fake) as mock_run:
             self.assertEqual(brain.generate_reply("u", "1+1"), "cli-2")
             mock_run.assert_called_once()  # HTTP 抛错 → 回退 CLI
+
+
+class TestSessionReuse(unittest.TestCase):
+    """会话连续性（#56）：AGENT_SESSION_REUSE 开启后同一 conv 复用 serve session。"""
+
+    def setUp(self):
+        brain._reset_sessions()
+
+    def _serve(self, calls, sids=None, fail_msg_404=False):
+        """假 serve：POST /session 依次发 sids（默认 ses_1/ses_2…），message 回带 sid 的文本。"""
+        seq = iter(sids or [f"ses_{i}" for i in range(1, 99)])
+
+        def fake(method, port, pwd, path, body=None, timeout=8):
+            calls.append((method, path, body))
+            if method == "POST" and path == "/session":
+                return {"id": next(seq)}
+            if method == "POST" and path.endswith("/message"):
+                if fail_msg_404:
+                    raise urllib.error.HTTPError(path, 404, "gone", {}, None)
+                sid = path.split("/")[2]
+                return {"parts": [{"type": "text", "text": f"reply@{sid}"}]}
+            return None  # DELETE
+        return fake
+
+    def _ctx(self, conv_id="cidA"):
+        return {"conv_id": conv_id, "conv_type": "2", "msg_id": "m", "user": "u"}
+
+    def test_reuse_same_conv_no_second_create_no_delete(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve(calls)):
+            r1 = brain.generate_reply("u", "第一句", ctx=self._ctx())
+            r2 = brain.generate_reply("u", "第二句", ctx=self._ctx())
+        self.assertEqual(r1, "reply@ses_1")
+        self.assertEqual(r2, "reply@ses_1")            # 复用同一 session
+        creates = [c for c in calls if c[0] == "POST" and c[1] == "/session"]
+        deletes = [c for c in calls if c[0] == "DELETE"]
+        self.assertEqual(len(creates), 1)              # 只建一次
+        self.assertEqual(len(deletes), 0)              # 复用期间不删
+
+    def test_different_conv_independent_sessions(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve(calls)):
+            brain.generate_reply("u", "hi", ctx=self._ctx("cidA"))
+            brain.generate_reply("u", "hi", ctx=self._ctx("cidB"))
+        self.assertEqual(brain._lookup_sid("cidA"), "ses_1")
+        self.assertEqual(brain._lookup_sid("cidB"), "ses_2")
+
+    def test_oneshot_mode_creates_and_deletes_each_time(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", False), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve(calls)):
+            brain.generate_reply("u", "a", ctx=self._ctx())
+            brain.generate_reply("u", "b", ctx=self._ctx())
+        self.assertEqual(len([c for c in calls if c[1] == "/session"]), 2)
+        self.assertEqual(len([c for c in calls if c[0] == "DELETE"]), 2)
+
+    def test_ttl_expiry_rebuilds(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "_SESSION_TTL", 0), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve(calls)):
+            brain.generate_reply("u", "a", ctx=self._ctx())
+            time.sleep(0.01)
+            brain.generate_reply("u", "b", ctx=self._ctx())
+        # TTL=0 → 第二条视为过期，重建 session
+        self.assertEqual(len([c for c in calls if c[1] == "/session"]), 2)
+
+    def test_lru_evicts_and_deletes_remote(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "_SESSION_MAX", 1), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve(calls)):
+            brain.generate_reply("u", "a", ctx=self._ctx("cidA"))
+            brain.generate_reply("u", "b", ctx=self._ctx("cidB"))
+        # MAX=1：cidB 挤掉 cidA，cidA 的远端 session (ses_1) 被 DELETE
+        self.assertIsNone(brain._lookup_sid("cidA"))
+        self.assertEqual(brain._lookup_sid("cidB"), "ses_2")
+        self.assertIn(("DELETE", "/session/ses_1", None), calls)
+
+    def test_reset_keyword_forgets_and_confirms(self):
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve(calls)):
+            brain.generate_reply("u", "第一句", ctx=self._ctx())
+            self.assertEqual(brain._lookup_sid("cidA"), "ses_1")
+            reply = brain.generate_reply("u", "/new", ctx=self._ctx())
+        self.assertIn("新话题", reply)
+        self.assertIsNone(brain._lookup_sid("cidA"))       # 记录已清
+        self.assertIn(("DELETE", "/session/ses_1", None), calls)  # 旧 session 删了
+
+    def test_404_rebuilds_once_and_succeeds(self):
+        # 复用的 session POST 报 404 → 重建重试成功
+        calls = []
+        seq = iter(["ses_new"])   # 预置的 ses_old 直接进表，首个 create 发生在重建时
+        state = {"first": True}
+
+        def fake(method, port, pwd, path, body=None, timeout=8):
+            calls.append((method, path, body))
+            if method == "POST" and path == "/session":
+                return {"id": next(seq)}
+            if method == "POST" and path.endswith("/message"):
+                if "ses_old" in path and state["first"]:
+                    state["first"] = False
+                    raise urllib.error.HTTPError(path, 404, "gone", {}, None)
+                return {"parts": [{"type": "text", "text": "ok"}]}
+            return None
+
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=fake):
+            brain._remember_sid("cidA", "ses_old")        # 预置一个"已存在"的复用会话
+            reply = brain.generate_reply("u", "hi", ctx=self._ctx())
+        self.assertEqual(reply, "ok")
+        self.assertEqual(brain._lookup_sid("cidA"), "ses_new")   # 换成新 session
+
+    def test_post_error_forgets_and_falls_back(self):
+        # 复用会话 POST 持续失败（非 404）→ 清记录 + 返回 None 走 CLI 回退
+        fake = MagicMock(returncode=0,
+                         stdout=json.dumps({"type": "text", "part": {"text": "cli"}}),
+                         stderr="")
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request", side_effect=self._serve([], fail_msg_404=True)), \
+             patch("subprocess.run", return_value=fake):
+            reply = brain.generate_reply("u", "hi", ctx=self._ctx())
+        # 404 但非复用（首次新建即 404）→ 不重试，清记录回退 CLI
+        self.assertEqual(reply, "cli")
+        self.assertIsNone(brain._lookup_sid("cidA"))
 
 
 class TestReplierLogMode(unittest.TestCase):
