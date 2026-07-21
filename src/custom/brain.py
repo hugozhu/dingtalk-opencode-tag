@@ -31,6 +31,7 @@ import urllib.error
 import urllib.request
 
 from core.agent_common import PROXY_URL, PROXY_KEY, find_serve_credentials, log
+from core.brain import STATUS_OK, STATUS_EMPTY, STATUS_FAILED
 
 # 大脑后端选择
 _BRAIN = os.environ.get("AGENT_BRAIN", "echo")
@@ -208,7 +209,13 @@ def _reset_sessions():
 
 
 def generate_reply(user, text, ctx=None, raw=False):
-    """根据用户消息生成回复文本。返回空串 = 不回复。
+    """根据用户消息生成回复文本。返回空串 = 不回复（向后兼容的纯字符串契约）。"""
+    reply, _status = generate_reply_ex(user, text, ctx=ctx, raw=raw)
+    return reply
+
+
+def generate_reply_ex(user, text, ctx=None, raw=False):
+    """生成回复 + 状态（#59）。返回 (reply, status)，status ∈ ok/empty/failed。
 
     Args:
         user: 发送者展示名
@@ -216,23 +223,28 @@ def generate_reply(user, text, ctx=None, raw=False):
         ctx:  可选上下文 dict（conv_id / msg_id / conv_type 等）
         raw:  True 时 text 已是**完整 prompt**，后端不再拼 "{user}：" 前缀
               （合并转发等已自行组装结构化 prompt 的调用方用它，避免前缀污染上下文）
+
+    失败语义：opencode 后端 serve HTTP 与 CLI 回退都不可用/超时/异常 → failed（让上层
+    发兜底提示 + ack 落失败终态）。echo/proxy 后端抛异常 → failed；正常返回空 → empty。
     """
     text = (text or "").strip()
     if not text:
-        return ""
+        return "", STATUS_EMPTY
     try:
         if _BRAIN == "proxy":
-            reply = _brain_proxy(user, text, ctx, raw=raw)
+            reply, status = _brain_proxy(user, text, ctx, raw=raw), None
         elif _BRAIN == "opencode":
-            reply = _brain_opencode(user, text, ctx, raw=raw)
+            reply, status = _brain_opencode(user, text, ctx, raw=raw)
         else:
-            reply = _brain_echo(user, text, ctx)
+            reply, status = _brain_echo(user, text, ctx), None
     except Exception as e:
         log(f"brain({_BRAIN}) err: {e}")
-        reply = ""
+        return "", STATUS_FAILED
     if reply and len(reply) > _MAX_REPLY_CHARS:
         reply = reply[:_MAX_REPLY_CHARS] + "…（已截断）"
-    return reply
+    if status is None:
+        status = STATUS_OK if reply else STATUS_EMPTY
+    return reply, status
 
 
 # ---------------------------------------------------------------------------
@@ -259,9 +271,11 @@ def _brain_echo(user, text, ctx):
 
 def _brain_opencode(user, text, ctx, raw=False):
     """opencode 大脑：优先走 serve HTTP，serve 不可用/出错时回退 `opencode run` CLI。
+    返回 (reply, status)，status ∈ ok/empty/failed（#59）。
 
     HTTP 复用常驻 serve 进程，省掉每次 CLI 冷启动（实测 ~3x）；serve 未起/凭据缺失/
-    请求异常时无缝回退到一次性子进程，保证收发闭环永远有回复。
+    请求异常时无缝回退到一次性子进程。两条路都不可用/超时/出错 → failed（上层发兜底
+    提示 + ack 落失败终态），而非静默吞消息。
 
     会话连续性（#56）：开启 AGENT_SESSION_REUSE 时，同一 conv 复用 serve session 带多轮
     上下文；用户发重置关键词（/new 等）→ 断上下文重建，不打扰模型直接回确认。
@@ -274,15 +288,22 @@ def _brain_opencode(user, text, ctx, raw=False):
             pid, port, pwd = find_serve_credentials()
             if port:
                 _delete_session(port, pwd, old)
-        return "🆕 已开启新话题，之前的上下文已清空。"
+        return "🆕 已开启新话题，之前的上下文已清空。", STATUS_OK
 
     prompt = text if raw else f"{user}：{text}"
     reply = _brain_opencode_http(prompt, ctx=ctx)
     if reply is not None:
-        return reply
+        # HTTP 后端正常应答（可能空）：非空=ok，空=模型未产出=empty
+        return reply, (STATUS_OK if reply else STATUS_EMPTY)
     # HTTP 不可用（serve 没起/凭据缺失/异常）→ 回退 CLI（无状态，拿不到 serve session）
     log("brain(opencode): serve HTTP 不可用，回退 opencode run CLI")
-    return _brain_opencode_cli(prompt)
+    try:
+        cli_reply = _brain_opencode_cli(prompt)
+    except Exception as e:
+        # CLI 也挂了（超时 / rc!=0 / opencode 不存在）→ 彻底失败，给用户兜底
+        log(f"brain(opencode): CLI 回退失败：{e}")
+        return "", STATUS_FAILED
+    return cli_reply, (STATUS_OK if cli_reply else STATUS_EMPTY)
 
 
 def _serve_request(method, port, pwd, path, body=None, timeout=8):
@@ -428,6 +449,8 @@ def _brain_opencode_cli(prompt):
     """回退路径：调 `opencode run <prompt> --model M --format json`，拼接 text 事件为回复。
 
     HTTP 不可用时的兜底。输出是 NDJSON 事件流，逐行取 type==text 的 part.text 拼接。
+    失败（超时 / rc!=0 / opencode 不存在）**抛异常**，由调用方判为 failed（#59）——不再
+    把失败伪装成空字符串，以便上层给用户兜底提示。
     """
     full_prompt = f"{_SYSTEM_PROMPT}\n\n{prompt}"
     cmd = [_OPENCODE_BIN, "run", full_prompt,
@@ -438,7 +461,7 @@ def _brain_opencode_cli(prompt):
         _oc_log("cli", _OPENCODE_MODEL, time.time() - t0, prompt, "", False,
                 r.stderr[:200])
         log(f"opencode run rc={r.returncode} stderr={r.stderr[:200]}")
-        return ""
+        raise RuntimeError(f"opencode run rc={r.returncode}")
     parts = []
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -481,5 +504,8 @@ def _brain_proxy(user, text, ctx, raw=False):
 
 
 # 把 opencode/proxy/echo 生成实现注册给 core.brain，让能力经 core.brain.generate_reply 统一调用。
-from core.brain import register_brain  # noqa: E402
+# 把 opencode/proxy/echo 生成实现注册给 core.brain，让能力经 core.brain.generate_reply 统一调用。
+# 同时注册状态感知实现（#59）：text_reply 经 generate_reply_ex 拿 ok/empty/failed 区分。
+from core.brain import register_brain, register_brain_ex  # noqa: E402
 register_brain(generate_reply)
+register_brain_ex(generate_reply_ex)

@@ -22,8 +22,14 @@ from core.agent_common import log
 # ---------------------------------------------------------------------------
 # 生成实现：协议 + 注册 + 默认 echo
 # ---------------------------------------------------------------------------
-_brain_impl = None
+_brain_impl = None            # (user, text, ctx, raw) -> str（字符串契约，向后兼容）
+_brain_impl_ex = None         # (user, text, ctx, raw) -> (str, status)（状态感知，可选）
 _MAX_REPLY_CHARS = None  # 由实现自行截断；core 不强制
+
+# 生成结果状态（#59）：让上层区分「模型正常但没话说」与「后端不可用/失败」。
+STATUS_OK = "ok"          # 有回复
+STATUS_EMPTY = "empty"    # 后端正常但返回空（模型选择不回复）
+STATUS_FAILED = "failed"  # 后端不可用/超时/异常（应给用户兜底提示 + ack 落失败终态）
 
 
 def register_brain(fn):
@@ -31,6 +37,18 @@ def register_brain(fn):
     global _brain_impl
     _brain_impl = fn
     log(f"brain 实现已注册: {getattr(fn, '__module__', '?')}.{getattr(fn, '__name__', fn)}")
+
+
+def register_brain_ex(fn):
+    """注册**状态感知**的生成实现。签名 (user, text, ctx=None, raw=False) -> (str, status)。
+
+    可选：注册了它，generate_reply_ex 用它拿到 ok/empty/failed 区分；否则回落到
+    字符串实现（失败与空回复都塌缩成 empty，保持旧行为）。generate_reply（纯字符串）
+    始终只取回复文本，向后兼容不受影响。
+    """
+    global _brain_impl_ex
+    _brain_impl_ex = fn
+    log(f"brain(ex) 实现已注册: {getattr(fn, '__module__', '?')}.{getattr(fn, '__name__', fn)}")
 
 
 def _default_brain(user, text, ctx=None, raw=False):
@@ -49,16 +67,37 @@ def generate_reply(user, text, ctx=None, raw=False):
     """生成回复文本（返回空串=不回复）。委托已注册实现；未注册用默认 echo。
 
     raw=True 时 text 已是完整 prompt，实现不应再拼 "{user}：" 前缀。
+
+    纯字符串契约（向后兼容）：失败与空回复都返回 ""。需要区分失败的调用方用
+    generate_reply_ex。
+    """
+    reply, _status = generate_reply_ex(user, text, ctx=ctx, raw=raw)
+    return reply
+
+
+def generate_reply_ex(user, text, ctx=None, raw=False):
+    """生成回复 + 状态（#59）。返回 (reply, status)，status ∈ ok/empty/failed。
+
+    - 注册了状态感知实现（register_brain_ex）→ 直接用它的 (reply, status)。
+    - 只有字符串实现 → 拿到字符串：非空=ok，空=empty；实现内部抛异常=failed。
+      （纯字符串实现无法自证"失败"，故失败仅能由异常体现——旧 echo/proxy 不受影响。）
     """
     text = (text or "").strip()
     if not text:
-        return ""
-    fn = _brain_impl or _default_brain
+        return "", STATUS_EMPTY
     try:
-        return fn(user, text, ctx=ctx, raw=raw) or ""
+        if _brain_impl_ex is not None:
+            reply, status = _brain_impl_ex(user, text, ctx=ctx, raw=raw)
+            reply = reply or ""
+            if status not in (STATUS_OK, STATUS_EMPTY, STATUS_FAILED):
+                status = STATUS_OK if reply else STATUS_EMPTY
+            return reply, status
+        fn = _brain_impl or _default_brain
+        reply = fn(user, text, ctx=ctx, raw=raw) or ""
+        return reply, (STATUS_OK if reply else STATUS_EMPTY)
     except Exception as e:
         log(f"brain generate err: {e}")
-        return ""
+        return "", STATUS_FAILED
 
 
 # ---------------------------------------------------------------------------

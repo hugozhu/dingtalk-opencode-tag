@@ -172,5 +172,30 @@ class TestDeclarativeGuards(unittest.TestCase):
         self.assertEqual(seen, ["a", "a"])   # 无 dedup/loop_guard → 都命中
 
 
+class TestReplyOutcomeSignal(unittest.TestCase):
+    """core.replier：send_reply 的 outcome_ok 覆盖广播给 on_reply_sent 的业务成败（#59）。"""
+
+    def setUp(self):
+        from core import replier as R
+        self.R = R
+        R._impl = lambda conv_id, conv_type, text, *, at_user_id=None: True  # 投递恒成功
+        self.signals = []
+        self._orig = R.dispatch_reply_sent
+        R.dispatch_reply_sent = lambda cid, ct, ok: self.signals.append(ok)
+
+    def tearDown(self):
+        self.R.dispatch_reply_sent = self._orig
+        self.R._impl = None
+
+    def test_default_uses_delivery_result(self):
+        self.R.send_reply("cid", "1", "hi")
+        self.assertEqual(self.signals, [True])   # 未传 outcome_ok → 用投递结果
+
+    def test_outcome_ok_false_overrides_successful_delivery(self):
+        # 投递成功但业务失败（兜底提示）→ 广播 False，让 ack 落失败终态
+        self.R.send_reply("cid", "1", "兜底", outcome_ok=False)
+        self.assertEqual(self.signals, [False])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

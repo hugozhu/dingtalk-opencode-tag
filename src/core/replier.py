@@ -32,11 +32,16 @@ def _default_send(conv_id, conv_type, text, *, at_user_id=None):
     return True
 
 
-def send_reply(conv_id, conv_type, text, *, at_user_id=None):
+def send_reply(conv_id, conv_type, text, *, at_user_id=None, outcome_ok=None):
     """把回复发回来源会话，返回 True=已发送/已记录。
 
     委托给已注册的平台实现；未注册时用默认 log-only。发送后广播 dispatch_reply_sent
     通知能力（best-effort，异常隔离，不影响本次结果）。
+
+    outcome_ok（#59）：广播给 on_reply_sent 的**业务成败**，默认 None=用平台投递结果
+    （delivery ok）。当一条“已成功投递”的消息其实代表失败结局时（如 LLM 不可用时发的
+    兜底提示），传 outcome_ok=False，让 ack 落「处理未完成」终态而非「已完成」——区分
+    “把字节发出去了”与“用户的请求真的办成了”。
     """
     text = (text or "").strip()
     if not text:
@@ -47,5 +52,6 @@ def send_reply(conv_id, conv_type, text, *, at_user_id=None):
     except Exception as e:
         log(f"replier send err: {e}")
         ok = False
-    dispatch_reply_sent(conv_id, conv_type, ok)
+    signal = ok if outcome_ok is None else bool(outcome_ok)
+    dispatch_reply_sent(conv_id, conv_type, signal)
     return ok
