@@ -69,24 +69,34 @@ echo "Testing monitor.sh constants..."
 assert_eq "monitor.sh 语法正确" "0" "$(bash -n "$SCRIPT_DIR/bin/core/monitor.sh" 2>&1; echo $?)"
 assert_eq "healthcheck.sh 语法正确" "0" "$(bash -n "$SCRIPT_DIR/bin/core/healthcheck.sh" 2>&1; echo $?)"
 assert_eq "reboot.sh 语法正确" "0" "$(bash -n "$SCRIPT_DIR/bin/core/reboot.sh" 2>&1; echo $?)"
+assert_eq "start.sh 语法正确" "0" "$(bash -n "$SCRIPT_DIR/bin/core/start.sh" 2>&1; echo $?)"
+assert_eq "stop.sh 语法正确" "0" "$(bash -n "$SCRIPT_DIR/bin/core/stop.sh" 2>&1; echo $?)"
 assert_eq "lib.sh 语法正确" "0" "$(bash -n "$SCRIPT_DIR/bin/core/lib.sh" 2>&1; echo $?)"
 
-# 测试 reboot.sh 的常量默认值
-KICKSTART_LINE=$(grep 'KICKSTART_RETRY_INTERVAL' "$SCRIPT_DIR/bin/core/reboot.sh" | grep '=' | head -1)
+# 测试 lib.sh 的服务控制常量默认值（v4.2 重构后从 reboot.sh 移至 lib.sh）
+KICKSTART_LINE=$(grep 'KICKSTART_RETRY_INTERVAL' "$SCRIPT_DIR/bin/core/lib.sh" | grep '=' | head -1)
 if [[ "$KICKSTART_LINE" =~ KICKSTART_RETRY_INTERVAL:=[[:space:]]*\"?([0-9]+) ]]; then
     KICKSTART_VAL="${BASH_REMATCH[1]}"
 else
     KICKSTART_VAL=""
 fi
-assert_eq "reboot.sh KICKSTART_RETRY_INTERVAL=10" "10" "$KICKSTART_VAL"
+assert_eq "lib.sh KICKSTART_RETRY_INTERVAL=10" "10" "$KICKSTART_VAL"
 
-LAUNCHD_LINE=$(grep 'LAUNCHD_LABEL' "$SCRIPT_DIR/bin/core/reboot.sh" | grep '=' | head -1)
+LAUNCHD_LINE=$(grep 'LAUNCHD_LABEL' "$SCRIPT_DIR/bin/core/lib.sh" | grep '=' | head -1)
 if [[ "$LAUNCHD_LINE" =~ LAUNCHD_LABEL:=[[:space:]]*\"?([a-zA-Z.]+) ]]; then
     LAUNCHD_VAL="${BASH_REMATCH[1]}"
 else
     LAUNCHD_VAL=""
 fi
-assert_eq "reboot.sh LAUNCHD_LABEL 存在" "1" "$([ -n "$LAUNCHD_VAL" ] && echo 1 || echo 0)"
+assert_eq "lib.sh LAUNCHD_LABEL 存在" "1" "$([ -n "$LAUNCHD_VAL" ] && echo 1 || echo 0)"
+
+# 测试 reboot.sh 的委托契约（v4.2：reboot 应调用 stop.sh 和 start.sh）
+if grep -q "bin/core/stop.sh" "$SCRIPT_DIR/bin/core/reboot.sh" && \
+   grep -q "bin/core/start.sh" "$SCRIPT_DIR/bin/core/reboot.sh"; then
+    assert_eq "reboot.sh 委托 stop.sh + start.sh" "1" "1"
+else
+    assert_eq "reboot.sh 委托 stop.sh + start.sh" "1" "0 (reboot.sh 未引用 stop/start)"
+fi
 
 # 测试 README 不硬编码版本号（应指向 VERSION，避免漂移）
 echo ""

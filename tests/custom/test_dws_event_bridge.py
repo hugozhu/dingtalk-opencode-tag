@@ -116,5 +116,95 @@ class TestToConnectLine(unittest.TestCase):
         self.assertIn("convType=1", line)
 
 
+class TestFlatFormat(unittest.TestCase):
+    """新版 dws CLI 的扁平输出格式（字段在事件顶层、type 即事件类型名、无 data 包裹）。
+
+    回归防护：dws 升级后改成扁平格式，旧的嵌套解析会把每条事件都跳过（bridge 处理 0 条、
+    数字员工完全不响应）。这组用例锁定扁平格式必须被正确解析。
+    """
+
+    @staticmethod
+    def _flat(etype, sender="hugozhu", content="hi",
+              conv="cidFLAT==", msg="msgFLAT=="):
+        return {
+            "type": etype,
+            "event_id": "ev-flat-1",
+            "sender": sender,
+            "content": content,
+            "conversation_id": conv,
+            "message_id": msg,
+            "create_time": "2026-07-21 17:15:50",
+        }
+
+    def test_flat_o2o(self):
+        line = bridge._to_connect_line(self._flat("user_im_message_receive_o2o"))
+        self.assertIsNotNone(line)
+        self.assertIn("[connect] 收到 @hugozhu: hi", line)
+        self.assertIn("convType=1", line)
+        self.assertIn("convId=cidFLAT==", line)
+        self.assertIn("msgId=msgFLAT==", line)
+
+    def test_flat_group(self):
+        line = bridge._to_connect_line(self._flat("user_im_message_receive_group"))
+        self.assertIn("convType=2", line)
+        self.assertNotIn("atMention", line)
+
+    def test_flat_at_marks_mention(self):
+        line = bridge._to_connect_line(self._flat("user_im_message_receive_at"))
+        self.assertIn("convType=2", line)
+        self.assertIn("atMention=1", line)
+
+    def test_flat_parseable_by_inbound(self):
+        """扁平格式产出的行也必须能被 core.inbound.parse_line 解析（端到端契约）。"""
+        import sys
+        src = os.path.join(PROJECT_ROOT, "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from core import inbound
+        line = bridge._to_connect_line(
+            self._flat("user_im_message_receive_o2o", sender="u",
+                       content="1+1", conv="cidX==", msg="msgY=="))
+        m = inbound.parse_line(line)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.user, "u")
+        self.assertEqual(m.text, "1+1")
+        self.assertEqual(m.conv_type, "1")
+        self.assertEqual(m.conv_id, "cidX==")
+        self.assertEqual(m.msg_id, "msgY==")
+
+    def test_flat_empty_content_dropped(self):
+        self.assertIsNone(bridge._to_connect_line(
+            self._flat("user_im_message_receive_o2o", content="")))
+
+    def test_flat_newlines_collapsed(self):
+        line = bridge._to_connect_line(
+            self._flat("user_im_message_receive_o2o", content="line1\nline2"))
+        self.assertIn("line1 line2", line)
+
+
+class TestFormatHealthCheck(unittest.TestCase):
+    """格式健康检查：收到多条原始事件却解析 0 条 → 告警（这次故障的自检防护）。"""
+
+    def test_warns_when_raw_high_parsed_zero(self):
+        """达到阈值条原始事件、解析 0 条、未报过 → 应告警。"""
+        self.assertTrue(bridge._should_warn_format(
+            bridge._FORMAT_WARN_THRESHOLD, 0, False))
+
+    def test_no_warn_below_threshold(self):
+        """原始事件数未到阈值 → 不告警（避免刚启动就误报）。"""
+        self.assertFalse(bridge._should_warn_format(
+            bridge._FORMAT_WARN_THRESHOLD - 1, 0, False))
+
+    def test_no_warn_when_parsing_works(self):
+        """有成功解析的（parsed>0）→ 格式正常，不告警。"""
+        self.assertFalse(bridge._should_warn_format(
+            bridge._FORMAT_WARN_THRESHOLD + 10, 1, False))
+
+    def test_no_warn_when_already_warned(self):
+        """已报过 → 不再重复告警（防刷屏）。"""
+        self.assertFalse(bridge._should_warn_format(
+            bridge._FORMAT_WARN_THRESHOLD, 0, True))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
