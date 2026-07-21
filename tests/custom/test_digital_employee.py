@@ -79,6 +79,26 @@ class TestBrainOpencodeCliFallback(unittest.TestCase):
              patch("subprocess.run", return_value=fake):
             self.assertEqual(brain.generate_reply("u", "hi"), "")
 
+    def test_nonzero_rc_status_failed(self):
+        # #59：serve 不可用 + CLI rc!=0 → status=failed（区别于模型正常空回复）
+        fake = MagicMock(returncode=1, stdout="", stderr="boom")
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(None, None, None)), \
+             patch("subprocess.run", return_value=fake):
+            reply, status = brain.generate_reply_ex("u", "hi")
+        self.assertEqual(reply, "")
+        self.assertEqual(status, "failed")
+
+    def test_cli_success_status_ok(self):
+        fake = MagicMock(returncode=0,
+                         stdout=json.dumps({"type": "text", "part": {"text": "答案"}}),
+                         stderr="")
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "find_serve_credentials", return_value=(None, None, None)), \
+             patch("subprocess.run", return_value=fake):
+            reply, status = brain.generate_reply_ex("u", "q")
+        self.assertEqual((reply, status), ("答案", "ok"))
+
     def test_ignores_non_text_events(self):
         fake = MagicMock(returncode=0,
                          stdout=self._events("答案") + "\nnot-json-line", stderr="")
@@ -350,7 +370,7 @@ class TestTextReplyCapability(unittest.TestCase):
         self.assertTrue(text_reply.CAPABILITY.dedup)
 
     def test_handle_text_reply_calls_brain_and_replier(self):
-        with patch.object(text_reply, "generate_reply", return_value="生成的回复") as g, \
+        with patch.object(text_reply, "generate_reply_ex", return_value=("生成的回复", "ok")) as g, \
              patch.object(text_reply, "send_reply", return_value=True) as s:
             text_reply._handle_text_reply("张三", "问题", "2", "cid==", "msg==")
             g.assert_called_once()
@@ -358,7 +378,25 @@ class TestTextReplyCapability(unittest.TestCase):
             self.assertEqual(s.call_args[0][2], "生成的回复")
 
     def test_empty_brain_reply_not_sent(self):
-        with patch.object(text_reply, "generate_reply", return_value=""), \
+        # status=empty（模型正常但没话说）→ 静默，不发任何东西
+        with patch.object(text_reply, "generate_reply_ex", return_value=("", "empty")), \
+             patch.object(text_reply, "send_reply") as s:
+            text_reply._handle_text_reply("张三", "x", "2", "cid==", "msg==")
+            s.assert_not_called()
+
+    def test_failed_brain_sends_fallback(self):
+        # status=failed（LLM 不可用）→ 发兜底提示（#59），触发 ack 落失败终态
+        with patch.object(text_reply, "generate_reply_ex", return_value=("", "failed")), \
+             patch.object(text_reply, "_FALLBACK_REPLY", "兜底提示"), \
+             patch.object(text_reply, "send_reply", return_value=False) as s:
+            text_reply._handle_text_reply("张三", "x", "2", "cid==", "msg==")
+            s.assert_called_once()
+            self.assertEqual(s.call_args[0][2], "兜底提示")
+
+    def test_failed_brain_no_fallback_when_disabled(self):
+        # AGENT_FALLBACK_REPLY 置空 → 回退旧的静默行为
+        with patch.object(text_reply, "generate_reply_ex", return_value=("", "failed")), \
+             patch.object(text_reply, "_FALLBACK_REPLY", ""), \
              patch.object(text_reply, "send_reply") as s:
             text_reply._handle_text_reply("张三", "x", "2", "cid==", "msg==")
             s.assert_not_called()

@@ -86,6 +86,9 @@ export AGENT_SESSION_TTL="${AGENT_SESSION_TTL:-1800}"          # 闲置多少秒
 export AGENT_SESSION_MAX="${AGENT_SESSION_MAX:-64}"            # 最多保活多少个 conv 的 session（LRU）
 # 触发断上下文（删旧 session）的整句关键词，逗号分隔
 export AGENT_SESSION_RESET_KEYWORDS="${AGENT_SESSION_RESET_KEYWORDS:-/new,新话题,重新开始,清空上下文}"
+# LLM 不可用/超时/出错时给用户的兜底提示（#59）：避免消息被静默吞掉、ack 永远停在
+# 「处理中」。设为空串关闭兜底（回退旧的静默行为）。模型正常但没话说（empty）仍静默。
+export AGENT_FALLBACK_REPLY="${AGENT_FALLBACK_REPLY:-⚠️ 暂时无法处理你的消息，请稍后再试。}"
 # opencode serve 端口（start_serve 用；密码自动生成写 .serve.pwd）。brain(opencode) 走
 # 此 serve 的 HTTP 接口生成回复。
 export OPENCODE_SERVE_PORT="${OPENCODE_SERVE_PORT:-4096}"
