@@ -317,6 +317,9 @@ def _format_session_summary(stats):
     elapsed = int(stats.get("elapsed", 0))
     model = stats.get("model", "unknown")
     rounds = stats.get("rounds", 0)
+    input_tokens = stats.get("input_tokens", 0)
+    output_tokens = stats.get("output_tokens", 0)
+    reasoning_tokens = stats.get("reasoning_tokens", 0)
 
     # 基础信息（总是显示）
     lines = [
@@ -327,21 +330,17 @@ def _format_session_summary(stats):
         f"🔄 轮数: {rounds}",
     ]
 
-    # Token 统计（只在有数据时显示）
-    input_tokens = stats.get("input_tokens", 0)
-    output_tokens = stats.get("output_tokens", 0)
-    reasoning_tokens = stats.get("reasoning_tokens", 0)
+    # Tokens 统计（总是显示，即使是 0）
+    input_str = _format_tokens(input_tokens)
+    output_str = _format_tokens(output_tokens)
+    lines.append(f"💬 Tokens: 输入 {input_str}↑ / 输出 {output_str}↓")
 
-    if input_tokens > 0 or output_tokens > 0:
-        input_str = _format_tokens(input_tokens)
-        output_str = _format_tokens(output_tokens)
-        lines.append(f"💬 Tokens: 输入 {input_str}↑ / 输出 {output_str}↓")
-
+    # 推理 tokens（只在 > 0 时显示）
     if reasoning_tokens > 0:
         reasoning_str = _format_tokens(reasoning_tokens)
         lines.append(f"🧠 推理: {reasoning_str}")
 
-    # 窗口使用率（只在有输入 token 时显示）
+    # 窗口使用率（只在输入 token > 0 时显示）
     if input_tokens > 0:
         window_size = 1_000_000
         window_pct = (input_tokens / window_size * 100) if window_size > 0 else 0
