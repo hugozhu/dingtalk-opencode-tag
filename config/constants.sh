@@ -87,6 +87,19 @@ export AGENT_SESSION_TTL="${AGENT_SESSION_TTL:-1800}"          # 闲置多少秒
 export AGENT_SESSION_MAX="${AGENT_SESSION_MAX:-64}"            # 最多保活多少个 conv 的 session（LRU）
 # 触发断上下文（删旧 session）的整句关键词，逗号分隔
 export AGENT_SESSION_RESET_KEYWORDS="${AGENT_SESSION_RESET_KEYWORDS:-/new,新话题,重新开始,清空上下文}"
+
+# 会话统计摘要（#63）：session 结束时自动发送统计信息。
+# 是否启用统计摘要（默认关闭，避免打扰用户）
+export AGENT_SESSION_SUMMARY_ENABLED="${AGENT_SESSION_SUMMARY_ENABLED:-0}"
+# 统计摘要的触发场景（逗号分隔）
+# reset: 用户主动重置会话时
+# ttl: TTL 过期时
+# lru: LRU 逐出时（可能频繁，建议关闭）
+# command: 用户发送 /stats 命令时
+export AGENT_SESSION_SUMMARY_TRIGGERS="${AGENT_SESSION_SUMMARY_TRIGGERS:-reset,command}"
+# 是否仅在单聊中发送（默认 1，群聊不发避免噪音）
+export AGENT_SESSION_SUMMARY_O2O_ONLY="${AGENT_SESSION_SUMMARY_O2O_ONLY:-1}"
+
 # LLM 不可用/超时/出错时给用户的兜底提示（#59）：避免消息被静默吞掉、ack 永远停在
 # 「处理中」。设为空串关闭兜底（回退旧的静默行为）。模型正常但没话说（empty）仍静默。
 export AGENT_FALLBACK_REPLY="${AGENT_FALLBACK_REPLY:-⚠️ 暂时无法处理你的消息，请稍后再试。}"
