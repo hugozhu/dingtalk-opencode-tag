@@ -29,8 +29,15 @@ from custom.capabilities import image
 from core.agent_common import find_serve_credentials
 
 
+FIXTURE_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "math_1plus1.png")
+
+
 def _make_math_png(expr="1+1=2"):
-    """生成一张白底黑字、写着算式的 PNG，返回字节。"""
+    """优先读取仓库里的 fixture 图片；缺失时用 PIL 现场生成白底黑字算式 PNG，返回字节。"""
+    if os.path.exists(FIXTURE_PNG):
+        with open(FIXTURE_PNG, "rb") as f:
+            return f.read()
+
     from PIL import Image, ImageDraw, ImageFont
 
     W, H = 480, 200
