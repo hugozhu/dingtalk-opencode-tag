@@ -312,8 +312,10 @@ def _get_session_stats(conv_id):
 
 
 def _format_tokens(count):
-    """格式化 token 数量（K 单位）。"""
-    if count >= 1000:
+    """格式化 token 数量（K/M 单位）。"""
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    elif count >= 1000:
         return f"{count / 1000:.1f}K"
     return str(count)
 
@@ -335,22 +337,24 @@ def _format_session_summary(stats):
 
     # 基础信息（总是显示）
     lines = [
-        f"Session ID: {sid}",
+        f"**Session ID:** `{sid}`",
         "",
-        f"⏱️ 耗时: {elapsed}s",
-        f"🤖 模型: {model}",
-        f"🔄 轮数: {rounds}",
     ]
+
+    # 使用 markdown 列表格式，每个字段一行
+    lines.append(f"- ⏱️ **耗时:** {elapsed}s")
+    lines.append(f"- 🤖 **模型:** {model}")
+    lines.append(f"- 🔄 **轮数:** {rounds}")
 
     # Tokens 统计（总是显示，即使是 0）
     input_str = _format_tokens(input_tokens)
     output_str = _format_tokens(output_tokens)
-    lines.append(f"💬 Tokens: 输入 {input_str}↑ / 输出 {output_str}↓")
+    lines.append(f"- 💬 **Tokens:** 输入 {input_str}↑ / 输出 {output_str}↓")
 
     # 推理 tokens（只在 > 0 时显示）
     if reasoning_tokens > 0:
         reasoning_str = _format_tokens(reasoning_tokens)
-        lines.append(f"🧠 推理: {reasoning_str}")
+        lines.append(f"- 🧠 **推理:** {reasoning_str}")
 
     # 缓存命中率（只在有缓存读取时显示）
     if cache_read > 0:
@@ -358,7 +362,7 @@ def _format_session_summary(stats):
         hit_rate = (cache_read / total_in * 100) if total_in > 0 else 0
         cache_read_str = _format_tokens(cache_read)
         total_in_str = _format_tokens(total_in)
-        lines.append(f"🔄 缓存命中: {hit_rate:.1f}%（{cache_read_str}/{total_in_str}）")
+        lines.append(f"- 🔄 **缓存命中:** {hit_rate:.1f}%（{cache_read_str}/{total_in_str}）")
 
     # 窗口使用率（只在有输入时显示，窗口占用 = 新输入 + 缓存命中）
     ctx_used = input_tokens + cache_read
@@ -367,7 +371,7 @@ def _format_session_summary(stats):
         window_pct = (ctx_used / window_size * 100) if window_size > 0 else 0
         ctx_used_str = _format_tokens(ctx_used)
         window_size_str = _format_tokens(window_size)
-        lines.append(f"📊 窗口: {ctx_used_str}/{window_size_str}（{window_pct:.1f}%）")
+        lines.append(f"- 📊 **窗口:** {ctx_used_str}/{window_size_str}（{window_pct:.1f}%）")
 
     return "\n".join(lines)
 
