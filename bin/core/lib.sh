@@ -111,10 +111,11 @@ kill_tree() {
 #   COMP_PID_BASENAMES：对应 PID 文件名（相对 SCRIPT_DIR）
 #   COMP_PATTERNS：cmdline 签名（verify_pid / pkill 用）
 # 顺序一一对应。改这里三个脚本同步生效。
+# 注：移除 watcher（serve-watcher 可选组件，默认不使用）避免无意义的"死亡"日志
 # ---------------------------------------------------------------------------
-HARNESS_COMP_NAMES=("serve" "connect" "watcher" "event_watcher")
-HARNESS_COMP_PID_BASENAMES=(".serve.pid" ".connect.pid" ".watcher.pid" ".event-watcher.pid")
-HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "serve-watcher\.sh" "event_watcher.py")
+HARNESS_COMP_NAMES=("serve" "connect" "event_watcher")
+HARNESS_COMP_PID_BASENAMES=(".serve.pid" ".connect.pid" ".event-watcher.pid")
+HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "event_watcher.py")
 
 # monitor 自身的运行时状态文件（reboot 清理时用）
 HARNESS_MONITOR_LOCK="${LOCK_FILE:-/tmp/agent-monitor.lock}"
