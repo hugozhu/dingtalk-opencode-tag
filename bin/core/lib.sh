@@ -119,3 +119,65 @@ HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "serve-wa
 # monitor 自身的运行时状态文件（reboot 清理时用）
 HARNESS_MONITOR_LOCK="${LOCK_FILE:-/tmp/agent-monitor.lock}"
 HARNESS_EXTRA_STATE_BASENAMES=(".next-check" ".serve.port" ".serve.pwd" ".opencode-connect-status.json")
+
+# ---------------------------------------------------------------------------
+# 服务控制共享函数 — start.sh / stop.sh / reboot.sh 共享逻辑，避免重复
+# ---------------------------------------------------------------------------
+
+# 服务控制常量（被 config/constants.local.sh 覆盖）
+: "${KICKSTART_RETRY_INTERVAL:=10}"
+: "${LAUNCHD_LABEL:=com.example.agent-connect}"
+: "${LAUNCHD_PLIST:=$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist}"
+: "${REBOOT_RESTART_MODE:=nohup}"
+
+# resolve_restart_mode — 解析重启机制：launchd | nohup
+# auto 时根据 launchd agent 是否已加载自动判定
+resolve_restart_mode() {
+    local mode="$REBOOT_RESTART_MODE"
+    if [[ "$mode" == "auto" ]]; then
+        if launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; then
+            mode="launchd"
+        else
+            mode="nohup"
+        fi
+    fi
+    echo "$mode"
+}
+
+# setup_components — 从 HARNESS_* 派生组件配置 + source start_funcs.sh 应用 custom 覆盖
+# 填充 COMP_NAMES / COMP_PATTERNS / COMP_PID_FILES（需调用方先 source constants.local.sh）
+# monitor.sh 有自己的数组初始化，不调此函数；stop/start/reboot 共享此函数避免重复
+setup_components() {
+    COMP_NAMES=("${HARNESS_COMP_NAMES[@]}")
+    COMP_PATTERNS=("${HARNESS_COMP_PATTERNS[@]}")
+    COMP_PID_FILES=()
+    for _b in "${HARNESS_COMP_PID_BASENAMES[@]}"; do
+        COMP_PID_FILES+=("$SCRIPT_DIR/$_b")
+    done
+    # source start_funcs.sh 让 custom 的 COMP_PATTERNS 覆盖生效（如 serve→'opencode serve'）
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/bin/core/start_funcs.sh"
+}
+
+# stop_components <signal> — 按 PID 文件 + cmdline 模式双路杀组件（含子进程树）
+stop_components() {
+    local sig="$1" pf pid pat
+    for pf in "${COMP_PID_FILES[@]}"; do
+        [[ -f "$pf" ]] || continue
+        pid=$(cat "$pf" 2>/dev/null)
+        [[ -n "$pid" ]] && kill_tree "$pid" "$sig"
+    done
+    for pat in "${COMP_PATTERNS[@]}"; do
+        for pid in $(pgrep -f "$pat" 2>/dev/null); do
+            kill_tree "$pid" "$sig"
+        done
+    done
+}
+
+# clean_runtime_state — 清理组件 PID 文件 + 锁 + 额外运行时状态
+clean_runtime_state() {
+    rm -f "$HARNESS_MONITOR_LOCK" 2>/dev/null || true
+    for _b in "${HARNESS_COMP_PID_BASENAMES[@]}" "${HARNESS_EXTRA_STATE_BASENAMES[@]}"; do
+        rm -f "$SCRIPT_DIR/$_b" 2>/dev/null || true
+    done
+}

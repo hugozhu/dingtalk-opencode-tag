@@ -78,6 +78,16 @@ dws auth status         # 确认 authenticated: true
 dws profile list        # 列出本机已登录的全部组织账号（corpId / userId / 组织名）
 ```
 
+> **macOS 用户注意**：dws 使用 macOS Keychain 存储登录凭据。如果遇到 `keychain_unavailable` 错误，需要解锁钥匙串：
+> ```bash
+> security unlock-keychain ~/Library/Keychains/login.keychain-db
+> # 或设置钥匙串永不锁定：
+> security set-keychain-settings ~/Library/Keychains/login.keychain-db
+> # 或使用环境变量绕过 Keychain（测试环境）：
+> export DWS_DISABLE_KEYCHAIN=1
+> dws auth login --device  # 重新登录，token 将存储在文件中
+> ```
+
 **创建组织（没有现成企业时，用 `dws contact org`）：**
 
 ```bash
