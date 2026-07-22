@@ -57,11 +57,12 @@ export AGENT_VISION_MODEL="${AGENT_VISION_MODEL:-opencode/mimo-v2.5-free}"
 # --- dws event connect（bin/custom/dws-connect.sh）---
 # 敏感值：真实的群 conversationId / profile 填在 config/constants.local.sh（gitignored），
 # 不要写进本模板文件。群订阅 + 单聊(o2o)订阅 + @我(at)订阅可任意组合，至少开一种。
-export DWS_EVENT_KEY="${DWS_EVENT_KEY:-user_im_message_receive_group}"
-export DWS_EVENT_GROUP="${DWS_EVENT_GROUP:-}"   # 群 openConversationId（订阅群消息必填，敏感）
-# 单聊(o2o)订阅：对端 userId 列表（逗号分隔）。钉钉 o2o 事件只能按“对端 userId”订阅，
+export DWS_EVENT_KEY=”${DWS_EVENT_KEY:-user_im_message_receive_group}”
+export DWS_EVENT_GROUP=”${DWS_EVENT_GROUP:-}”   # 群 openConversationId（订阅群消息必填，敏感）
+export DWS_EVENT_GROUP_NAME=”${DWS_EVENT_GROUP_NAME:-}”  # 群聊名称（可选，用于启动报告显示）
+# 单聊(o2o)订阅：对端 userId 列表（逗号分隔）。钉钉 o2o 事件只能按”对端 userId”订阅，
 # 每个对端起一个 consumer。留空=不订阅单聊。例：给数字员工发单聊的真人 userId。
-export DWS_EVENT_O2O_USERS="${DWS_EVENT_O2O_USERS:-}"  # 敏感，勿提交
+export DWS_EVENT_O2O_USERS=”${DWS_EVENT_O2O_USERS:-}”  # 敏感，勿提交
 # @我订阅：数字员工账号在**任意群**被 @ 时收到消息（事件 user_im_message_receive_at，
 # rule_type=at 个人级订阅，无需 group/user 参数）。1/true/yes/on=开，留空/0=不订阅。
 # 适合“只在被 @ 时才响应、又不想逐个配置群 conversationId”的场景。与群/单聊订阅可并存，
@@ -86,9 +87,25 @@ export AGENT_SESSION_TTL="${AGENT_SESSION_TTL:-1800}"          # 闲置多少秒
 export AGENT_SESSION_MAX="${AGENT_SESSION_MAX:-64}"            # 最多保活多少个 conv 的 session（LRU）
 # 触发断上下文（删旧 session）的整句关键词，逗号分隔
 export AGENT_SESSION_RESET_KEYWORDS="${AGENT_SESSION_RESET_KEYWORDS:-/new,新话题,重新开始,清空上下文}"
+
+# 会话统计摘要（#63）：session 结束时自动发送统计信息。
+# 是否启用统计摘要（默认开启）
+export AGENT_SESSION_SUMMARY_ENABLED="${AGENT_SESSION_SUMMARY_ENABLED:-1}"
+# 统计摘要的触发场景（逗号分隔）
+# reset: 用户主动重置会话时
+# ttl: TTL 过期时
+# lru: LRU 逐出时（可能频繁，建议关闭）
+# command: 用户发送 /stats 命令时
+export AGENT_SESSION_SUMMARY_TRIGGERS="${AGENT_SESSION_SUMMARY_TRIGGERS:-reset,command}"
+# 是否仅在单聊中发送（默认 1，群聊不发避免噪音）
+export AGENT_SESSION_SUMMARY_O2O_ONLY="${AGENT_SESSION_SUMMARY_O2O_ONLY:-1}"
+
 # LLM 不可用/超时/出错时给用户的兜底提示（#59）：避免消息被静默吞掉、ack 永远停在
 # 「处理中」。设为空串关闭兜底（回退旧的静默行为）。模型正常但没话说（empty）仍静默。
 export AGENT_FALLBACK_REPLY="${AGENT_FALLBACK_REPLY:-⚠️ 暂时无法处理你的消息，请稍后再试。}"
+# 启动报告：服务启动后向订阅单聊用户的主管发送详细服务状态报告（默认开）。
+# 报告包含数字员工身份、订阅配置、组件状态、健康检查、配置概要等。设 0 关闭。
+export CAP_STARTUP_REPORT_ENABLED="${CAP_STARTUP_REPORT_ENABLED:-1}"
 # opencode serve 端口（start_serve 用；密码自动生成写 .serve.pwd）。brain(opencode) 走
 # 此 serve 的 HTTP 接口生成回复。
 export OPENCODE_SERVE_PORT="${OPENCODE_SERVE_PORT:-4096}"
@@ -151,9 +168,9 @@ export ACK_MARK_READ="${ACK_MARK_READ:-1}"
 # 咖啡/OK/疑问 等；文字表情会先 create-text-emotion 拿 emotionId 再 add，模块内按(名,文)缓存）。
 # 默认文案用纯文字：实测含 emoji/特殊标点的文案（🈺、（约 5 分钟）…）会被 create-text-emotion
 # 拒（"暂不支持保存该文字表情"），纯文字稳定可存。改文案后建议先手测 create-text-emotion 能存。
-export ACK_STAGES="${ACK_STAGES:-0:稍等:已收到，正在处理|5:稍等:正在处理中|300:咖啡:仍在处理，请稍候}"
-export ACK_DONE="${ACK_DONE:-OK:✅ 已处理完成}"          # 完成（表情名:文字，✅ 实测可存）
-export ACK_ERROR="${ACK_ERROR:-疑问:⚠️ 处理未完成}"      # 失败（表情名:文字，⚠️ 实测可存）
+export ACK_STAGES="${ACK_STAGES:-0:稍等:收到|5:稍等:处理中|300:咖啡:处理中}"
+export ACK_DONE="${ACK_DONE:-OK:完成}"          # 完成（表情名:文字）
+export ACK_ERROR="${ACK_ERROR:-疑问:未完成}"      # 失败（表情名:文字）
 # 等"回复已发出"信号的上限秒数（brain 慢 / 空回复不发送时兜底收尾）。留空=自动取
 # max(180, 最后阶段delay + 300)，保证时间线走完后仍留足冗余。
 # export ACK_DONE_TIMEOUT="600"

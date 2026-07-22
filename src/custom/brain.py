@@ -56,6 +56,18 @@ _RESET_KEYWORDS = {
     if k.strip()
 }
 
+# 会话统计摘要（#63）：session 结束时发送统计信息。
+#   AGENT_SESSION_SUMMARY_ENABLED   是否启用统计摘要（默认开启）。
+#   AGENT_SESSION_SUMMARY_TRIGGERS  触发场景：reset(重置),ttl(过期),lru(逐出),command(/stats命令)，逗号分隔。
+#   AGENT_SESSION_SUMMARY_O2O_ONLY  是否仅在单聊发送（默认 1，群聊不发避免噪音）。
+_SUMMARY_ENABLED = os.environ.get("AGENT_SESSION_SUMMARY_ENABLED", "1") in ("1", "true", "True", "yes", "on")
+_SUMMARY_TRIGGERS = {
+    t.strip().lower()
+    for t in os.environ.get("AGENT_SESSION_SUMMARY_TRIGGERS", "reset,command").split(",")
+    if t.strip()
+}
+_SUMMARY_O2O_ONLY = os.environ.get("AGENT_SESSION_SUMMARY_O2O_ONLY", "1") in ("1", "true", "True", "yes", "on")
+
 
 # per-session 权限规则（JSON 数组，serve v1 格式 [{"permission","pattern","action"}]）。
 # 配了 ask 规则时命中的工具调用会挂起并发 permission.asked SSE 事件 → permission 能力
@@ -141,9 +153,20 @@ def _split_model(model):
 # LRU（OrderedDict，命中/新建移到末尾，超上限从头逐出）+ 闲置 TTL 过期。每 conv 一把锁，
 # 保证同一会话先后到达的消息串行走同一 session（serve 对 busy session 的并发 POST 未保证
 # 有序）。不同 conv 并行不受影响。CLI 回退路径不参与复用（拿不到 serve session，降级无状态）。
+# 统计扩展（#63）：增加 created/rounds/input_tokens/output_tokens/reasoning_tokens/cache_read/cache_write 字段。
 from collections import OrderedDict                       # noqa: E402
 
-_conv_sessions = OrderedDict()   # conv_id -> {"sid": str, "last": float}
+_conv_sessions = OrderedDict()   # conv_id -> {
+                                 #   "sid": str,
+                                 #   "last": float,
+                                 #   "created": float,           # 创建时间
+                                 #   "rounds": int,              # 对话轮数
+                                 #   "input_tokens": int,        # 输入 tokens
+                                 #   "output_tokens": int,       # 输出 tokens
+                                 #   "reasoning_tokens": int,    # 推理 tokens
+                                 #   "cache_read": int,          # 缓存读取 tokens
+                                 #   "cache_write": int,         # 缓存写入 tokens
+                                 # }
 _conv_locks = {}                 # conv_id -> threading.Lock（保护单会话内的顺序）
 _conv_meta_lock = threading.Lock()   # 保护上面两张表本身的结构性改动
 
@@ -157,8 +180,11 @@ def _conv_lock(conv_id):
         return lk
 
 
-def _lookup_sid(conv_id):
-    """查该 conv 未过期的 sid；过期/无则返回 None（过期项顺手删除）。"""
+def _lookup_sid(conv_id, ctx=None):
+    """查该 conv 未过期的 sid；过期/无则返回 None（过期项顺手删除）。
+
+    ctx: 可选上下文 dict（含 conv_type），用于过期时发送统计摘要。
+    """
     if not conv_id:
         return None
     with _conv_meta_lock:
@@ -166,19 +192,66 @@ def _lookup_sid(conv_id):
         if not rec:
             return None
         if time.time() - rec["last"] > _SESSION_TTL:
-            _conv_sessions.pop(conv_id, None)   # 过期 → 丢弃，调用方重建
+            # TTL 过期：发送统计摘要（如果启用且提供了 ctx）
+            if ctx:
+                conv_type = ctx.get("conv_type", 1)
+                # 在锁外发送（避免死锁）
+                sid_to_send = rec["sid"]
+                conv_id_to_send = conv_id
+                _conv_sessions.pop(conv_id, None)   # 过期 → 丢弃，调用方重建
+                # 释放锁后发送
+                try:
+                    if _should_send_summary(conv_id_to_send, conv_type, "ttl"):
+                        stats = {
+                            "sid": sid_to_send,
+                            "created": rec.get("created", rec["last"]),
+                            "elapsed": time.time() - rec.get("created", rec["last"]),
+                            "rounds": rec.get("rounds", 0),
+                            "input_tokens": rec.get("input_tokens", 0),
+                            "output_tokens": rec.get("output_tokens", 0),
+                            "reasoning_tokens": rec.get("reasoning_tokens", 0),
+                            "cache_read": rec.get("cache_read", 0),
+                            "cache_write": rec.get("cache_write", 0),
+                            "model": _OPENCODE_MODEL,
+                        }
+                        summary = _format_session_summary(stats)
+                        if summary:
+                            from core.replier import send_reply
+                            send_reply(conv_id_to_send, conv_type, summary)
+                            log(f"brain: 已发送统计摘要 conv={conv_id_to_send[:12]} trigger=ttl")
+                except Exception as e:
+                    log(f"brain: TTL 过期发送统计摘要失败: {e}")
+            else:
+                _conv_sessions.pop(conv_id, None)   # 过期 → 丢弃，调用方重建
             return None
         _conv_sessions.move_to_end(conv_id)     # LRU：命中移到末尾
         return rec["sid"]
 
 
-def _remember_sid(conv_id, sid):
-    """登记/刷新 conv→sid，并做 LRU 逐出。返回被逐出的 (conv_id, sid) 列表供删远端 session。"""
+def _remember_sid(conv_id, sid, is_new=False):
+    """登记/刷新 conv→sid，并做 LRU 逐出。返回被逐出的 (conv_id, sid) 列表供删远端 session。
+
+    is_new=True 时初始化统计字段；False 时只刷新 last。
+    """
     evicted = []
     if not conv_id or not sid:
         return evicted
     with _conv_meta_lock:
-        _conv_sessions[conv_id] = {"sid": sid, "last": time.time()}
+        if is_new or conv_id not in _conv_sessions:
+            _conv_sessions[conv_id] = {
+                "sid": sid,
+                "last": time.time(),
+                "created": time.time(),
+                "rounds": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+            }
+        else:
+            _conv_sessions[conv_id]["sid"] = sid
+            _conv_sessions[conv_id]["last"] = time.time()
         _conv_sessions.move_to_end(conv_id)
         while len(_conv_sessions) > _SESSION_MAX:
             old_cid, old_rec = _conv_sessions.popitem(last=False)
@@ -198,6 +271,157 @@ def _forget_sid(conv_id):
 def _is_reset(text):
     """整句命中重置关键词（大小写不敏感）→ 主动断上下文。"""
     return (text or "").strip().lower() in _RESET_KEYWORDS
+
+
+def _update_stats(conv_id, input_tokens=0, output_tokens=0, reasoning_tokens=0, cache_read=0, cache_write=0):
+    """更新会话统计信息（轮数 + tokens）。"""
+    if not conv_id:
+        return
+    with _conv_meta_lock:
+        rec = _conv_sessions.get(conv_id)
+        if rec:
+            rec["rounds"] += 1
+            rec["input_tokens"] += input_tokens
+            rec["output_tokens"] += output_tokens
+            rec["reasoning_tokens"] += reasoning_tokens
+            rec["cache_read"] += cache_read
+            rec["cache_write"] += cache_write
+            rec["last"] = time.time()
+
+
+def _get_session_stats(conv_id):
+    """获取会话统计信息。返回 dict 或 None。"""
+    if not conv_id:
+        return None
+    with _conv_meta_lock:
+        rec = _conv_sessions.get(conv_id)
+        if not rec:
+            return None
+        return {
+            "sid": rec["sid"],
+            "created": rec.get("created", rec["last"]),
+            "elapsed": time.time() - rec.get("created", rec["last"]),
+            "rounds": rec.get("rounds", 0),
+            "input_tokens": rec.get("input_tokens", 0),
+            "output_tokens": rec.get("output_tokens", 0),
+            "reasoning_tokens": rec.get("reasoning_tokens", 0),
+            "cache_read": rec.get("cache_read", 0),
+            "cache_write": rec.get("cache_write", 0),
+            "model": _OPENCODE_MODEL,
+        }
+
+
+def _format_tokens(count):
+    """格式化 token 数量（K/M 单位）。"""
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    elif count >= 1000:
+        return f"{count / 1000:.1f}K"
+    return str(count)
+
+
+def _format_session_summary(stats):
+    """格式化会话统计摘要消息。"""
+    if not stats:
+        return None
+
+    sid = stats.get("sid", "unknown")[:12]
+    elapsed = int(stats.get("elapsed", 0))
+    model = stats.get("model", "unknown")
+    rounds = stats.get("rounds", 0)
+    input_tokens = stats.get("input_tokens", 0)
+    output_tokens = stats.get("output_tokens", 0)
+    reasoning_tokens = stats.get("reasoning_tokens", 0)
+    cache_read = stats.get("cache_read", 0)
+    cache_write = stats.get("cache_write", 0)
+
+    # 基础信息（总是显示）
+    lines = [
+        f"**Session ID:** `{sid}`",
+        "",
+    ]
+
+    # 使用 markdown 列表格式，每个字段一行
+    lines.append(f"- ⏱️ **耗时:** {elapsed}s")
+    lines.append(f"- 🤖 **模型:** {model}")
+    lines.append(f"- 🔄 **轮数:** {rounds}")
+
+    # Tokens 统计（总是显示，即使是 0）
+    input_str = _format_tokens(input_tokens)
+    output_str = _format_tokens(output_tokens)
+    lines.append(f"- 💬 **Tokens:** 输入 {input_str}↑ / 输出 {output_str}↓")
+
+    # 推理 tokens（只在 > 0 时显示）
+    if reasoning_tokens > 0:
+        reasoning_str = _format_tokens(reasoning_tokens)
+        lines.append(f"- 🧠 **推理:** {reasoning_str}")
+
+    # 缓存命中率（只在有缓存读取时显示）
+    if cache_read > 0:
+        total_in = input_tokens + cache_read
+        hit_rate = (cache_read / total_in * 100) if total_in > 0 else 0
+        cache_read_str = _format_tokens(cache_read)
+        total_in_str = _format_tokens(total_in)
+        lines.append(f"- 🔄 **缓存命中:** {hit_rate:.1f}%（{cache_read_str}/{total_in_str}）")
+
+    # 窗口使用率（只在有输入时显示，窗口占用 = 新输入 + 缓存命中）
+    ctx_used = input_tokens + cache_read
+    if ctx_used > 0:
+        window_size = 1_000_000
+        window_pct = (ctx_used / window_size * 100) if window_size > 0 else 0
+        ctx_used_str = _format_tokens(ctx_used)
+        window_size_str = _format_tokens(window_size)
+        lines.append(f"- 📊 **窗口:** {ctx_used_str}/{window_size_str}（{window_pct:.1f}%）")
+
+    return "\n".join(lines)
+
+
+def _should_send_summary(conv_id, conv_type, trigger):
+    """判断是否应该发送统计摘要。
+
+    Args:
+        conv_id: 会话 ID
+        conv_type: 会话类型（1=单聊，2=群聊）
+        trigger: 触发场景（reset/ttl/lru/command）
+
+    Returns:
+        bool: 是否发送
+    """
+    if not _SUMMARY_ENABLED:
+        return False
+    if trigger not in _SUMMARY_TRIGGERS:
+        return False
+    if _SUMMARY_O2O_ONLY and conv_type != 1:
+        return False
+    return True
+
+
+def _send_session_summary(conv_id, conv_type, trigger="reset"):
+    """发送会话统计摘要。
+
+    Args:
+        conv_id: 会话 ID
+        conv_type: 会话类型
+        trigger: 触发场景（reset/ttl/lru/command）
+    """
+    if not _should_send_summary(conv_id, conv_type, trigger):
+        return
+
+    stats = _get_session_stats(conv_id)
+    if not stats:
+        return
+
+    summary = _format_session_summary(stats)
+    if not summary:
+        return
+
+    # 延迟导入避免循环依赖
+    try:
+        from core.replier import send_reply
+        send_reply(conv_id, conv_type, summary)
+        log(f"brain: 已发送统计摘要 conv={conv_id[:12]} trigger={trigger}")
+    except Exception as e:
+        log(f"brain: 发送统计摘要失败: {e}")
 
 
 def _reset_sessions():
@@ -281,8 +505,11 @@ def _brain_opencode(user, text, ctx, raw=False):
     上下文；用户发重置关键词（/new 等）→ 断上下文重建，不打扰模型直接回确认。
     """
     conv_id = (ctx or {}).get("conv_id", "")
+    conv_type = (ctx or {}).get("conv_type", 1)
     # 重置指令：仅在复用模式下有意义（无状态模式每条本就是新会话）
     if _SESSION_REUSE and conv_id and _is_reset(text):
+        # 发送统计摘要（如果启用）
+        _send_session_summary(conv_id, conv_type, trigger="reset")
         old = _forget_sid(conv_id)
         if old:
             pid, port, pwd = find_serve_credentials()
@@ -349,7 +576,10 @@ def _delete_session(port, pwd, sid):
 
 
 def _post_message(port, pwd, sid, prompt, provider, model_id):
-    """向 session 发一条 message，拼接 text parts 返回回复文本。"""
+    """向 session 发一条 message，拼接 text parts 返回回复文本和统计信息。
+
+    返回 (reply_text, usage_dict)，usage_dict 包含 input/output/reasoning/cache tokens。
+    """
     d = _serve_request(
         "POST", port, pwd, f"/session/{sid}/message",
         {
@@ -359,9 +589,30 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
         },
         timeout=_OPENCODE_TIMEOUT,
     ) or {}
-    return "".join(
+    reply = "".join(
         p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
     ).strip()
+
+    # 提取 token 使用统计（支持多种格式）
+    # 格式1: info.tokens (opencode serve 实际格式)
+    info = d.get("info", {}) or {}
+    info_tokens = info.get("tokens", {}) or {}
+
+    # 格式2: tokens (参考项目格式，可能用于 SSE 事件)
+    tokens = d.get("tokens", {}) or {}
+
+    # 格式3: usage (驼峰命名，备用)
+    usage = d.get("usage", {}) or {}
+
+    # 优先使用 info.tokens（实际响应格式），然后 fallback
+    cache = info_tokens.get("cache") or tokens.get("cache", {}) or {}
+    return reply, {
+        "input_tokens": info_tokens.get("input") or tokens.get("input") or usage.get("inputTokens", 0),
+        "output_tokens": info_tokens.get("output") or tokens.get("output") or usage.get("outputTokens", 0),
+        "reasoning_tokens": info_tokens.get("reasoning") or tokens.get("reasoning") or usage.get("reasoningTokens", 0),
+        "cache_read": cache.get("read") or usage.get("cacheReadTokens", 0),
+        "cache_write": cache.get("write") or usage.get("cacheWriteTokens", 0),
+    }
 
 
 def _brain_opencode_http(prompt, ctx=None):
@@ -397,7 +648,7 @@ def _http_oneshot(port, pwd, prompt, ctx):
     try:
         sid = _create_session(port, pwd)
         _register_textreply_sid(sid, ctx)
-        reply = _post_message(port, pwd, sid, prompt, provider, model_id)
+        reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
         _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
         return reply
     except Exception as e:
@@ -413,14 +664,14 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
     provider, model_id = _split_model(_OPENCODE_MODEL)
     t0 = time.time()
     with _conv_lock(conv_id):
-        sid = _lookup_sid(conv_id)
+        sid = _lookup_sid(conv_id, ctx=ctx)
         reused = sid is not None
         try:
             if sid is None:
                 sid = _create_session(port, pwd)
             _register_textreply_sid(sid, ctx)   # 刷新 conv ctx（回程路由用最新来源）
             try:
-                reply = _post_message(port, pwd, sid, prompt, provider, model_id)
+                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
             except urllib.error.HTTPError as he:
                 # 复用的 session 已被 serve 清（重启/GC）→ 丢记录、重建一次重试
                 if reused and he.code == 404:
@@ -428,12 +679,20 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                     _forget_sid(conv_id)
                     sid = _create_session(port, pwd)
                     _register_textreply_sid(sid, ctx)
-                    reply = _post_message(port, pwd, sid, prompt, provider, model_id)
+                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                    reused = False  # 重建了，视为新会话
                 else:
                     raise
             # 成功：登记/刷新 last，处理 LRU 逐出（删被挤掉会话的远端 session）
-            for _cid, _sid in _remember_sid(conv_id, sid):
+            for _cid, _sid in _remember_sid(conv_id, sid, is_new=(not reused)):
                 _delete_session(port, pwd, _sid)
+            # 更新统计信息
+            _update_stats(conv_id,
+                         input_tokens=usage.get("input_tokens", 0),
+                         output_tokens=usage.get("output_tokens", 0),
+                         reasoning_tokens=usage.get("reasoning_tokens", 0),
+                         cache_read=usage.get("cache_read", 0),
+                         cache_write=usage.get("cache_write", 0))
             _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
             return reply
         except Exception as e:

@@ -415,6 +415,17 @@ def main():
     t = threading.Thread(target=log_tail_thread, args=(stop_flag,), daemon=True)
     t.start()
 
+    # 延迟发送启动报告（等待所有组件启动完成 + 健康检查）
+    def send_startup_report_delayed():
+        time.sleep(10)  # 等待 10 秒让服务完全启动
+        try:
+            from custom.capabilities.startup_report import send_startup_report
+            send_startup_report()
+        except Exception as e:
+            log(f"[startup_report] 发送启动报告异常: {e}")
+
+    threading.Thread(target=send_startup_report_delayed, daemon=True).start()
+
     # 主线程跑 SSE 连接
     try:
         connect_sse()

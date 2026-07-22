@@ -91,15 +91,14 @@ def _parse_status(spec, default_emoji, default_text):
 
 
 # 进度「文字表情」时间线：收到即贴，5s 处理中，5 分钟(300s)仍在处理。
-# 默认文案用纯文字：实测部分含 emoji/特殊标点的文案（如 "🈺 已收到，正在处理…"、
-# "（约 5 分钟）"）被 create-text-emotion 拒（"暂不支持保存该文字表情"）；纯文字稳定可存。
-# 表情名本身已是钉钉贴纸（稍等/咖啡/OK/疑问），文字只作补充。DONE/ERROR 的 ✅/⚠️ 实测可存。
+# 默认文案简洁清晰：收到 → 处理中 → 完成/未完成
+# 表情名本身已是钉钉贴纸（稍等/咖啡/OK/疑问），文字只作补充。
 _STAGES = _parse_stages(
     os.environ.get("ACK_STAGES")
-    or "0:稍等:已收到，正在处理|5:稍等:正在处理中|300:咖啡:仍在处理，请稍候"
+    or "0:稍等:收到|5:稍等:处理中|300:咖啡:处理中"
 )
-_DONE = _parse_status(os.environ.get("ACK_DONE"), "OK", "✅ 已处理完成")
-_ERROR = _parse_status(os.environ.get("ACK_ERROR"), "疑问", "⚠️ 处理未完成")
+_DONE = _parse_status(os.environ.get("ACK_DONE"), "OK", "完成")
+_ERROR = _parse_status(os.environ.get("ACK_ERROR"), "疑问", "未完成")
 
 # 等"回复已发出"信号的上限秒数（brain 慢 / 空回复不发时兜底收尾）。默认覆盖到最后一个
 # 进度阶段之后仍留足冗余（最后阶段 delay + 300s，至少 180s）。
