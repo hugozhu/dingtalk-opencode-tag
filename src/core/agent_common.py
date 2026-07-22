@@ -310,6 +310,73 @@ def _write_state_file(basename, value):
         log(f"write state {basename} err: {e}")
 
 
+# ---------------------------------------------------------------------------
+# serve_request — 向 opencode serve 发 HTTP 请求的**唯一出口**
+#
+# 此前 auth+Request+urlopen+loads 的模板在本模块被拷贝 8 份（下面各 helper），brain /
+# image 各再拷一份。统一到这里：凭据发现、Basic auth、可选调试日志、JSON 解析集中一处。
+# ---------------------------------------------------------------------------
+
+# 调试日志开关：AGENT_SERVE_DEBUG=1 时把每个 serve 请求/响应的完整 body 写到 opencode.log
+# （便于排查发给模型的 prompt / 模型返回）。默认关，避免日志爆炸。路径同 brain 的 _oc_log。
+_SERVE_DEBUG = os.environ.get("AGENT_SERVE_DEBUG", "") in ("1", "true", "True", "yes", "on")
+_SERVE_LOG = os.environ.get("AGENT_OPENCODE_LOG", os.path.join(_PROJECT_ROOT, "opencode.log"))
+# 长 body（图片 base64 data_url 可达几百 KB）截断：留头 _SERVE_LOG_HEAD + 尾 _SERVE_LOG_TAIL。
+_SERVE_LOG_HEAD = 1000
+_SERVE_LOG_TAIL = 500
+
+
+def _serve_log(line):
+    """把一行调试日志写到 opencode.log（best-effort，写失败静默）。"""
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(_SERVE_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {line}\n")
+    except Exception:
+        pass
+
+
+def _serve_log_trunc(s):
+    """截断过长 body，保留头尾便于阅读（中间标注截断字符数）。"""
+    if s is None:
+        return ""
+    if len(s) <= _SERVE_LOG_HEAD + _SERVE_LOG_TAIL:
+        return s
+    return f"{s[:_SERVE_LOG_HEAD]}...[截断{len(s)}字符]...{s[-_SERVE_LOG_TAIL:]}"
+
+
+def serve_request(method, path, body=None, timeout=8, *, port=None, pwd=None):
+    """向 opencode serve 发一个 HTTP 请求的唯一出口。返回解析后的 JSON（无响应体返回 None）。
+
+    - port/pwd 缺省时自动 find_serve_credentials()；仍无端口 → 抛 RuntimeError。
+    - pwd 非空 → Basic auth(opencode:<pwd>)；否则不带鉴权头（与 healthcheck 约定一致）。
+    - AGENT_SERVE_DEBUG=1 时把 method/path/请求 body、响应 status+body 写到 opencode.log；
+      长 body（图片 data_url 等）自动截断头尾。
+    - **不吞异常**：HTTPError/URLError 照常抛出，调用方保留各自的 404/超时/凭据缺失处理。
+    """
+    if port is None:
+        _, port, pwd = find_serve_credentials()
+    if not port:
+        raise RuntimeError("serve 凭据缺失（port 为空）")
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    if pwd:
+        headers["Authorization"] = "Basic " + base64.b64encode(
+            f"opencode:{pwd}".encode()).decode()
+    if _SERVE_DEBUG:
+        body_str = json.dumps(body, ensure_ascii=False) if body is not None else ""
+        _serve_log(f">>> REQ {method} {path} body={_serve_log_trunc(body_str)}")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=data, headers=headers, method=method)
+    r = urllib.request.urlopen(req, timeout=timeout)
+    raw = r.read().decode("utf-8")
+    if _SERVE_DEBUG:
+        _serve_log(f"<<< RESP {method} {path} status={r.status} body={_serve_log_trunc(raw)}")
+    return json.loads(raw) if raw.strip() else None
+
+
 def _find_bot_session():
     """找数字员工当前会话（directory 含 _BOT_DIR_SUBSTR，time.updated 最新的）。
 
@@ -320,12 +387,7 @@ def _find_bot_session():
     if not port:
         return None
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session",
-            headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
-        data = json.loads(r.read().decode("utf-8"))
+        data = serve_request("GET", "/session", timeout=8, port=port, pwd=pwd)
         sessions = data if isinstance(data, list) else data.get("data", [])
         bot = None
         bot_updated = 0
@@ -357,12 +419,7 @@ def _find_session_with_predicate(predicate, asked_ts_ms=None, max_candidates=8):
     if not port:
         return None
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session",
-            headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
-        data = json.loads(r.read().decode("utf-8"))
+        data = serve_request("GET", "/session", timeout=8, port=port, pwd=pwd)
         sessions = data if isinstance(data, list) else data.get("data", [])
         candidates = [s for s in sessions if _BOT_DIR_SUBSTR in (s.get("directory", "") or "")]
         candidates.sort(key=lambda s: (s.get("time", {}) or {}).get("updated", 0) or 0, reverse=True)
@@ -393,16 +450,7 @@ def _create_session(title="agent-default"):
     if not port:
         return None
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        body = json.dumps({"title": title}).encode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session",
-            data=body,
-            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        r = urllib.request.urlopen(req, timeout=10)
-        d = json.loads(r.read().decode("utf-8"))
+        d = serve_request("POST", "/session", {"title": title}, timeout=10, port=port, pwd=pwd) or {}
         sid = d.get("id")
         if sid:
             log(f"created session {sid} (title={title})")
@@ -418,16 +466,10 @@ def _post_user_message(full_sid, text):
     if not port:
         return None
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        body = json.dumps({"input": text, "parts": [{"type": "text", "text": text}]}).encode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session/{full_sid}/message",
-            data=body,
-            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        r = urllib.request.urlopen(req, timeout=180)
-        d = json.loads(r.read().decode("utf-8"))
+        d = serve_request(
+            "POST", f"/session/{full_sid}/message",
+            {"input": text, "parts": [{"type": "text", "text": text}]},
+            timeout=180, port=port, pwd=pwd) or {}
         return d.get("info", {}).get("id") or None
     except Exception as e:
         log(f"post_user_message err: {e}")
@@ -440,12 +482,8 @@ def _get_message_text(full_sid, msg_id):
     if not port:
         return ""
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session/{full_sid}/message",
-            headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
-        data = json.loads(r.read().decode("utf-8"))
+        data = serve_request(
+            "GET", f"/session/{full_sid}/message", timeout=8, port=port, pwd=pwd)
         msgs = data if isinstance(data, list) else data.get("data", [])
         for m in msgs:
             if m.get("info", {}).get("id") == msg_id:
@@ -462,12 +500,8 @@ def _list_session_messages(full_sid):
     if not port:
         return []
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session/{full_sid}/message",
-            headers={"Authorization": f"Basic {auth}"})
-        r = urllib.request.urlopen(req, timeout=8)
-        data = json.loads(r.read().decode("utf-8"))
+        data = serve_request(
+            "GET", f"/session/{full_sid}/message", timeout=8, port=port, pwd=pwd)
         return data if isinstance(data, list) else data.get("data", [])
     except Exception as e:
         log(f"list_session_messages err: {e}")
@@ -480,14 +514,11 @@ def _delete_session_message(full_sid, msg_id):
     if not port:
         return False
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session/{full_sid}/message/{msg_id}",
-            headers={"Authorization": f"Basic {auth}"},
-            method="DELETE",
-        )
-        r = urllib.request.urlopen(req, timeout=6)
-        return r.status == 200
+        # serve 对非 2xx 会抛 HTTPError；正常返回（无异常）即视为删除成功。
+        serve_request(
+            "DELETE", f"/session/{full_sid}/message/{msg_id}",
+            timeout=6, port=port, pwd=pwd)
+        return True
     except urllib.error.HTTPError as e:
         log(f"delete_session_message HTTP {e.code}")
         return False
@@ -502,16 +533,11 @@ def _session_action(full_sid, action, body=None):
     if not port:
         return False
     try:
-        auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-        data = json.dumps(body or {}).encode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/session/{full_sid}/{action}",
-            data=data,
-            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        r = urllib.request.urlopen(req, timeout=6)
-        return r.status == 200
+        # 非 2xx 抛 HTTPError；正常返回即视为成功。
+        serve_request(
+            "POST", f"/session/{full_sid}/{action}", body or {},
+            timeout=6, port=port, pwd=pwd)
+        return True
     except urllib.error.HTTPError as e:
         log(f"session_action {action} HTTP {e.code}")
         return False

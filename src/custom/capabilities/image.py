@@ -17,13 +17,11 @@
 """
 
 import base64
-import json
 import os
 import re
 import tempfile
-import urllib.request
 
-from core.agent_common import _proxy_vision, _run_cli, find_serve_credentials, log, submit_handler
+from core.agent_common import _proxy_vision, _run_cli, find_serve_credentials, log, serve_request, submit_handler
 from core.capabilities import Capability, register
 from core.inbound import KIND_IMAGE
 from core.brain import generate_reply, register_session as _register_textreply_sid
@@ -100,32 +98,23 @@ def _recognize_via_serve(img_bytes, mime="image/png"):
     provider, model_id = _split_model(_VISION_MODEL)
     b64 = base64.b64encode(img_bytes).decode()
     data_url = f"data:{mime};base64,{b64}"
-    auth = base64.b64encode(f"opencode:{pwd}".encode()).decode()
-    headers = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
-
-    def _req(method, path, body=None, timeout=15):
-        data = json.dumps(body).encode() if body is not None else None
-        r = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
-                                   data=data, headers=headers, method=method)
-        resp = urllib.request.urlopen(r, timeout=timeout)
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw.strip() else None
 
     sid = None
     try:
-        created = _req("POST", "/session", {"title": "agent-vision"}, timeout=10)
+        created = serve_request("POST", "/session", {"title": "agent-vision"},
+                                timeout=10, port=port, pwd=pwd)
         sid = (created or {}).get("id")
         if not sid:
             return ""
         # 登记为 brain 抑制名单，避免 vision session 的 SSE 事件触发业务通知刷屏
         _register_textreply_sid(sid)
-        d = _req("POST", f"/session/{sid}/message", {
+        d = serve_request("POST", f"/session/{sid}/message", {
             "model": {"providerID": provider, "modelID": model_id},
             "parts": [
                 {"type": "file", "mime": mime, "filename": "image", "url": data_url},
                 {"type": "text", "text": _VISION_PROMPT},
             ],
-        }, timeout=_VISION_TIMEOUT) or {}
+        }, timeout=_VISION_TIMEOUT, port=port, pwd=pwd) or {}
         desc = "".join(
             p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
         ).strip()
@@ -138,7 +127,7 @@ def _recognize_via_serve(img_bytes, mime="image/png"):
     finally:
         if sid:
             try:
-                _req("DELETE", f"/session/{sid}", timeout=6)
+                serve_request("DELETE", f"/session/{sid}", timeout=6, port=port, pwd=pwd)
             except Exception:
                 pass
 
