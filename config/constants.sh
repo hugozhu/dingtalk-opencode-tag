@@ -46,10 +46,10 @@ export EVENT_WATCHER_CHECK_PATTERN="${EVENT_WATCHER_CHECK_PATTERN:-event_watcher
 export PROXY_URL="${PROXY_URL:-http://localhost:4000/v1}"
 export PROXY_KEY="${PROXY_KEY:-sk-1234}"
 export VISION_MODEL="${VISION_MODEL:-gemini-3.1-flash-image}"
-# 经 opencode serve 自身识别图片的免费多模态模型（无需外部 proxy）。实测 opencode
-# provider 已鉴权且能读图；opencode/mimo-v2.5-free 正确识别测试图（CODE/颜色/框），~7s。
-# 图片能力后续可改走 serve 直传图片给此模型（provider/model 格式）。
-export AGENT_VISION_MODEL="${AGENT_VISION_MODEL:-opencode/mimo-v2.5-free}"
+# 经 opencode serve 自身识别图片的多模态模型（无需外部 proxy）。provider/model 格式。
+# 可选免费模型：opencode/mimo-v2.5-free；或走外部 proxy 的 gemini（识别质量更好）。
+# 留空则只用外部 proxy (PROXY_URL + VISION_MODEL)。
+export AGENT_VISION_MODEL="${AGENT_VISION_MODEL:-}"
 
 # --- 业务特定（用户扩展）---
 # 在这里加自己的业务常量
