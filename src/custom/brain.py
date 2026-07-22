@@ -589,18 +589,23 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
         p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
     ).strip()
 
-    # 提取 token 使用统计（同时支持两种格式）
-    # 格式1: tokens (参考项目使用，字段名小写)
+    # 提取 token 使用统计（支持多种格式）
+    # 格式1: info.tokens (opencode serve 实际格式)
+    info = d.get("info", {}) or {}
+    info_tokens = info.get("tokens", {}) or {}
+
+    # 格式2: tokens (参考项目格式，可能用于 SSE 事件)
     tokens = d.get("tokens", {}) or {}
-    # 格式2: usage (驼峰命名)
+
+    # 格式3: usage (驼峰命名，备用)
     usage = d.get("usage", {}) or {}
 
-    # 优先使用 tokens 格式（与参考项目一致），fallback 到 usage
-    cache = tokens.get("cache", {}) or {}
+    # 优先使用 info.tokens（实际响应格式），然后 fallback
+    cache = info_tokens.get("cache") or tokens.get("cache", {}) or {}
     return reply, {
-        "input_tokens": tokens.get("input") or usage.get("inputTokens", 0),
-        "output_tokens": tokens.get("output") or usage.get("outputTokens", 0),
-        "reasoning_tokens": tokens.get("reasoning") or usage.get("reasoningTokens", 0),
+        "input_tokens": info_tokens.get("input") or tokens.get("input") or usage.get("inputTokens", 0),
+        "output_tokens": info_tokens.get("output") or tokens.get("output") or usage.get("outputTokens", 0),
+        "reasoning_tokens": info_tokens.get("reasoning") or tokens.get("reasoning") or usage.get("reasoningTokens", 0),
         "cache_read": cache.get("read") or usage.get("cacheReadTokens", 0),
         "cache_write": cache.get("write") or usage.get("cacheWriteTokens", 0),
     }
