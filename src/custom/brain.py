@@ -153,7 +153,7 @@ def _split_model(model):
 # LRU（OrderedDict，命中/新建移到末尾，超上限从头逐出）+ 闲置 TTL 过期。每 conv 一把锁，
 # 保证同一会话先后到达的消息串行走同一 session（serve 对 busy session 的并发 POST 未保证
 # 有序）。不同 conv 并行不受影响。CLI 回退路径不参与复用（拿不到 serve session，降级无状态）。
-# 统计扩展（#63）：增加 created/rounds/input_tokens/output_tokens/reasoning_tokens 字段。
+# 统计扩展（#63）：增加 created/rounds/input_tokens/output_tokens/reasoning_tokens/cache_read/cache_write 字段。
 from collections import OrderedDict                       # noqa: E402
 
 _conv_sessions = OrderedDict()   # conv_id -> {
@@ -164,6 +164,8 @@ _conv_sessions = OrderedDict()   # conv_id -> {
                                  #   "input_tokens": int,        # 输入 tokens
                                  #   "output_tokens": int,       # 输出 tokens
                                  #   "reasoning_tokens": int,    # 推理 tokens
+                                 #   "cache_read": int,          # 缓存读取 tokens
+                                 #   "cache_write": int,         # 缓存写入 tokens
                                  # }
 _conv_locks = {}                 # conv_id -> threading.Lock（保护单会话内的顺序）
 _conv_meta_lock = threading.Lock()   # 保护上面两张表本身的结构性改动
@@ -208,6 +210,8 @@ def _lookup_sid(conv_id, ctx=None):
                             "input_tokens": rec.get("input_tokens", 0),
                             "output_tokens": rec.get("output_tokens", 0),
                             "reasoning_tokens": rec.get("reasoning_tokens", 0),
+                            "cache_read": rec.get("cache_read", 0),
+                            "cache_write": rec.get("cache_write", 0),
                             "model": _OPENCODE_MODEL,
                         }
                         summary = _format_session_summary(stats)
@@ -242,6 +246,8 @@ def _remember_sid(conv_id, sid, is_new=False):
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "reasoning_tokens": 0,
+                "cache_read": 0,
+                "cache_write": 0,
             }
         else:
             _conv_sessions[conv_id]["sid"] = sid
@@ -267,7 +273,7 @@ def _is_reset(text):
     return (text or "").strip().lower() in _RESET_KEYWORDS
 
 
-def _update_stats(conv_id, input_tokens=0, output_tokens=0, reasoning_tokens=0):
+def _update_stats(conv_id, input_tokens=0, output_tokens=0, reasoning_tokens=0, cache_read=0, cache_write=0):
     """更新会话统计信息（轮数 + tokens）。"""
     if not conv_id:
         return
@@ -278,6 +284,8 @@ def _update_stats(conv_id, input_tokens=0, output_tokens=0, reasoning_tokens=0):
             rec["input_tokens"] += input_tokens
             rec["output_tokens"] += output_tokens
             rec["reasoning_tokens"] += reasoning_tokens
+            rec["cache_read"] += cache_read
+            rec["cache_write"] += cache_write
             rec["last"] = time.time()
 
 
@@ -297,6 +305,8 @@ def _get_session_stats(conv_id):
             "input_tokens": rec.get("input_tokens", 0),
             "output_tokens": rec.get("output_tokens", 0),
             "reasoning_tokens": rec.get("reasoning_tokens", 0),
+            "cache_read": rec.get("cache_read", 0),
+            "cache_write": rec.get("cache_write", 0),
             "model": _OPENCODE_MODEL,
         }
 
@@ -320,6 +330,8 @@ def _format_session_summary(stats):
     input_tokens = stats.get("input_tokens", 0)
     output_tokens = stats.get("output_tokens", 0)
     reasoning_tokens = stats.get("reasoning_tokens", 0)
+    cache_read = stats.get("cache_read", 0)
+    cache_write = stats.get("cache_write", 0)
 
     # 基础信息（总是显示）
     lines = [
@@ -340,12 +352,22 @@ def _format_session_summary(stats):
         reasoning_str = _format_tokens(reasoning_tokens)
         lines.append(f"🧠 推理: {reasoning_str}")
 
-    # 窗口使用率（只在输入 token > 0 时显示）
-    if input_tokens > 0:
+    # 缓存命中率（只在有缓存读取时显示）
+    if cache_read > 0:
+        total_in = input_tokens + cache_read
+        hit_rate = (cache_read / total_in * 100) if total_in > 0 else 0
+        cache_read_str = _format_tokens(cache_read)
+        total_in_str = _format_tokens(total_in)
+        lines.append(f"🔄 缓存命中: {hit_rate:.1f}%（{cache_read_str}/{total_in_str}）")
+
+    # 窗口使用率（只在有输入时显示，窗口占用 = 新输入 + 缓存命中）
+    ctx_used = input_tokens + cache_read
+    if ctx_used > 0:
         window_size = 1_000_000
-        window_pct = (input_tokens / window_size * 100) if window_size > 0 else 0
-        window_usage = f"{_format_tokens(input_tokens)}/{_format_tokens(window_size)}（{window_pct:.1f}%）"
-        lines.append(f"📊 窗口: {window_usage}")
+        window_pct = (ctx_used / window_size * 100) if window_size > 0 else 0
+        ctx_used_str = _format_tokens(ctx_used)
+        window_size_str = _format_tokens(window_size)
+        lines.append(f"📊 窗口: {ctx_used_str}/{window_size_str}（{window_pct:.1f}%）")
 
     return "\n".join(lines)
 
@@ -552,7 +574,7 @@ def _delete_session(port, pwd, sid):
 def _post_message(port, pwd, sid, prompt, provider, model_id):
     """向 session 发一条 message，拼接 text parts 返回回复文本和统计信息。
 
-    返回 (reply_text, usage_dict)，usage_dict 包含 input/output/reasoning tokens。
+    返回 (reply_text, usage_dict)，usage_dict 包含 input/output/reasoning/cache tokens。
     """
     d = _serve_request(
         "POST", port, pwd, f"/session/{sid}/message",
@@ -567,12 +589,20 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
         p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
     ).strip()
 
-    # 提取 token 使用统计
+    # 提取 token 使用统计（同时支持两种格式）
+    # 格式1: tokens (参考项目使用，字段名小写)
+    tokens = d.get("tokens", {}) or {}
+    # 格式2: usage (驼峰命名)
     usage = d.get("usage", {}) or {}
+
+    # 优先使用 tokens 格式（与参考项目一致），fallback 到 usage
+    cache = tokens.get("cache", {}) or {}
     return reply, {
-        "input_tokens": usage.get("inputTokens", 0),
-        "output_tokens": usage.get("outputTokens", 0),
-        "reasoning_tokens": usage.get("reasoningTokens", 0),
+        "input_tokens": tokens.get("input") or usage.get("inputTokens", 0),
+        "output_tokens": tokens.get("output") or usage.get("outputTokens", 0),
+        "reasoning_tokens": tokens.get("reasoning") or usage.get("reasoningTokens", 0),
+        "cache_read": cache.get("read") or usage.get("cacheReadTokens", 0),
+        "cache_write": cache.get("write") or usage.get("cacheWriteTokens", 0),
     }
 
 
@@ -651,7 +681,9 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
             _update_stats(conv_id,
                          input_tokens=usage.get("input_tokens", 0),
                          output_tokens=usage.get("output_tokens", 0),
-                         reasoning_tokens=usage.get("reasoning_tokens", 0))
+                         reasoning_tokens=usage.get("reasoning_tokens", 0),
+                         cache_read=usage.get("cache_read", 0),
+                         cache_write=usage.get("cache_write", 0))
             _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
             return reply
         except Exception as e:
