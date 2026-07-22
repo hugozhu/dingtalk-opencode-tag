@@ -89,8 +89,8 @@ export AGENT_SESSION_MAX="${AGENT_SESSION_MAX:-64}"            # 最多保活多
 export AGENT_SESSION_RESET_KEYWORDS="${AGENT_SESSION_RESET_KEYWORDS:-/new,新话题,重新开始,清空上下文}"
 
 # 会话统计摘要（#63）：session 结束时自动发送统计信息。
-# 是否启用统计摘要（默认关闭，避免打扰用户）
-export AGENT_SESSION_SUMMARY_ENABLED="${AGENT_SESSION_SUMMARY_ENABLED:-0}"
+# 是否启用统计摘要（默认开启）
+export AGENT_SESSION_SUMMARY_ENABLED="${AGENT_SESSION_SUMMARY_ENABLED:-1}"
 # 统计摘要的触发场景（逗号分隔）
 # reset: 用户主动重置会话时
 # ttl: TTL 过期时

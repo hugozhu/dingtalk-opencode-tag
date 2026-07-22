@@ -57,10 +57,10 @@ _RESET_KEYWORDS = {
 }
 
 # 会话统计摘要（#63）：session 结束时发送统计信息。
-#   AGENT_SESSION_SUMMARY_ENABLED   是否启用统计摘要（默认关闭，避免打扰用户）。
+#   AGENT_SESSION_SUMMARY_ENABLED   是否启用统计摘要（默认开启）。
 #   AGENT_SESSION_SUMMARY_TRIGGERS  触发场景：reset(重置),ttl(过期),lru(逐出),command(/stats命令)，逗号分隔。
 #   AGENT_SESSION_SUMMARY_O2O_ONLY  是否仅在单聊发送（默认 1，群聊不发避免噪音）。
-_SUMMARY_ENABLED = os.environ.get("AGENT_SESSION_SUMMARY_ENABLED", "0") in ("1", "true", "True", "yes", "on")
+_SUMMARY_ENABLED = os.environ.get("AGENT_SESSION_SUMMARY_ENABLED", "1") in ("1", "true", "True", "yes", "on")
 _SUMMARY_TRIGGERS = {
     t.strip().lower()
     for t in os.environ.get("AGENT_SESSION_SUMMARY_TRIGGERS", "reset,command").split(",")

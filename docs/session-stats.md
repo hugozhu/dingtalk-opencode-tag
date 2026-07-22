@@ -34,8 +34,8 @@ Session ID: abc123xyz
 在 `config/constants.sh` 或 `config/constants.local.sh` 中配置：
 
 ```bash
-# 是否启用统计摘要（默认关闭，避免打扰用户）
-export AGENT_SESSION_SUMMARY_ENABLED=0
+# 是否启用统计摘要（默认开启）
+export AGENT_SESSION_SUMMARY_ENABLED=1
 
 # 统计摘要的触发场景（逗号分隔）
 # reset: 用户主动重置会话时
