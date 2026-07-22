@@ -168,7 +168,8 @@ export ACK_MARK_READ="${ACK_MARK_READ:-1}"
 # 咖啡/OK/疑问 等；文字表情会先 create-text-emotion 拿 emotionId 再 add，模块内按(名,文)缓存）。
 # 默认文案用纯文字：实测含 emoji/特殊标点的文案（🈺、（约 5 分钟）…）会被 create-text-emotion
 # 拒（"暂不支持保存该文字表情"），纯文字稳定可存。改文案后建议先手测 create-text-emotion 能存。
-export ACK_STAGES="${ACK_STAGES:-0:稍等:收到|5:稍等:处理中|300:咖啡:处理中}"
+# 注：从 5s 改为 1s，避免快速响应时状态滞后于实际回复（#62）
+export ACK_STAGES="${ACK_STAGES:-0:稍等:收到|1:稍等:处理中|300:咖啡:处理中}"
 export ACK_DONE="${ACK_DONE:-OK:完成}"          # 完成（表情名:文字）
 export ACK_ERROR="${ACK_ERROR:-疑问:未完成}"      # 失败（表情名:文字）
 # 等"回复已发出"信号的上限秒数（brain 慢 / 空回复不发送时兜底收尾）。留空=自动取

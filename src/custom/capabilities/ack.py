@@ -5,7 +5,7 @@
 「文字表情」回应（DingTalk text-emotion：**表情 + 文字同时呈现**），随处理进度
 **原地更新**（不发独立消息、不刷屏、无卡片"生成中"加载态）：
 
-  🈺 收到「稍等｜已收到，正在处理…」→ 5s「稍等｜正在处理中…」
+  🈺 收到「稍等｜已收到，正在处理…」→ 1s「稍等｜正在处理中…」
      → 5 分钟仍在处理「咖啡｜仍在处理（约 5 分钟）…」
   回复发出 → 「OK｜已完成」；处理失败 → 「疑问｜处理未完成」
 
@@ -90,12 +90,13 @@ def _parse_status(spec, default_emoji, default_text):
     return (default_emoji, default_text)
 
 
-# 进度「文字表情」时间线：收到即贴，5s 处理中，5 分钟(300s)仍在处理。
+# 进度「文字表情」时间线：收到即贴，1s 处理中，5 分钟(300s)仍在处理。
 # 默认文案简洁清晰：收到 → 处理中 → 完成/未完成
 # 表情名本身已是钉钉贴纸（稍等/咖啡/OK/疑问），文字只作补充。
+# 注：将处理中延迟从5s改为1s，避免快速响应时状态滞后（#62）
 _STAGES = _parse_stages(
     os.environ.get("ACK_STAGES")
-    or "0:稍等:收到|5:稍等:处理中|300:咖啡:处理中"
+    or "0:稍等:收到|1:稍等:处理中|300:咖啡:处理中"
 )
 _DONE = _parse_status(os.environ.get("ACK_DONE"), "OK", "完成")
 _ERROR = _parse_status(os.environ.get("ACK_ERROR"), "疑问", "未完成")
