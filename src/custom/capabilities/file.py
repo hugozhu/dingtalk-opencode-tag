@@ -45,12 +45,13 @@ _TEXT_EXTS = {
 
 # 防回环 + msgId 去重由 core 声明式处理（见 Capability(loop_guard/dedup)）。
 
-# prompt 末句
+# prompt 末句：明确文件内容由系统下载并转写，参考生产版强调任务导向（答疑/归纳）。
 _FILE_PROMPT_FOOTER = os.environ.get(
     "CAP_FILE_PROMPT_FOOTER",
-    "以上是用户发送的文件内容（由系统下载并读取，可能已截断）。请结合用户随文件的说明（若有），"
-    "对用户的意图做出有帮助的回应（该答疑答疑、该归纳归纳）。",
-)
+    "以上是用户发送的文件内容（由系统下载并读取前 {max_bytes} 字节，可能已截断）。\n"
+    "请理解文件的完整语境（主题、关键信息、数据/代码细节），结合用户随文件的说明（若有），\n"
+    "对用户的意图做出有帮助的回应（该答疑答疑、该归纳归纳、该指出问题指出问题）。",
+).format(max_bytes=_FILE_MAX_BYTES)
 
 
 def _is_text_file(filename):
@@ -123,9 +124,17 @@ def handle_file(user, text, msg_id, conv_id, conv_type):
 
     log(f"file: msgId={msg_id[:24]} filename={filename!r} content_len={len(content)} truncated={truncated}")
 
-    parts = [f"用户 {user} 发送了一个文件：{filename}", "", "【文件内容】", content]
+    # 参考生产版：结构化呈现文件信息（用户+文件名+正文+截断标注+任务指令）
+    parts = [
+        f"用户 {user} 发送了一个文件：{filename}",
+        "",
+        "【文件内容】",
+        "```",
+        content,
+        "```",
+    ]
     if truncated:
-        parts.append("…（文件内容过长，已截断）")
+        parts.append(f"（文件过长，仅读取前 {_FILE_MAX_BYTES} 字节）")
     parts += ["", _FILE_PROMPT_FOOTER]
     prompt = "\n".join(parts)
 

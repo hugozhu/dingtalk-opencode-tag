@@ -106,10 +106,14 @@ from core.brain import (                                # noqa: E402
     is_textreply_session,
     session_conv,
 )
-# 系统提示词（proxy/opencode 后端），可用环境变量覆盖
+# 系统提示词（proxy/opencode 后端），可用环境变量覆盖。
+# 点明数字员工身份 + 钉钉协同场景 + 多模态/多人对话能力，让 agent 更好理解工作语境。
 _SYSTEM_PROMPT = os.environ.get(
     "AGENT_SYSTEM_PROMPT",
-    "你是一个数字员工助手，在钉钉群里回答同事的问题。回答简洁、准确、友好，用中文。",
+    "你是一个钉钉数字员工 Agent，通过钉钉群聊/私聊与用户协同工作。\n"
+    "你需要理解多人对话场景（群聊中不同角色的发言、转发的聊天记录），识别任务意图并给出有帮助的回应。\n"
+    "用户可能会发送文档、图片、文件、链接，系统已为你识别/转写这些内容并内联在消息里。\n"
+    "回答简洁、准确、专业，用中文。当用户需要总结或归纳时，关注关键信息和行动项。",
 )
 # 回复长度上限（防止刷屏）
 _MAX_REPLY_CHARS = int(os.environ.get("AGENT_MAX_REPLY_CHARS", "1000"))

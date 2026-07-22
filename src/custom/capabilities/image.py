@@ -48,11 +48,12 @@ _VISION_PROMPT = os.environ.get(
 
 # msgId 去重（断线重连可能重投）+ 防回环由 core 声明式处理（见 Capability(dedup/loop_guard)）。
 
-# prompt 末句：点明这是图片、内容是 vision 识别的，让 agent 基于内容回应（别再说看不到图）
+# prompt 末句：点明这是图片、内容是 vision 识别的，参考生产版让 agent 理解多模态语境。
 _IMAGE_PROMPT_FOOTER = os.environ.get(
     "CAP_IMAGE_PROMPT_FOOTER",
-    "以上「图片识别内容」由多模态模型从用户发送的图片中提取/描述得到（你本身看不到原图，"
-    "但可据此内容回应）。请结合用户随图的说明（若有），对用户的意图做出有帮助的回应。",
+    "以上「图片识别内容」由多模态模型从用户发送的图片中提取/描述得到。\n"
+    "你本身看不到原图，但可根据识别内容理解用户意图。\n"
+    "请结合用户随图的说明（若有），对用户发送这张图片的意图做出有帮助的回应。",
 )
 
 
@@ -188,8 +189,16 @@ def handle_image(user, text, msg_id, conv_id, conv_type):
 
     log(f"image: msgId={msg_id[:24]} 识别成功 desc_len={len(desc)} caption={caption[:30]!r}")
 
-    # 组 prompt：识别内容 + 用户 caption + 末句指令
-    parts = [f"用户 {user} 发送了一张图片。", "", "【图片识别内容】", desc, ""]
+    # 参考生产版：结构化呈现图片识别结果（用户+图片标识+识别内容代码块+用户说明+任务指令）
+    parts = [
+        f"用户 {user} 发送了一张图片。",
+        "",
+        "【图片识别内容】",
+        "```",
+        desc,
+        "```",
+        "",
+    ]
     if caption:
         parts += [f"【用户随图说明】{caption}", ""]
     parts.append(_IMAGE_PROMPT_FOOTER)
