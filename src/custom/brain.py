@@ -317,24 +317,38 @@ def _format_session_summary(stats):
     elapsed = int(stats.get("elapsed", 0))
     model = stats.get("model", "unknown")
     rounds = stats.get("rounds", 0)
-    input_tokens = _format_tokens(stats.get("input_tokens", 0))
-    output_tokens = _format_tokens(stats.get("output_tokens", 0))
-    reasoning_tokens = _format_tokens(stats.get("reasoning_tokens", 0))
 
-    # 计算窗口使用率（假设 1M 上下文窗口）
-    total_tokens = stats.get("input_tokens", 0)
-    window_size = 1_000_000
-    window_pct = (total_tokens / window_size * 100) if window_size > 0 else 0
-    window_usage = f"{_format_tokens(total_tokens)}/{_format_tokens(window_size)}（{window_pct:.1f}%）"
+    # 基础信息（总是显示）
+    lines = [
+        f"Session ID: {sid}",
+        "",
+        f"⏱️ 耗时: {elapsed}s",
+        f"🤖 模型: {model}",
+        f"🔄 轮数: {rounds}",
+    ]
 
-    return f"""Session ID: {sid}
+    # Token 统计（只在有数据时显示）
+    input_tokens = stats.get("input_tokens", 0)
+    output_tokens = stats.get("output_tokens", 0)
+    reasoning_tokens = stats.get("reasoning_tokens", 0)
 
-⏱️ 耗时: {elapsed}s
-🤖 模型: {model}
-🔄 轮数: {rounds}
-💬 Tokens: 输入 {input_tokens}↑ / 输出 {output_tokens}↓
-🧠 推理: {reasoning_tokens}
-📊 窗口: {window_usage}"""
+    if input_tokens > 0 or output_tokens > 0:
+        input_str = _format_tokens(input_tokens)
+        output_str = _format_tokens(output_tokens)
+        lines.append(f"💬 Tokens: 输入 {input_str}↑ / 输出 {output_str}↓")
+
+    if reasoning_tokens > 0:
+        reasoning_str = _format_tokens(reasoning_tokens)
+        lines.append(f"🧠 推理: {reasoning_str}")
+
+    # 窗口使用率（只在有输入 token 时显示）
+    if input_tokens > 0:
+        window_size = 1_000_000
+        window_pct = (input_tokens / window_size * 100) if window_size > 0 else 0
+        window_usage = f"{_format_tokens(input_tokens)}/{_format_tokens(window_size)}（{window_pct:.1f}%）"
+        lines.append(f"📊 窗口: {window_usage}")
+
+    return "\n".join(lines)
 
 
 def _should_send_summary(conv_id, conv_type, trigger):
