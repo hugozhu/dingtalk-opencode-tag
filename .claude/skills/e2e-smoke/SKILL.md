@@ -1,6 +1,6 @@
 ---
 name: e2e-smoke
-description: 端到端冒烟——验证数字员工「收→处理→发」闭环。支持文本消息和文件消息（#68）两种测试，双校验（日志 + 钉钉实际会话）确认链路正常。
+description: 端到端冒烟——验证数字员工「收→处理→发」闭环。支持文本消息与文件消息（#68，含 markdown/图片/PDF 三类）测试，双校验（日志 + 钉钉实际会话）确认链路正常。
 allowed-tools: Bash
 ---
 
@@ -37,6 +37,30 @@ bash tests/custom/e2e_text_reply_test.sh
     `tail -n 40 monitor.log opencode.log` 定位。
 
 ## 2. 文件消息测试（#68）
+
+验证文件能力的完整链路：发送文件 → 按类型分派解析（type-based dispatch）→ 回复。
+文件能力对三类文件走不同解析路径，各有独立封装脚本，判定逻辑一致（V1 发送 / V2 入站
+`[文件] … fileId:` / V3 `解析成功 type=<T>` / V4 `reply user OK`）：
+
+| 类型 | 脚本 | 解析路径 | V3 期望 |
+|------|------|----------|---------|
+| markdown/文本 | `tests/custom/e2e_file_test.sh` | 直接读文本 | `type=text` |
+| 图片 | `tests/custom/e2e_image_file_test.sh` | vision 识别（独立 session） | `type=image` |
+| PDF | `tests/custom/e2e_pdf_file_test.sh` | pdfplumber 提取文本 | `type=pdf` |
+
+一键三类全跑：
+
+```bash
+for t in e2e_file_test e2e_image_file_test e2e_pdf_file_test; do
+  echo "===== $t ====="; bash "tests/custom/$t.sh" || echo "❌ $t 失败"
+done
+```
+
+- 慢环境/vision 较慢：图片脚本内置 90s 轮询，PDF/文本 60s，通常无需调参。
+- 指定发送方：`E2E_SENDER_PROFILE="<corpId>:<真人userId>" bash tests/custom/e2e_image_file_test.sh`
+- 依赖：PDF 需 `pip install pdfplumber`；图片需 `AGENT_VISION_MODEL` 可用。
+
+### 2.1 文本 / markdown
 
 验证文件能力的完整链路：创建 markdown 文件 → 发送 → 解析（type-based dispatch）→ 回复。
 
@@ -142,9 +166,33 @@ tail -10 monitor.log | grep "file:" | tail -2 || echo "未找到解析记录"
 SCRIPT
 ```
 
+### 2.2 图片文件
+
+图片作为**文件**发送（`--msg-type file`，非 `image`），文件能力分类为 `image` 后走
+vision 识别（独立 session），再注入回复。
+
+```bash
+bash tests/custom/e2e_image_file_test.sh
+```
+
+验收点：V3 期望 `file: 解析成功 type=image`，且日志出现 `serve 识别成功 model=… desc_len=…`。
+挂在 V3（无 `type=image` 或识别为空）→ 检查 `AGENT_VISION_MODEL` 配置与 serve 是否运行。
+
+### 2.3 PDF 文件
+
+PDF 分类为 `pdf`，用 pdfplumber 提取文本后注入主会话回复。
+
+```bash
+bash tests/custom/e2e_pdf_file_test.sh
+```
+
+验收点：V3 期望 `file: 解析成功 type=pdf content_len=…`。挂在 V3 多半是缺库——
+`pip install pdfplumber`（可选 OCR 回退需 `pip install pdf2image` + poppler）。
+
 ## 注意
 
 - 这些测试会**真实发消息**到钉钉，仅用于用户明确要做端到端确认时。
 - 不改任何代码；纯读 + 发测试消息。
 - 文本测试校验用 `dws chat message list`（o2o 私聊回复 list-by-sender 索引不到，见 AGENTS.md 坑#1）。
 - 文件测试需要正确的发送方 profile（真人账号，非数字员工账号）。
+- 图片测试依赖 `AGENT_VISION_MODEL`；PDF 测试依赖 `pdfplumber`。缺依赖会挂在 V3。
