@@ -140,6 +140,62 @@ NONE_RC="$(env DWS_CONNECT_SKIP_LOCAL=1 DWS_CONNECT_DRY_RUN=1 CONNECT_LOG=/dev/n
     DWS_PROFILE=p bash "$DWS_CONNECT" >/dev/null 2>&1; echo $?)"
 assert_eq "无任何订阅 → 退出非0" "1" "$NONE_RC"
 
+# 测试 #71 进程生命周期修复（_bus 孤儿清扫 + reboot 干净环境）
+echo ""
+echo "Testing #71 process lifecycle fixes..."
+
+# dws-connect.sh：consumer 收尾必须走子树清理（否则 dws event _bus 甩成孤儿）
+assert_eq "dws-connect.sh 定义 _kill_subtree" "1" \
+    "$(grep -c '^_kill_subtree()' "$SCRIPT_DIR/bin/custom/dws-connect.sh")"
+assert_eq "dws-connect.sh 有 EXIT/TERM 收尾 trap" "1" \
+    "$(grep -q "trap '_cleanup_consumers' EXIT" "$SCRIPT_DIR/bin/custom/dws-connect.sh" && echo 1 || echo 0)"
+
+# stop.sh / monitor.sh：调用 custom 停机钩子 stop_extra_cleanup
+assert_eq "stop.sh 调用 stop_extra_cleanup 钩子" "1" \
+    "$(grep -q 'stop_extra_cleanup' "$SCRIPT_DIR/bin/core/stop.sh" && echo 1 || echo 0)"
+assert_eq "monitor.sh stop_all 调用 stop_extra_cleanup 钩子" "1" \
+    "$(grep -q 'stop_extra_cleanup' "$SCRIPT_DIR/bin/core/monitor.sh" && echo 1 || echo 0)"
+
+# reboot.sh：用干净环境跑 stop/start（否则改 config 后 /reboot 不生效）
+assert_eq "reboot.sh 用 env -i 干净环境重启" "1" \
+    "$(grep -q 'env -i' "$SCRIPT_DIR/bin/core/reboot.sh" && echo 1 || echo 0)"
+
+# custom start_funcs.sh 语法 + 钩子定义
+assert_eq "custom start_funcs.sh 语法正确" "0" \
+    "$(bash -n "$SCRIPT_DIR/bin/custom/start_funcs.sh" 2>&1; echo $?)"
+
+# 功能测试：stop_extra_cleanup 按 profile 精确清扫假 dws event 进程树，
+# 不误伤其他 profile 的进程
+FAKE_DIR=$(mktemp -d)
+cat > "$FAKE_DIR/dws" <<'EOF'
+#!/bin/bash
+sleep 300 &
+sleep 300
+EOF
+chmod +x "$FAKE_DIR/dws"
+"$FAKE_DIR/dws" event consume --profile "unittest:fakebot" >/dev/null 2>&1 &
+FAKE_PID=$!
+disown "$FAKE_PID" 2>/dev/null
+"$FAKE_DIR/dws" event consume --profile "unittest:otherbot" >/dev/null 2>&1 &
+OTHER_PID=$!
+disown "$OTHER_PID" 2>/dev/null
+sleep 1
+
+# 载入钩子（COMP_NAMES 置空避免覆盖逻辑报错；log 输出屏蔽）
+COMP_NAMES=()
+source "$SCRIPT_DIR/bin/custom/start_funcs.sh" 2>/dev/null
+DWS_PROFILE="unittest:fakebot" stop_extra_cleanup KILL 2>/dev/null
+sleep 1
+
+assert_eq "stop_extra_cleanup 清扫匹配 profile 的 dws event" "1" \
+    "$(kill -0 "$FAKE_PID" 2>/dev/null && echo 0 || echo 1)"
+assert_eq "stop_extra_cleanup 不误伤其他 profile" "1" \
+    "$(kill -0 "$OTHER_PID" 2>/dev/null && echo 1 || echo 0)"
+
+# teardown：清掉另一棵假进程树 + 临时目录
+kill_tree "$OTHER_PID" KILL 2>/dev/null
+rm -rf "$FAKE_DIR"
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

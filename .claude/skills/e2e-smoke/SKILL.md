@@ -148,3 +148,6 @@ SCRIPT
 - 不改任何代码；纯读 + 发测试消息。
 - 文本测试校验用 `dws chat message list`（o2o 私聊回复 list-by-sender 索引不到，见 AGENTS.md 坑#1）。
 - 文件测试需要正确的发送方 profile（真人账号，非数字员工账号）。
+- **macOS keychain 锁定会让 `dws profile list` 返回空**（AGENTS.md 坑#12），发送方自动探测
+  会因此 SKIP。先 `security unlock-keychain ~/Library/Keychains/login.keychain-db` 解锁，
+  或显式 `E2E_SENDER_PROFILE="<corpId>:<真人userId>"` 绕过探测。

@@ -32,15 +32,27 @@ fi
 # 等待主进程退出（避免 stop.sh 的 pkill 误杀刚派生的本脚本）
 sleep 1
 
+# 用**干净环境**跑 stop/start（#71）：本脚本由老 event_watcher 派生，继承了老 monitor
+# 启动时的全部 env。若直接透传，config 里 `export VAR="${VAR:-新值}"` 风格的赋值会被
+# 继承的旧值压住——改完 config/constants.local.sh 后 /reboot 不生效，新 monitor / serve
+# 仍带旧 env。env -i 只保留身份/路径基本量，stop/start 自己 source config，行为与
+# 「开新终端手工全停全起」完全一致。
+_env_clean() {
+    env -i HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" \
+        SHELL="${SHELL:-/bin/bash}" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-en_US.UTF-8}" \
+        PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        "$@"
+}
+
 log "重启服务：调用 stop.sh..."
-if ! bash "$SCRIPT_DIR/bin/core/stop.sh"; then
+if ! _env_clean bash "$SCRIPT_DIR/bin/core/stop.sh"; then
     log "⚠️ stop.sh 返回非零，继续尝试启动"
 fi
 
 sleep 2
 
 log "重启服务：调用 start.sh..."
-if bash "$SCRIPT_DIR/bin/core/start.sh"; then
+if _env_clean bash "$SCRIPT_DIR/bin/core/start.sh"; then
     log "重启完成"
     exit 0
 fi

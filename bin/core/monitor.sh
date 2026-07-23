@@ -100,6 +100,8 @@ stop_all() {
             kill_tree "$pid" TERM
         done
     done
+    # custom 钩子：进程树已断裂、模式够不着的残留（如 dws event _bus 孤儿，#71）
+    if declare -F stop_extra_cleanup >/dev/null 2>&1; then stop_extra_cleanup TERM; fi
     sleep 2
     # 第二轮 SIGKILL 兜底：TERM 没死透的（含忽略 SIGTERM 的进程）强杀。
     for pattern in "${COMP_PATTERNS[@]}"; do
@@ -107,6 +109,7 @@ stop_all() {
             kill_tree "$pid" KILL
         done
     done
+    if declare -F stop_extra_cleanup >/dev/null 2>&1; then stop_extra_cleanup KILL; fi
     for f in "${COMP_PID_FILES[@]}"; do
         rm -f "$f"
     done
