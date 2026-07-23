@@ -140,7 +140,21 @@ dws auth status 2>/dev/null | grep -E '"authenticated"|"token_valid"|"user_id"' 
 
 ### 端到端确认（可选）
 
-最可靠的健康判定是真发一条消息看回复：
+最可靠的健康判定是真发一条消息看回复。**已脚本化，一键跑**（opencode / Claude Code / Codex 通用）：
+
+```bash
+# 以真人身份私聊发一条带唯一校验码的算式，V1-V4 双校验数字员工回复正确
+bash tests/custom/e2e_text_reply_test.sh
+# 期望结尾：✅ 文本回复真实链路端到端测试通过（V1-V4）
+#   E2E-<ts>  "…37 加 5 等于多少？"  →  "42"
+```
+
+脚本自动：探测真人发送方（同 corp、非数字员工）→ 发消息 → 轮询 `agent-connect.log`/`monitor.log`
+断言收发 → 从入站行取 convId、用 `dws chat message list --group` 独立拉回复断言答案。
+无 dws / 未登录 / 服务未跑 → SKIP（不算失败）。若 V2 超时未见入站，多半是订阅投递停滞
+（见 AGENTS.md 坑#3），先 `bash bin/core/reboot.sh` 再跑。
+
+手动版（想自己盯日志时）：
 
 ```bash
 # 实时跟随日志，然后到群里 @ 数字员工发一句话

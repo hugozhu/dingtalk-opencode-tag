@@ -190,20 +190,24 @@ systemctl --user start dingtalk-agent.service     # 启动
 - Python 单测：`unittest` + `patch.object(<module>, "<func>", return_value=...)`
 - 业务 handler 测试：mock `inject_and_forward` 验证 prompt 拼装 + 调用回调，不测模板内部
 - e2e 通用范式：**实际触发 + 监控日志 + DWS 独立拉群消息**（两侧对照的双校验）
-  - **基础文本 e2e（最底层冒烟）**：以真人身份发一条纯文本、断言数字员工回复。这条不碰合并转发/serve，只验"收→大脑→发"闭环——最快定位链路断在哪。
+  - **基础文本 e2e（最底层冒烟）**：以真人身份发一条纯文本、断言数字员工回复。这条不碰合并转发/serve，只验"收→大脑→发"闭环——最快定位链路断在哪。**已脚本化：`bash tests/custom/e2e_text_reply_test.sh`**（opencode / Claude Code / Codex 通用；参数化身份不写死，SKIP 友好）。
     ```bash
+    # 一键跑（自动探测真人发送方 + 唯一校验码 + V1-V4 双校验）
+    bash tests/custom/e2e_text_reply_test.sh
+    # 手动等价步骤（脚本内部就是这套）：
     # 触发：用 --profile 切成真人身份（非数字员工自己，否则被 AGENT_SELF_NAMES 防回环过滤）
-    dws chat message send --group "$DWS_EVENT_GROUP" --text "1+1" --profile "<corpId>:<真人>" -y
-    # 校验 A（agent 侧）：agent-connect.log 有 "[connect] 收到 @<真人>: 1+1"；monitor.log 有 "reply user OK"
-    # 校验 B（DWS 侧独立拉取）：以那个真人身份拉数字员工发来的消息，断言内容
-    dws chat message list-by-sender --sender-user-id "<数字员工 userId>" \
-        --start "<ISO8601>" --end "<ISO8601>" --profile "<corpId>:<真人>"
+    dws chat message send --user "<数字员工 userId>" --text "[CODE] 37+5=?" --profile "<corpId>:<真人>" -y
+    # 校验 A（agent 侧）：agent-connect.log 有 "[connect] 收到 @<真人>: [CODE] …"；monitor.log 有发送后的 "reply user OK"
+    # 校验 B（DWS 侧独立拉取）：从入站行取 convId，用 list --group 拉数字员工回复断言答案
+    #   （注意：list-by-sender 实测不索引 o2o 私聊回复，o2o 校验须用 list --group <convId>）
+    dws chat message list --group "<convId>" --time "<起始时刻>" --direction newer --profile "<corpId>:<真人>" -y
     ```
   - **业务 e2e（合并转发路径）**：`dws chat message forward` 触发 → 监控日志 → 拉群校验，见 `tests/custom/e2e_test.sh`。
   - **文本回复 HTTP e2e（本地冒烟，无需钉钉）**：起临时 serve → 直接调 `brain.generate_reply("u","1+1")` 断言回复 + `opencode.log` 有 `transport=http`，见 `tests/custom/e2e_text_http_test.sh`。
   - **@我(AT) 订阅 e2e**：验证 `user_im_message_receive_at` 订阅 → bridge(convType=2) → inbound → 能力分发全链，末段 LIVE 用 `dws event consume ...receive_at --duration` 抓 `[event] ready` 证明真实建联（只读不发消息，无 dws/未登录则 SKIP）。见 `tests/custom/e2e_at_test.sh`。开启订阅：`config/constants.local.sh` 设 `DWS_EVENT_AT=1`。
-  - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）。回退用 `list-by-sender`（按发送者拉）同样能独立校验。
+  - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）；群聊场景可回退 `list-by-sender`（按发送者拉）。**但 o2o 私聊回复实测 `list-by-sender` 索引不到**——私聊校验必须用 `list --group <o2o-convId>`（convId 从 connect log 入站行 `convId=…` 取）。`e2e_text_reply_test.sh` 的 V4 即如此。
   - **坑#2**：实时订阅（connect 日志）**不回显当前登录用户自己发的消息**——数字员工的回复不会出现在它自己的接收流里，别把"connect 日志没看到回复"误判为没发出去；用校验 B 的 DWS 拉取确认。
+  - **坑#3**：`dws event` 订阅偶发**投递停滞**——`dws event consume` 子进程还活着（healthcheck 只查进程存活会误判"健康"），但连接静默失活、消息迟迟不进 connect log，只延到下次重启。跑基础文本 e2e 时若 V2 超时未见入站，先 `bash bin/core/reboot.sh` 重建订阅再跑。
   - **后端两条路都走 opencode serve HTTP**：普通文本回复走 `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI；合并转发业务走 `inject_and_forward` 的 serve HTTP `/session`。两者都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
   - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**：每次 opencode 调用记一条（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败）。想确认"回复到底走 HTTP 还是 CLI 回退"看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
 
