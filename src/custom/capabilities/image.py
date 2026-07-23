@@ -193,7 +193,9 @@ def handle_image(user, text, msg_id, conv_id, conv_type):
     parts.append(_IMAGE_PROMPT_FOOTER)
     prompt = "\n".join(parts)
 
-    reply = generate_reply(user, prompt, raw=True)
+    reply = generate_reply(user, prompt, raw=True, ctx={
+        "conv_id": conv_id, "conv_type": conv_type, "msg_id": msg_id, "user": user,
+    })
     if reply:
         send_reply(conv_id, conv_type, reply)
     else:
