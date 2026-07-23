@@ -79,16 +79,42 @@ fi
 
 BRIDGE="$SCRIPT_DIR/bin/custom/dws_event_bridge.py"
 
+# _kill_subtree <pid> [sig]：先递归杀子进程再杀自己（子在前，避免留孤儿）。
+# dws event consume 会派生 `dws event _bus` 子进程（真正持流连接的那个）。只
+# `kill <consumer>` 会把 _bus 甩成孤儿被 init 收养——它继续占着订阅消费消息，
+# 重启后新旧 _bus 抢投递，表象为「投递停滞/收不到消息」（#71）。
+_kill_subtree() {
+    local pid="$1" sig="${2:-TERM}" child
+    [[ -z "$pid" ]] && return 0
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        _kill_subtree "$child" "$sig"
+    done
+    kill "-$sig" "$pid" 2>/dev/null
+    return 0
+}
+
+# consumer PID 登记表（子 shell 内全局）+ 统一收尾：所有 consumer 连子树一起清
+_consumer_pids=()
+_cleanup_consumers() {
+    local p
+    for p in ${_consumer_pids[@]+"${_consumer_pids[@]}"}; do
+        _kill_subtree "$p" TERM
+    done
+    return 0
+}
+
 # _run_consumers：把所有要开的 consumer 的 stdout 合流输出（供管道喂 bridge）。
 # 每个 consumer 的 stderr（[event] ready / 状态）汇入 CONNECT_LOG 便于健康检查看活跃度。
-# 子进程都在本函数的子 shell 里，脚本退出（SIGTERM）时随之被清理。
+# 子进程都在本函数的子 shell 里；trap 保证子 shell 无论正常收尾还是被 TERM，
+# 都把 consumer **连同其 _bus 子树**清干净（#71）。
 _run_consumers() {
-    local pids=()
+    trap '_cleanup_consumers' EXIT
+    trap '_cleanup_consumers; exit 143' TERM INT
     # 群消息 consumer
     if [[ "$_want_group" -eq 1 ]]; then
         dws event consume "$DWS_EVENT_KEY" --group "$DWS_EVENT_GROUP" \
             --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
-        pids+=($!)
+        _consumer_pids+=($!)
     fi
     # 单聊 consumer：每个对端 userId 一个（o2o 只能按对端订阅）
     if [[ "$_want_o2o" -eq 1 ]]; then
@@ -99,7 +125,7 @@ _run_consumers() {
             [[ -z "$u" ]] && continue
             dws event consume user_im_message_receive_o2o --user "$u" \
                 --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
-            pids+=($!)
+            _consumer_pids+=($!)
         done
     fi
     # @我 consumer：个人级订阅（rule_type=at，无需 group/user 参数），捕获当前数字员工
@@ -107,20 +133,20 @@ _run_consumers() {
     if [[ "$_want_at" -eq 1 ]]; then
         dws event consume user_im_message_receive_at \
             --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
-        pids+=($!)
+        _consumer_pids+=($!)
     fi
     # 任一 consumer 退出即整体结束，让 monitor 兜底重启（bash 3.2 无 `wait -n`，用轮询：
-    # 任一子进程不再存活就 kill 其余并返回）。
+    # 任一子进程不再存活就清掉其余（含子树）并返回）。
     while :; do
         local alive=0 p
-        for p in "${pids[@]}"; do
+        for p in "${_consumer_pids[@]}"; do
             if kill -0 "$p" 2>/dev/null; then
                 alive=$((alive + 1))
             fi
         done
         # 有 consumer 死了（存活数 < 总数）→ 收尾
-        if [[ "$alive" -lt "${#pids[@]}" ]]; then
-            for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
+        if [[ "$alive" -lt "${#_consumer_pids[@]}" ]]; then
+            _cleanup_consumers
             break
         fi
         sleep 5

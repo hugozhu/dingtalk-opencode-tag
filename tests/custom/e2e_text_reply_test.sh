@@ -79,7 +79,14 @@ for p in d.get("profiles", []):
         print(p.get("profile", "")); break
 ' 2>/dev/null)"
 fi
-[[ -n "$SENDER_PROFILE" ]] || skip "无可用发送方 profile（设 E2E_SENDER_PROFILE 或 dws login 一个真人账号）"
+# 自动探测为空的常见原因（#71）：macOS keychain 锁定时 dws profile list 直接返回空。
+# 给出可操作的提示再 SKIP，而不是让人误以为没登录。
+if [[ -z "$SENDER_PROFILE" ]]; then
+    echo "  提示：若已登录过真人账号但探测为空，可能是 macOS keychain 锁定，先解锁再试："
+    echo "        security unlock-keychain ~/Library/Keychains/login.keychain-db"
+    echo "        或显式指定发送方：E2E_SENDER_PROFILE=\"<corpId>:<真人userId>\" bash $0"
+    skip "无可用发送方 profile（设 E2E_SENDER_PROFILE 或 dws login 一个真人账号）"
+fi
 SENDER_USER="${SENDER_PROFILE##*:}"
 
 # 目标：私聊发给数字员工 userId；群聊发到 DWS_EVENT_GROUP

@@ -54,15 +54,25 @@ if [[ "$_mode" == "launchd" ]]; then
 else
     # nohup 模式：杀掉 monitor 进程（stop.sh 自己是被 reboot 以 start_new_session 派生，
     # 或被开发者手动调，不在 monitor 进程组里，pkill 不会误杀自己）
+    # 不只匹配 "--foreground"：手工 `bash bin/core/monitor.sh`（无参数，同样进前台循环）
+    # 起的 monitor 也要杀，否则它带着旧 env 继续兜底拉起组件（#71 reboot 后 env 不生效）。
+    # 按「bash + 路径」双条件过滤，避免 pkill -f 误杀 cmdline 恰好含该路径的编辑器等进程。
     log "停止 monitor 进程..."
-    pkill -9 -f "monitor.sh --foreground" 2>/dev/null || true
+    for _mpid in $(pgrep -f "bin/core/monitor.sh" 2>/dev/null); do
+        case "$(ps -p "$_mpid" -o command= 2>/dev/null)" in
+            *bash*bin/core/monitor.sh*) kill -9 "$_mpid" 2>/dev/null || true ;;
+        esac
+    done
 fi
 
-# 2. 停止所有组件（含子进程树）
+# 2. 停止所有组件（含子进程树）；custom 可定义 stop_extra_cleanup 钩子做额外清扫
+#    （如 dws event _bus 孤儿——进程树断裂后 PID 文件 / COMP_PATTERNS 都够不着，#71）
 log "停止所有组件..."
 stop_components TERM
+if declare -F stop_extra_cleanup >/dev/null 2>&1; then stop_extra_cleanup TERM; fi
 sleep 2
 stop_components KILL   # SIGKILL 兜底
+if declare -F stop_extra_cleanup >/dev/null 2>&1; then stop_extra_cleanup KILL; fi
 
 # 3. 清理运行时状态
 log "清理运行时状态..."
