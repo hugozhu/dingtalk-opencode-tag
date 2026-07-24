@@ -78,3 +78,25 @@ start_connect() {
     _spawn "$SCRIPT_DIR/.connect.pid" "${CONNECT_LOG:-$SCRIPT_DIR/agent-connect.log}" \
         bash "$SCRIPT_DIR/bin/custom/dws-connect.sh"
 }
+
+# ---------------------------------------------------------------------------
+# stop_extra_cleanup [signal] — custom 停机钩子（core 的 stop.sh / monitor.sh stop_all
+# 在按 PID 文件 + COMP_PATTERNS 杀完组件后调用，未定义则跳过）。
+#
+# 清扫本 profile 残留的 dws event 进程（consume / _bus 孤儿）：`dws event consume`
+# 会派生 `dws event _bus` 子进程持流连接，若 _bus 曾被甩成孤儿（被 init 收养），
+# 进程树断裂后 kill_tree 和 COMP_PATTERNS（dws-connect.sh）都够不着它——它继续占着
+# 订阅消费消息，是「重启后投递停滞/收不到消息」的元凶之一（#71）。
+# 按 DWS_PROFILE 精确匹配 cmdline，不误伤其他项目/账号的 dws 进程。
+# ---------------------------------------------------------------------------
+stop_extra_cleanup() {
+    local sig="${1:-TERM}" pid cmd
+    [[ -z "${DWS_PROFILE:-}" ]] && return 0
+    for pid in $(pgrep -f "dws event" 2>/dev/null); do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null) || continue
+        [[ "$cmd" == *"dws event"* && "$cmd" == *"$DWS_PROFILE"* ]] || continue
+        log "  stop_extra_cleanup: 清扫残留 dws event (pid=$pid, sig=$sig)"
+        kill_tree "$pid" "$sig"
+    done
+    return 0
+}
