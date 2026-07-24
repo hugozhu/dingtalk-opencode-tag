@@ -213,7 +213,7 @@ systemctl --user start dingtalk-agent.service     # 启动
   - **坑#2**：实时订阅（connect 日志）**不回显当前登录用户自己发的消息**——数字员工的回复不会出现在它自己的接收流里，别把"connect 日志没看到回复"误判为没发出去；用校验 B 的 DWS 拉取确认。
   - **坑#3**：`dws event` 订阅偶发**投递停滞**——`dws event consume` 子进程还活着（healthcheck 只查进程存活会误判"健康"），但连接静默失活、消息迟迟不进 connect log，只延到下次重启。跑基础文本 e2e 时若 V2 超时未见入站，先 `bash bin/core/reboot.sh` 重建订阅再跑。
   - **后端两条路都走 opencode serve HTTP**：普通文本回复走 `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI；合并转发业务走 `inject_and_forward` 的 serve HTTP `/session`。两者都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
-  - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**：每次 opencode 调用记一条（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败）。想确认"回复到底走 HTTP 还是 CLI 回退"看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
+  - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**（统一调试总开关，原 `AGENT_SERVE_DEBUG` 已并入）：每次 opencode 调用记一条摘要（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败），**并把每个 serve 请求/响应的完整 body（含发给模型的 prompt 与模型返回）写到同一文件**，长 body（图片 data_url 等）自动截断头尾。想确认"回复到底走 HTTP 还是 CLI 回退"或"到底发了什么 prompt / serve 返回了什么"都看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
 
 ## 不要做的事
 

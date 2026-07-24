@@ -541,7 +541,7 @@ def _serve_request(method, port, pwd, path, body=None, timeout=8):
 
     实现已统一到 core.agent_common.serve_request（凭据/Basic auth/调试日志集中一处）；
     这里保留旧的位置参数签名，让内部调用点与测试桩（patch brain._serve_request）不变。
-    调试日志由 AGENT_SERVE_DEBUG 开关控制，见 serve_request。
+    调试日志由 AGENT_DEBUG 开关控制，见 serve_request。
     """
     return serve_request(method, path, body, timeout, port=port, pwd=pwd)
 

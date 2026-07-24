@@ -178,10 +178,12 @@ export ACK_ERROR="${ACK_ERROR:-疑问:未完成}"      # 失败（表情名:文�
 
 
 # --- 调试 ---
-# AGENT_DEBUG=1 时：
-#   - agent_common 每次 serve 请求成功也打 [serve] 访问日志到 monitor.log；
+# AGENT_DEBUG=1 时（统一调试总开关）：
+#   - agent_common 把每个 serve 请求/响应的完整 body（含发给模型的 prompt / 模型返回）
+#     写到 opencode.log，长 body（图片 data_url 等）自动截断头尾；
 #   - brain 每次 opencode 调用单独记一条到 opencode.log（transport=http|cli / model / 耗时 /
 #     prompt+reply 长度 / reply 预览 / 成败）。opencode 调用出错恒记，不受此开关影响；
+#   - ack 能力把动作轨迹（收到/升级/收尾/仅已读）记到 monitor.log；
 #   - start_serve 给 opencode serve 加 --print-logs --log-level，serve 自身日志打到 serve.log。
 export AGENT_DEBUG="${AGENT_DEBUG:-0}"
 # opencode 调用日志路径（默认 <PROJECT_DIR>/opencode.log）
