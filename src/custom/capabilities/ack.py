@@ -50,6 +50,17 @@ _O2O_ONLY = env_flag("ACK_O2O_ONLY", default=True)       # 默认只单聊（群
 _AT_MENTION = env_flag("ACK_AT_MENTION", default=True)   # 群里被 @ 数字员工时也回执（#46）
 _MARK_READ = env_flag("ACK_MARK_READ", default=True)      # 是否同时标记已读
 
+# ack 动作轨迹（收到/升级/收尾/仅已读）AGENT_DEBUG 时记到 monitor.log —— 和 ack 失败日志
+# 同一文件、同一 "ack:" 前缀，一处看全某条消息的回执经过（按 msgId 与 agent-connect.log 对齐）。
+# 生产默认关（避免每条消息都刷 monitor.log）；失败日志不受此开关影响，恒记。
+_ACK_DEBUG = env_flag("AGENT_DEBUG", default=False)
+
+
+def _dlog(msg):
+    """AGENT_DEBUG 时把一行 ack 动作轨迹记到 monitor.log（复用 core.log）。"""
+    if _ACK_DEBUG:
+        log(f"ack: {msg}")
+
 
 def _parse_stages(spec):
     """把 'delay:表情:文字|delay:表情:文字|…' 解析成按 delay 升序的 [(delay, 表情, 文字)]。
@@ -299,9 +310,12 @@ def _first_status(stages):
 
 def _do_processing(rec):
     """收到阶段：标记已读 + 贴时间线第一个（delay=0）文字表情。"""
-    if _MARK_READ:
-        _mark_read(rec.conv_id, rec.msg_id)
+    read = _mark_read(rec.conv_id, rec.msg_id) if _MARK_READ else None
     first = _first_status(_STAGES)
+    _dlog("收到 msgId=%s conv=%s mark-read=%s 贴=%s" % (
+        rec.msg_id or "-", (rec.conv_id or "-")[:16],
+        "off" if read is None else ("ok" if read else "fail"),
+        ("%s｜%s" % first) if first else "-"))
     if first:
         _set_status(rec, first)
 
@@ -313,6 +327,10 @@ def _finalize(rec, ok):
         final = _DONE
     elif ok is False:
         final = _ERROR
+    _dlog("收尾 msgId=%s 结果=%s → %s" % (
+        rec.msg_id or "-",
+        {True: "成功", False: "失败", None: "超时"}.get(ok),
+        ("%s｜%s" % final) if final else "移除进度"))
     _set_status(rec, final)
 
 
@@ -332,6 +350,8 @@ def _ack_worker(rec):
                 break   # 回复已到/被取代：不再升级，跳到收尾
             if rec.event.is_set():
                 break
+            _dlog("升级 msgId=%s elapsed=%.0fs → %s｜%s" % (
+                rec.msg_id or "-", time.monotonic() - start, emoji, text))
             _set_status(rec, (emoji, text))   # 到点升级（如 5 分钟 → 咖啡｜仍在处理）
 
         # 所有进度阶段走完仍没信号 → 继续等到整体超时兜底
@@ -379,6 +399,7 @@ def on_inbound(msg):
     if do_begin:
         _begin(msg)          # 完整回执（worker 内部会 mark-read + 贴表情）
     elif do_read:
+        _dlog("仅已读 msgId=%s conv=%s" % (msg.msg_id or "-", (msg.conv_id or "-")[:16]))
         _mark_read(msg.conv_id, msg.msg_id)   # 仅标记已读（best-effort，失败只记日志）
     return False   # 关键：不消费，text_reply 等仍会处理并回复
 
