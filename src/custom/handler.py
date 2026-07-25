@@ -54,6 +54,10 @@ _POLL_INTERVAL = 5
 # 通用：检测消息类型的正则（用户按业务调整）
 _RE_MEDIA_ID = re.compile(r"mediaId=([^\s)]+)")
 _RE_FILE_ID = re.compile(r"fileId:\s*(\S+)")
+# 文件消息 content 里的文件名：[文件] <名> fileId: <id>
+_RE_FILE_NAME = re.compile(r"\[文件\]\s*(.+?)\s+fileId:")
+# 图片类后缀（文件消息但实为图片 → 走 vision 识别，而非当文本读成乱码）
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
 
 # 业务消息检测正则（log-tail 用来识别）
 BUSINESS_MSG_RE = re.compile(r'msgtype="business-special"')
@@ -200,9 +204,101 @@ def _download_file_text(file_id):
     return "[文件为空]"
 
 
+def _download_file_to_path(file_id):
+    """Download a file via CLI to a temp dir. Returns local path or None."""
+    tmp_dir = tempfile.mkdtemp(prefix="agent_file_")
+    rc, _ = _run_cli([
+        "drive", "download",
+        "--node", file_id,
+        "--output", tmp_dir + "/",
+    ])
+    if rc != 0:
+        log(f"file download failed (rc={rc}) fileId={file_id}")
+        return None
+    for name in os.listdir(tmp_dir):
+        return os.path.join(tmp_dir, name)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Fetch stage — resolve attachments → list of dicts (pure data, no rendering)
 # ---------------------------------------------------------------------------
+
+# 恢复被转发剥离的 fileId 时，单会话最多翻页数（防 hasMore 恒 true 死循环）
+_RECOVER_MAX_PAGES = 5
+
+
+def _recover_file_ids(file_msgs):
+    """批量恢复被合并转发剥离的 fileId，返回 {openMessageId: 完整 content}。
+
+    钉钉「合并转发」会把内层**文件消息** content 里的 `fileId: xxx` 剥掉，只剩
+    `[文件] <名>`（实测 list-by-ids 反查内层 msgId 同样拿不到 fileId）。但回源会话
+    用 `list --group` 按时间拉，原消息 content 仍带完整 fileId。故对缺 fileId 的文件
+    消息，用其 openConversationId + createTime 回源会话翻页、按 openMessageId 匹配，
+    取回带 fileId 的原始 content。
+
+    按 conv 分组批量回源（同一会话的多条共享一次翻页扫描），从最早 createTime 往前
+    buffer 60s 起向新翻页，命中全部目标或越过最晚时间或达 _RECOVER_MAX_PAGES 即停。
+    """
+    by_conv = {}
+    for fm in file_msgs:
+        conv = fm.get("openConversationId", "")
+        mid = fm.get("openMessageId", "")
+        ct = fm.get("createTime", "")
+        if conv and mid and ct:
+            by_conv.setdefault(conv, {})[mid] = ct
+
+    result = {}
+    for conv, targets in by_conv.items():
+        times = sorted(targets.values())
+        start = _time_minus_60s(times[0])
+        latest = times[-1]
+        remaining = set(targets)
+        for _ in range(_RECOVER_MAX_PAGES):
+            rc, out = _run_cli([
+                "chat", "message", "list",
+                "--group", conv,
+                "--time", start,
+                "--direction", "newer",
+                "--limit", "50",
+            ], timeout=30)
+            if rc != 0:
+                log(f"recover fileId: list --group 失败 rc={rc} conv={conv[:24]}")
+                break
+            try:
+                d = json.loads(out)
+                r = d.get("result", {})
+                msgs = r.get("messages", [])
+            except Exception as e:
+                log(f"recover fileId: 解析响应失败: {e}")
+                break
+            if not msgs:
+                break
+            for m in msgs:
+                mid = m.get("openMessageId", "")
+                if mid in remaining:
+                    result[mid] = m.get("content", "") or ""
+                    remaining.discard(mid)
+            if not remaining:
+                break
+            if not r.get("hasMore"):
+                break
+            boundary = min((m.get("createTime", "") for m in msgs), default="")
+            if not boundary or boundary > latest:
+                break
+            start = boundary
+    return result
+
+
+def _time_minus_60s(t):
+    """createTime('YYYY-MM-DD HH:MM:SS') 往前 60s，返回同格式字符串（解析失败原样返回）。"""
+    try:
+        from datetime import datetime, timedelta
+        dt = datetime.strptime(t, "%Y-%m-%d %H:%M:%S") - timedelta(seconds=60)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return t
+
 
 def fetch_attachments(messages, lookup_convs=None):
     """Resolve each message into an attachment dict with raw content + fetched data.
@@ -211,6 +307,16 @@ def fetch_attachments(messages, lookup_convs=None):
 
     Returns list of dicts: [{type, raw_content, text, time, msgid, conv_id}, ...]
     """
+    # 预恢复被合并转发剥离的 fileId（仅对缺 fileId 的文件消息回源会话反查）
+    need_recover = [
+        fm for fm in messages
+        if _classify_message(fm.get("content", "") or "") == "file"
+        and not _RE_FILE_ID.search(fm.get("content", "") or "")
+    ]
+    recovered = _recover_file_ids(need_recover) if need_recover else {}
+    if recovered:
+        log(f"recover fileId: 恢复 {len(recovered)}/{len(need_recover)} 条文件消息的 fileId")
+
     out = []
     for fm in messages:
         fm_content = fm.get("content", "") or ""
@@ -222,7 +328,8 @@ def fetch_attachments(messages, lookup_convs=None):
         if kind == "image":
             entry = _fetch_image_entry(fm_content, fm_msg_id, fm_conv_id)
         elif kind == "file":
-            entry = _fetch_file_entry(fm_content)
+            content_for_parse = recovered.get(fm_msg_id, fm_content)
+            entry = _fetch_file_entry(content_for_parse)
         else:
             entry = fm_content
 
@@ -269,15 +376,46 @@ def _fetch_image_entry(fm_content, msg_id, conv_id):
 
 
 def _fetch_file_entry(fm_content):
-    """Resolve a file message to its prompt entry text."""
+    """Resolve a file message to its prompt entry text.
+
+    图片类文件（png/jpg 等）走 vision 识别（复用 image._recognize），而非当文本读成
+    乱码——钉钉里以「文件」形式发送的图片（如 math_1plus1.png）二进制读出来无意义。
+    其余文件按文本读前 N 字节。
+    """
     fid_m = _RE_FILE_ID.search(fm_content)
     if not fid_m:
         return f"{fm_content}\n    [文件正文下载失败：未获取到 fileId]"
     file_id = fid_m.group(1)
+
+    name_m = _RE_FILE_NAME.search(fm_content)
+    filename = name_m.group(1).strip() if name_m else ""
+    if filename.lower().endswith(_IMAGE_EXTS):
+        return _fetch_image_file_entry(fm_content, file_id)
+
     file_text = _download_file_text(file_id)
     if len(file_text) > ATTACHMENT_MAX_BYTES:
         file_text = file_text[:ATTACHMENT_MAX_BYTES] + "\n...(文件内容过长，已截断)"
     return f"{fm_content}\n    文件正文：\n```\n{file_text}\n```"
+
+
+def _fetch_image_file_entry(fm_content, file_id):
+    """图片类文件：drive 下载到临时文件 → vision 识别（_recognize 内部读完删临时文件）。"""
+    image_path = _download_file_to_path(file_id)
+    if not image_path:
+        return f"{fm_content}\n    [图片文件下载失败]"
+    try:
+        from custom.capabilities.image import _recognize
+        desc = _recognize(image_path)
+    except Exception as e:
+        log(f"image-file recognize err: {e}")
+        desc = ""
+        try:
+            os.unlink(image_path)
+        except Exception:
+            pass
+    if desc:
+        return f"{fm_content}\n    [图片识别内容]\n```\n{desc}\n```"
+    return f"{fm_content}\n    [图片文件识别失败]"
 
 
 # ---------------------------------------------------------------------------

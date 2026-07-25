@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import unittest
+from unittest.mock import patch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
@@ -98,6 +99,75 @@ class TestBoundedSeen(unittest.TestCase):
             s.add(k)
         self.assertNotIn("a", s)  # 最旧被淘汰
         self.assertIn("d", s)
+
+
+class TestRecoverFileIds(unittest.TestCase):
+    """合并转发剥离 fileId 的回源恢复（#图片不能下载 bug）。"""
+
+    def _fm(self, mid, content, conv="cidSRC==", ct="2026-07-25 14:57:28"):
+        return {"openMessageId": mid, "content": content,
+                "openConversationId": conv, "createTime": ct}
+
+    def test_time_minus_60s(self):
+        self.assertEqual(handler._time_minus_60s("2026-07-25 14:57:28"),
+                         "2026-07-25 14:56:28")
+        self.assertEqual(handler._time_minus_60s("bad"), "bad")  # 解析失败原样返回
+
+    def test_recover_strips_recovered_content(self):
+        # 内层文件消息 content 被剥离 fileId，回源 list --group 拿到带 fileId 的原文
+        fms = [self._fm("msgA==", "[文件] math_1plus1.png")]
+        list_resp = (0, '{"result": {"messages": [{"openMessageId": "msgA==", '
+                      '"content": "[文件] math_1plus1.png fileId: REAL_A 注意：如需下载使用dws drive download命令下载"}], '
+                      '"hasMore": false}}')
+        with patch.object(handler, "_run_cli", return_value=list_resp) as cli:
+            result = handler._recover_file_ids(fms)
+        self.assertEqual(result.get("msgA=="),
+                         "[文件] math_1plus1.png fileId: REAL_A 注意：如需下载使用dws drive download命令下载")
+        args = cli.call_args[0][0]
+        self.assertIn("--group", args)
+        self.assertIn("cidSRC==", args)
+        self.assertIn("2026-07-25 14:56:28", args)  # createTime 往前 buffer 60s
+
+    def test_fetch_attachments_uses_recovered_fileid(self):
+        # 端到端：fetch_attachments 对缺 fileId 的文本文件消息回源恢复后下载正文
+        msgs = [self._fm("msgA==", "[文件] notes.txt")]
+        list_resp = (0, '{"result": {"messages": [{"openMessageId": "msgA==", '
+                      '"content": "[文件] notes.txt fileId: REAL_A"}], "hasMore": false}}')
+        with patch.object(handler, "_run_cli", return_value=list_resp), \
+             patch.object(handler, "_download_file_text", return_value="hello") as dl:
+            out = handler.fetch_attachments(msgs)
+        self.assertEqual(out[0]["type"], "file")
+        self.assertIn("hello", out[0]["text"])
+        self.assertNotIn("未获取到 fileId", out[0]["text"])
+        dl.assert_called_once_with("REAL_A")  # 用恢复出的 fileId 下载
+
+    def test_image_file_routes_to_vision(self):
+        # 图片类文件（png）走 vision 识别，而非当文本读成乱码
+        content = "[文件] math_1plus1.png fileId: REAL_IMG"
+        with patch.object(handler, "_download_file_to_path", return_value="/tmp/x.png") as dl, \
+             patch("custom.capabilities.image._recognize", return_value="1+1=2") as rec:
+            entry = handler._fetch_file_entry(content)
+        dl.assert_called_once_with("REAL_IMG")
+        self.assertIn("1+1=2", entry)
+        self.assertIn("[图片识别内容]", entry)
+        self.assertTrue(rec.called)
+
+    def test_no_recovery_when_fileid_present(self):
+        # content 已带 fileId → 不触发回源反查
+        msgs = [self._fm("msgB==", "[文件] a.txt fileId: EXISTING")]
+        with patch.object(handler, "_run_cli") as cli, \
+             patch.object(handler, "_download_file_text", return_value="hi"):
+            handler.fetch_attachments(msgs)
+        cli.assert_not_called()
+
+    def test_recovery_failure_falls_back(self):
+        # 回源失败 → 仍走原 content（报"未获取到 fileId"），不崩
+        msgs = [self._fm("msgC==", "[文件] c.png")]
+        with patch.object(handler, "_run_cli", return_value=(1, "")), \
+             patch.object(handler, "_download_file_text") as dl:
+            out = handler.fetch_attachments(msgs)
+        self.assertIn("未获取到 fileId", out[0]["text"])
+        dl.assert_not_called()
 
 
 if __name__ == "__main__":
