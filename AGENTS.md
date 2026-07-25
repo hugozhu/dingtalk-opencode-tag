@@ -120,6 +120,7 @@ bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路�
 | `tests/custom/e2e_test.sh` | @custom | (脚本本身) | 端到端测试（FDE 改这里） |
 | `tests/custom/e2e_at_test.sh` | @custom | (脚本本身) | @我(AT) 订阅+处理 端到端测试 |
 | `tests/custom/e2e_ack_test.sh` | @custom | (脚本本身) | 回执（已读+状态表情）端到端测试 |
+| `tests/custom/e2e_forward_mixed.py` | @custom | (脚本本身) | 合并转发混合消息（2图+1文件+3文本）端到端测试 |
 
 ## 服务控制
 
@@ -207,6 +208,7 @@ systemctl --user start dingtalk-agent.service     # 启动
     dws chat message list --group "<convId>" --time "<起始时刻>" --direction newer --profile "<corpId>:<真人>" -y
     ```
   - **业务 e2e（合并转发路径）**：`dws chat message forward` 触发 → 监控日志 → 拉群校验，见 `tests/custom/e2e_test.sh`。
+  - **合并转发混合消息 e2e（本地冒烟，无需真发）**：钉钉 `combine-forward` 只能转发已存在 msgId、`send --msg-type image` 又需预置 mediaId，故真造一条 2图+1文件+3文本的转发不可行。改用**合成 fixture 驱动真实代码路径**：真实 `list-by-ids` 结构 + **真实 serve+gemini 视觉识别本地图** + 真实摘要发送人解析 + 真实 brain，只 stub 转发源/媒体下载/发送三处 I/O。断言 6 条全在、类型都解析对、发送人从外层摘要对齐、图片走 serve+gemini（非 `_proxy_vision`）、回复带 `ctx.conv_id` 进主 session。见 `tests/custom/e2e_forward_mixed.py`（serve 在跑即真识别图片）。
   - **文本回复 HTTP e2e（本地冒烟，无需钉钉）**：起临时 serve → 直接调 `brain.generate_reply("u","1+1")` 断言回复 + `opencode.log` 有 `transport=http`，见 `tests/custom/e2e_text_http_test.sh`。
   - **@我(AT) 订阅 e2e**：验证 `user_im_message_receive_at` 订阅 → bridge(convType=2) → inbound → 能力分发全链，末段 LIVE 用 `dws event consume ...receive_at --duration` 抓 `[event] ready` 证明真实建联（只读不发消息，无 dws/未登录则 SKIP）。见 `tests/custom/e2e_at_test.sh`。开启订阅：`config/constants.local.sh` 设 `DWS_EVENT_AT=1`。
   - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）；群聊场景可回退 `list-by-sender`（按发送者拉）。**但 o2o 私聊回复实测 `list-by-sender` 索引不到**——私聊校验必须用 `list --group <o2o-convId>`（convId 从 connect log 入站行 `convId=…` 取）。`e2e_text_reply_test.sh` 的 V4 即如此。
