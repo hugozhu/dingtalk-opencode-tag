@@ -49,9 +49,132 @@ class TestForwardDetection(unittest.TestCase):
         self.assertTrue(forward._looks_like_forward("群聊的聊天记录 a:[消息]"))
         self.assertTrue(forward._looks_like_forward("hugozhu与opencode的聊天记录"))
 
+    def test_english_summary_matches(self):
+        # 英文客户端摘要头（实测 msg98nDkoiY... 同一条转发英文 locale）
+        self.assertTrue(forward._looks_like_forward("Group Chat History\nhugozhu:[Image]"))
+        self.assertTrue(forward._looks_like_forward("Chat History\na:hi"))
+        self.assertTrue(forward._looks_like_forward("chat history"))  # 大小写不敏感
+
+    def test_other_languages_via_structural_fallback(self):
+        # 繁体「聊天記錄」(記錄≠记录)、日语等快路径没枚举的语言，靠 ≥2 行 `名字:内容` 结构兜底
+        self.assertTrue(forward._looks_like_forward(
+            "群組聊天記錄\nhugozhu:[圖片]\n冬翔:@朱鴻 主動性"))
+        self.assertTrue(forward._looks_like_forward(
+            "グループチャットの履歴\nhugozhu:[画像]\n冬翔:主動性"))
+
     def test_normal_text_not_matched(self):
         self.assertFalse(forward._looks_like_forward("1+1"))
         self.assertFalse(forward._looks_like_forward(""))
+        self.assertFalse(forward._looks_like_forward("history of the project"))
+        # 单行 `label:value` 不够阈值（<2 行），且自然语言 `label: value` 带空格不匹配
+        self.assertFalse(forward._looks_like_forward("note:hi"))
+        self.assertFalse(forward._looks_like_forward("时间: 10:30\n地点: 北京"))
+
+
+class TestSendersFromSummary(unittest.TestCase):
+    """外层摘要解析发送人——转发内层 sender 常为 "null" 且反查不到，摘要是唯一可靠来源。"""
+
+    # 真实样本（取自 msghynJd0G+sjOyX6XESiuFXg== 的 mget content）
+    _REAL = ("群聊的聊天记录\n"
+             "hugozhu:[图片]\n"
+             "hugozhu:传统播报机器人 真人 数字员工 在一个群里协同\n"
+             "hugozhu:@夏东翔(冬翔) FDE教练要拟人化 要主动做这个岗位该做的事情 能力要全面胜任岗位\n"
+             "冬翔:@朱鸿(hugozhu) 主动性 就是主动感知和触发action的能力")
+
+    def test_real_sample_aligns(self):
+        self.assertEqual(forward._senders_from_summary(self._REAL, 4),
+                         ["hugozhu", "hugozhu", "hugozhu", "冬翔"])
+
+    def test_chinese_colon(self):
+        self.assertEqual(
+            forward._senders_from_summary("X与Y的聊天记录\n张三：你好\n李四：在", 2),
+            ["张三", "李四"])
+
+    def test_count_mismatch_returns_none(self):
+        # 行数与 n 不一致（内层含换行会错位）→ 不猜，返回 None 交回兜底
+        self.assertIsNone(forward._senders_from_summary(self._REAL, 3))
+
+    def test_colon_in_content_not_captured_as_sender(self):
+        # 正文深处的冒号（URL）不应被当成发送人分隔——取第一个冒号前即可
+        out = forward._senders_from_summary("群聊的聊天记录\nhugozhu:见 http://a.com/x", 1)
+        self.assertEqual(out, ["hugozhu"])
+
+    def test_no_header_still_parses(self):
+        self.assertEqual(forward._senders_from_summary("a:1\nb:2", 2), ["a", "b"])
+
+    def test_english_header_stripped(self):
+        # 英文摘要头也要被识别并丢掉，剩余行与 n 对齐
+        english = ("Group Chat History\n"
+                   "hugozhu:[Image]\n"
+                   "冬翔:@朱鸿(hugozhu) 主动性")
+        self.assertEqual(forward._senders_from_summary(english, 2), ["hugozhu", "冬翔"])
+
+    def test_empty_or_zero(self):
+        self.assertIsNone(forward._senders_from_summary("", 3))
+        self.assertIsNone(forward._senders_from_summary("群聊的聊天记录\na:1", 0))
+
+
+class TestForwardMainSession(unittest.TestCase):
+    """转发回复必须发进来源会话的**主 session**（ctx 带 conv_id），复用多轮上下文——
+    与 image/file/text_reply 一致。图片识别用的临时 session 是另一回事（只做 vision 转写）。"""
+
+    def setUp(self):
+        forward._seen.clear()
+
+    def test_main_path_passes_conv_id_ctx(self):
+        fms = [{"content": "hi", "createTime": "t", "openMessageId": "m1"}]
+        body = {"sender": "hugozhu", "content": "群聊的聊天记录\nhugozhu:hi", "messages": fms}
+        with patch.object(forward, "_fetch_forward_body", return_value=(body, fms)), \
+             patch.object(forward, "_fetch_senders", return_value=["hugozhu"]), \
+             patch.object(forward, "fetch_attachments", return_value=[{"text": "hi", "time": "t"}]), \
+             patch.object(forward, "send_reply"), \
+             patch.object(forward, "generate_reply", return_value="ok") as gr:
+            forward.handle_forward("hugozhu", "txt", "msgX", "cidMAIN==", "2")
+        kwargs = gr.call_args.kwargs
+        self.assertEqual(kwargs.get("ctx", {}).get("conv_id"), "cidMAIN==")
+        self.assertTrue(kwargs.get("raw"))
+
+    def test_false_positive_fallback_also_passes_ctx(self):
+        # 假阳性回退（无 forwardMessages）也要进主 session，不能退化成无状态
+        with patch.object(forward, "_fetch_forward_body", return_value=(None, [])), \
+             patch.object(forward, "send_reply"), \
+             patch.object(forward, "generate_reply", return_value="ok") as gr:
+            forward.handle_forward("hugozhu", "txt", "msgX", "cidMAIN==", "2")
+        self.assertEqual(gr.call_args.kwargs.get("ctx", {}).get("conv_id"), "cidMAIN==")
+
+
+class TestForwardImageEntry(unittest.TestCase):
+    """转发内层图片识别——必须走 image._recognize（serve+gemini 优先），与独立图片一致，
+    而非旧的直连 _proxy_vision（实测转发内图 Connection refused）。"""
+
+    def test_uses_image_recognize(self):
+        from custom import handler
+        from custom.capabilities import image
+        with patch.object(handler, "_download_image_to_path", return_value="/tmp/fake.png"), \
+             patch.object(image, "_recognize", return_value="GEMINI识别文本") as rec:
+            out = handler._fetch_image_entry("[图片消息](mediaId=$abc123)", "msg1", "cid1")
+        rec.assert_called_once_with("/tmp/fake.png")   # 走 image 能力的统一识别
+        self.assertIn("GEMINI识别文本", out)
+        self.assertIn("识别内容", out)
+
+    def test_no_media_id(self):
+        from custom import handler
+        self.assertEqual(handler._fetch_image_entry("无 mediaId", "m", "c"),
+                         "[图片消息，未提取到 mediaId]")
+
+    def test_download_failed(self):
+        from custom import handler
+        with patch.object(handler, "_download_image_to_path", return_value=None):
+            self.assertEqual(handler._fetch_image_entry("[图片消息](mediaId=$x)", "m", "c"),
+                             "[图片，下载失败]")
+
+    def test_recognize_empty_marks_failed(self):
+        from custom import handler
+        from custom.capabilities import image
+        with patch.object(handler, "_download_image_to_path", return_value="/tmp/fake.png"), \
+             patch.object(image, "_recognize", return_value=""):
+            out = handler._fetch_image_entry("[图片消息](mediaId=$abc)", "m", "c")
+        self.assertEqual(out, "[图片，识别失败]")   # 留标记，不静默丢弃
 
 
 class TestForwardRouting(unittest.TestCase):
@@ -117,12 +240,14 @@ class TestHandleForward(unittest.TestCase):
         self.assertEqual(snd.call_args[0][2], "总结：两条消息")
 
     def test_false_positive_falls_back_to_text_reply(self):
-        # content 像转发但反查无 forwardMessages → 回退普通文本回复
+        # content 像转发但反查无 forwardMessages → 回退普通文本回复（仍进主 session：ctx 带 conv_id）
         with patch.object(forward, "_run_cli", return_value=(0, _NORMAL_RESPONSE)), \
              patch.object(forward, "generate_reply", return_value="普通回复") as gen, \
              patch.object(forward, "send_reply", return_value=True) as snd:
             forward.handle_forward("hugozhu", "假的聊天记录文本", "msgN==", "cid==", "2")
-        gen.assert_called_once_with("hugozhu", "假的聊天记录文本")  # 用原始 text 回退
+        gen.assert_called_once_with("hugozhu", "假的聊天记录文本", ctx={
+            "conv_id": "cid==", "conv_type": "2", "msg_id": "msgN==", "user": "hugozhu",
+        })
         snd.assert_called_once()
 
     def test_lookup_failure_no_crash(self):
