@@ -317,9 +317,11 @@ def _write_state_file(basename, value):
 # image 各再拷一份。统一到这里：凭据发现、Basic auth、可选调试日志、JSON 解析集中一处。
 # ---------------------------------------------------------------------------
 
-# 调试日志开关：AGENT_SERVE_DEBUG=1 时把每个 serve 请求/响应的完整 body 写到 opencode.log
+# 调试日志开关：AGENT_DEBUG=1 时把每个 serve 请求/响应的完整 body 写到 opencode.log
 # （便于排查发给模型的 prompt / 模型返回）。默认关，避免日志爆炸。路径同 brain 的 _oc_log。
-_SERVE_DEBUG = os.environ.get("AGENT_SERVE_DEBUG", "") in ("1", "true", "True", "yes", "on")
+# 统一调试总开关（原独立的 AGENT_SERVE_DEBUG 已并入）：serve body / brain 调用摘要 /
+# ack 轨迹 / serve 自身日志级别都由 AGENT_DEBUG 控制。
+_SERVE_DEBUG = os.environ.get("AGENT_DEBUG", "") in ("1", "true", "True", "yes", "on")
 _SERVE_LOG = os.environ.get("AGENT_OPENCODE_LOG", os.path.join(_PROJECT_ROOT, "opencode.log"))
 # 长 body（图片 base64 data_url 可达几百 KB）截断：留头 _SERVE_LOG_HEAD + 尾 _SERVE_LOG_TAIL。
 _SERVE_LOG_HEAD = 1000
@@ -350,7 +352,7 @@ def serve_request(method, path, body=None, timeout=8, *, port=None, pwd=None):
 
     - port/pwd 缺省时自动 find_serve_credentials()；仍无端口 → 抛 RuntimeError。
     - pwd 非空 → Basic auth(opencode:<pwd>)；否则不带鉴权头（与 healthcheck 约定一致）。
-    - AGENT_SERVE_DEBUG=1 时把 method/path/请求 body、响应 status+body 写到 opencode.log；
+    - AGENT_DEBUG=1 时把 method/path/请求 body、响应 status+body 写到 opencode.log；
       长 body（图片 data_url 等）自动截断头尾。
     - **不吞异常**：HTTPError/URLError 照常抛出，调用方保留各自的 404/超时/凭据缺失处理。
     """

@@ -120,6 +120,7 @@ bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路�
 | `tests/custom/e2e_test.sh` | @custom | (脚本本身) | 端到端测试（FDE 改这里） |
 | `tests/custom/e2e_at_test.sh` | @custom | (脚本本身) | @我(AT) 订阅+处理 端到端测试 |
 | `tests/custom/e2e_ack_test.sh` | @custom | (脚本本身) | 回执（已读+状态表情）端到端测试 |
+| `tests/custom/e2e_forward_mixed.py` | @custom | (脚本本身) | 合并转发混合消息（2图+1文件+3文本）端到端测试 |
 
 ## 服务控制
 
@@ -183,6 +184,10 @@ systemctl --user start dingtalk-agent.service     # 启动
 7. **不要改 core 改 routes**——业务路由注册到 `src/custom/routes.py`，**绝不改 `src/core/event_watcher.py`**。core 的路径在 upstream 和 fork 里必须一致才能干净 merge。
 8. **dws 输出格式随版本会变，bridge 要兼容**——`dws event consume -f ndjson` 的事件格式有两种：旧版**嵌套**（外层 `type=="event"`，事件体在 `data`(二层 JSON 字符串)`.payload.body`）、新版**扁平**（字段直接在事件顶层，`type` 即事件类型名如 `user_im_message_receive_o2o`，无 `data` 包裹）。`dws_event_bridge.py` 两种都解析。**故障特征极隐蔽**：格式不匹配时 bridge 把每条事件都跳过（`处理 0 条`），进程/连接/healthcheck 全绿但数字员工完全不响应。诊断捷径：`dws event consume ... | cat` 能看到原始数据、`... | python3 dws_event_bridge.py` 却 `处理 0 条` → 就是格式不匹配。bridge 内置**格式健康检查**：收到 ≥3 条原始事件却解析 0 条时，在 connect-log + monitor.log 报 `⚠️ 格式健康告警`。
 9. **`for line in sys.stdin` 在管道下有 readahead 缓冲**——低频事件流会卡在缓冲里不实时 yield，bridge 用 `iter(sys.stdin.readline, "")` 逐行读避免。
+10. **杀 `dws event consume` 必须连子树一起杀**（#71）——consume 会派生 `dws event _bus` 子进程（真正持流连接的那个）。只 `kill <consumer>` 会把 _bus 甩成孤儿被 init 收养，它继续占着订阅消费消息；重启后新旧 _bus 抢投递，表象为「投递停滞/收不到消息」。约定：`dws-connect.sh` 收尾用 `_kill_subtree`（子在前）+ EXIT/TERM trap；`stop.sh` / `monitor.sh stop_all` 杀完组件后调 custom 钩子 `stop_extra_cleanup`（定义在 `bin/custom/start_funcs.sh`），按 `DWS_PROFILE` 精确清扫进程树已断裂、COMP_PATTERNS 够不着的残留 `dws event` 进程。
+11. **/reboot 必须用干净环境重启**（#71）——`reboot.sh` 由老 event_watcher 派生，继承老 monitor 启动时的全部 env。若直接透传，config 里 `export VAR="${VAR:-新值}"` 风格的赋值会被继承的旧值压住——改完 `config/constants.local.sh` 后 /reboot 不生效（新 monitor / serve 仍带旧 env）。`reboot.sh` 用 `env -i`（仅保留 HOME/USER/PATH 等基本量）跑 stop.sh + start.sh，让 config 成为 env 的唯一来源，行为与「开新终端手工全停全起」一致。PATH 依赖 `constants.local.sh` 里 `export PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin"` 补回 dws / opencode。
+12. **macOS keychain 锁定会让 `dws profile list` 返回空**（#71）——e2e 冒烟的发送方自动探测会因此 SKIP，容易误判为"没登录"。解锁：`security unlock-keychain ~/Library/Keychains/login.keychain-db`；或显式 `E2E_SENDER_PROFILE="<corpId>:<真人userId>"` 绕过探测。`start.sh` 启动时已做 keychain 预检并打印提示。
+13. **e2e 冒烟别依赖硬编码免费模型**（#71）——`opencode/deepseek-v4-flash-free` 等免费模型会失效/超时，未 source 配置时 e2e 会 HTTP 90s + CLI 90s = 180s 慢失败，易误判为链路问题。`e2e_text_http_test.sh` 约定：未显式设 `AGENT_OPENCODE_MODEL` 时先 source `config/constants.local.sh` 取真实可用模型，且起临时 serve 后**轮询 /session 就绪探测**（最多 30s）再发请求，不裸 sleep。
 
 ## 测试约定
 
@@ -203,13 +208,14 @@ systemctl --user start dingtalk-agent.service     # 启动
     dws chat message list --group "<convId>" --time "<起始时刻>" --direction newer --profile "<corpId>:<真人>" -y
     ```
   - **业务 e2e（合并转发路径）**：`dws chat message forward` 触发 → 监控日志 → 拉群校验，见 `tests/custom/e2e_test.sh`。
+  - **合并转发混合消息 e2e（本地冒烟，无需真发）**：钉钉 `combine-forward` 只能转发已存在 msgId、`send --msg-type image` 又需预置 mediaId，故真造一条 2图+1文件+3文本的转发不可行。改用**合成 fixture 驱动真实代码路径**：真实 `list-by-ids` 结构 + **真实 serve+gemini 视觉识别本地图** + 真实摘要发送人解析 + 真实 brain，只 stub 转发源/媒体下载/发送三处 I/O。断言 6 条全在、类型都解析对、发送人从外层摘要对齐、图片走 serve+gemini（非 `_proxy_vision`）、回复带 `ctx.conv_id` 进主 session。见 `tests/custom/e2e_forward_mixed.py`（serve 在跑即真识别图片）。
   - **文本回复 HTTP e2e（本地冒烟，无需钉钉）**：起临时 serve → 直接调 `brain.generate_reply("u","1+1")` 断言回复 + `opencode.log` 有 `transport=http`，见 `tests/custom/e2e_text_http_test.sh`。
   - **@我(AT) 订阅 e2e**：验证 `user_im_message_receive_at` 订阅 → bridge(convType=2) → inbound → 能力分发全链，末段 LIVE 用 `dws event consume ...receive_at --duration` 抓 `[event] ready` 证明真实建联（只读不发消息，无 dws/未登录则 SKIP）。见 `tests/custom/e2e_at_test.sh`。开启订阅：`config/constants.local.sh` 设 `DWS_EVENT_AT=1`。
   - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）；群聊场景可回退 `list-by-sender`（按发送者拉）。**但 o2o 私聊回复实测 `list-by-sender` 索引不到**——私聊校验必须用 `list --group <o2o-convId>`（convId 从 connect log 入站行 `convId=…` 取）。`e2e_text_reply_test.sh` 的 V4 即如此。
   - **坑#2**：实时订阅（connect 日志）**不回显当前登录用户自己发的消息**——数字员工的回复不会出现在它自己的接收流里，别把"connect 日志没看到回复"误判为没发出去；用校验 B 的 DWS 拉取确认。
   - **坑#3**：`dws event` 订阅偶发**投递停滞**——`dws event consume` 子进程还活着（healthcheck 只查进程存活会误判"健康"），但连接静默失活、消息迟迟不进 connect log，只延到下次重启。跑基础文本 e2e 时若 V2 超时未见入站，先 `bash bin/core/reboot.sh` 重建订阅再跑。
   - **后端两条路都走 opencode serve HTTP**：普通文本回复走 `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI；合并转发业务走 `inject_and_forward` 的 serve HTTP `/session`。两者都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
-  - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**：每次 opencode 调用记一条（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败）。想确认"回复到底走 HTTP 还是 CLI 回退"看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
+  - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**（统一调试总开关，原 `AGENT_SERVE_DEBUG` 已并入）：每次 opencode 调用记一条摘要（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败），**并把每个 serve 请求/响应的完整 body（含发给模型的 prompt 与模型返回）写到同一文件**，长 body（图片 data_url 等）自动截断头尾。想确认"回复到底走 HTTP 还是 CLI 回退"或"到底发了什么 prompt / serve 返回了什么"都看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
 
 ## 不要做的事
 

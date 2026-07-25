@@ -167,6 +167,12 @@ Complete list in AGENTS.md "常见坑". Critical ones:
 
 8. **patch.object 第三参数是 `new` 不是 `return_value`**: 指定 new 后不传 mock 给测试函数
 
+9. **Kill `dws event consume` with its subtree** (#71): consume spawns a `dws event _bus` child holding the stream connection. Plain `kill <consumer>` orphans `_bus` → it keeps consuming, new/old `_bus` fight over delivery ("投递停滞"). Use subtree kill; `stop.sh`/`monitor.sh` call the custom `stop_extra_cleanup` hook to sweep residual `dws event` by `DWS_PROFILE`.
+
+10. **/reboot uses a clean env** (#71): `reboot.sh` runs stop/start via `env -i` so edits to `config/constants.local.sh` take effect — inherited stale env would otherwise defeat `${VAR:-...}`-style assignments.
+
+11. **Locked macOS keychain empties `dws profile list`** (#71): e2e sender autodetect then SKIPs. Fix: `security unlock-keychain ~/Library/Keychains/login.keychain-db` or set `E2E_SENDER_PROFILE`.
+
 ## Environment Variables
 
 Key configuration (see `config/constants.sh` for full list):

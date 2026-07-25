@@ -17,6 +17,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$SCRIPT_DIR"
 
+# 模型兜底（#71）：未显式设 AGENT_OPENCODE_MODEL 时先 source 本地配置取真实可用模型
+# （顺带补 PATH，daemon/裸终端都能找到 opencode）。硬编码默认（deepseek-v4-flash-free）
+# 可能已失效——那会 HTTP 90s + CLI 90s = 180s 慢失败，易误判为链路问题。
+if [[ -z "${AGENT_OPENCODE_MODEL:-}" && -f "$SCRIPT_DIR/config/constants.local.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/config/constants.local.sh"
+fi
+
 OPENCODE_BIN="${AGENT_OPENCODE_BIN:-opencode}"
 MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-free}"
 PORT="${E2E_SERVE_PORT:-47790}"
@@ -37,14 +45,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== 阶段 1: 起临时 serve（端口 ${PORT}）==="
+echo "=== 阶段 1: 起临时 serve（端口 ${PORT}，模型 ${MODEL}）==="
 echo "$PORT" > "$PORT_FILE"
 echo "$PW"   > "$PWD_FILE"
 OPENCODE_SERVER_PASSWORD="$PW" nohup "$OPENCODE_BIN" serve \
     --port "$PORT" --hostname 127.0.0.1 >/tmp/e2e_serve.log 2>&1 &
 SVPID=$!
 disown "$SVPID" 2>/dev/null || true
-sleep 5
+
+# 就绪探测（#71）：轮询 /session 到 HTTP 200 再继续（最多 30s），代替裸 sleep——
+# 冷启动/慢机器上 serve 5s 内起不来，brain 首次请求会白等一个完整超时周期。
+_auth="$(printf '%s' "opencode:$PW" | base64)"
+READY=0
+for ((i = 0; i < 30; i++)); do
+    sleep 1
+    if curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Basic $_auth" \
+            "http://127.0.0.1:$PORT/session" 2>/dev/null | grep -q '^200$'; then
+        READY=1; break
+    fi
+done
+if [[ "$READY" -ne 1 ]]; then
+    echo "❌ 临时 serve 30s 内未就绪（/tmp/e2e_serve.log 尾部如下）"
+    tail -20 /tmp/e2e_serve.log 2>/dev/null | sed 's/^/    /'
+    exit 1
+fi
+echo "  serve 就绪（$((i + 1))s）"
 
 echo ""
 echo "=== 阶段 2: 驱动 brain（HTTP 路径）+ 采集耗时 ==="
