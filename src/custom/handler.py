@@ -34,7 +34,6 @@ from core.agent_common import (
     _find_bot_session,
     _find_session_with_predicate,
     _md,
-    _proxy_vision,
     inject_and_forward,
     log,
     send_notification,
@@ -239,7 +238,13 @@ def fetch_attachments(messages, lookup_convs=None):
 
 
 def _fetch_image_entry(fm_content, msg_id, conv_id):
-    """Resolve an image message to its prompt entry text."""
+    """Resolve an image message to its prompt entry text.
+
+    复用 image 能力的 _recognize：优先经 opencode serve 用 AGENT_VISION_MODEL 识别
+    （gemini 等，免外部 proxy），空再回退 _proxy_vision。此前这里**直接**用 _proxy_vision，
+    会跳过可用的 serve 路径——实测转发内层图片 Connection refused（外部 proxy 未起），而同一张图
+    独立发送却能被 serve+gemini 正常识别。两条路径就此统一。
+    """
     mid_m = _RE_MEDIA_ID.search(fm_content)
     if not mid_m:
         return "[图片消息，未提取到 mediaId]"
@@ -248,16 +253,16 @@ def _fetch_image_entry(fm_content, msg_id, conv_id):
     if not image_path:
         return "[图片，下载失败]"
     try:
-        with open(image_path, "rb") as f:
-            img_bytes = f.read()
-        desc = _proxy_vision(img_bytes)
+        # 惰性导入，避免 infra(handler) → 能力(image) 的加载期耦合与潜在环
+        from custom.capabilities.image import _recognize
+        desc = _recognize(image_path)  # 内部负责 读字节 + serve/proxy 识别 + 删临时文件
     except Exception as e:
-        log(f"image recognize err: {e}")
+        log(f"forward image recognize err: {e}")
         desc = ""
-    try:
-        os.unlink(image_path)
-    except Exception:
-        pass
+        try:
+            os.unlink(image_path)
+        except Exception:
+            pass
     if desc:
         return f"[图片，识别内容]\n```\n{desc}\n```"
     return "[图片，识别失败]"
