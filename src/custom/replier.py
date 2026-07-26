@@ -20,16 +20,53 @@ from core.replier import register_replier
 _REPLY_MODE = os.environ.get("AGENT_REPLY_MODE", "log")
 # 回复标题（send-by-bot 需要 title）
 _REPLY_TITLE = os.environ.get("AGENT_REPLY_TITLE", "数字员工")
+# 单条钉钉消息分片上限（字符）。长回复按段落/换行拆成多条顺序发出，避免撑爆钉钉
+# 服务端单消息上限（~20000 字节）且不再一刀切丢内容。中文 UTF-8 下 3500 字符 ≈ 10.5KB，安全。
+_CHUNK_CHARS = int(os.environ.get("AGENT_REPLY_CHUNK_CHARS", "3500"))
+# 分片时给「（i/n）\n」前缀预留的字符余量
+_PREFIX_MARGIN = 16
+
+
+def _split_text(text, size):
+    """把 text 切成每片 ≤ size 的列表，优先在 \\n 段落边界断开；单行超长则硬切。
+
+    预留 _PREFIX_MARGIN 给「（i/n）」前缀，故实际累积上限为 size-_PREFIX_MARGIN。
+    text 长度 ≤ 有效上限时原样返回单元素列表（不加前缀，见 _dingtalk_send）。
+    """
+    limit = max(1, size - _PREFIX_MARGIN)
+    if len(text) <= limit:
+        return [text]
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        # 单行本身超长：先冲掉累积，再把该行硬切成多片
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        add = line if not cur else cur + "\n" + line
+        if len(add) > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = add
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def _dingtalk_send(conv_id, conv_type, text, *, at_user_id=None):
     """钉钉发送实现。返回 True=已发送/已记录。core.replier 已做空 text 过滤 + 回执广播。
 
+    长回复在此按 _CHUNK_CHARS 分片顺序发出；对上层透明——send_reply 只调本函数一次、
+    只广播一次 reply-sent，内部发多条 dws 消息不影响 ack 回执语义。
+
     Args:
         conv_id:  来源 openConversationId
         conv_type: 会话类型（1=单聊 2=群聊；send --group 对两者通用，均按 conv_id 发）
         text:     回复正文
-        at_user_id: 可选，群里 @ 回某人的 userId
+        at_user_id: 可选，群里 @ 回某人的 userId（多片时只在第 1 片带，避免重复 @）
     """
     if not conv_id:
         log(f"reply skip: 无 conv_id (mode={_REPLY_MODE})")
@@ -42,12 +79,25 @@ def _dingtalk_send(conv_id, conv_type, text, *, at_user_id=None):
             "否则 dws 报未登录。见 constants.sh 顶部坑#2。")
         return False
 
-    if _REPLY_MODE == "bot":
-        return _reply_bot(conv_id, text, at_user_id)
-    if _REPLY_MODE == "user":
-        return _reply_user(conv_id, text)
     # 默认 log 模式：只记录不发送（仍视为"已回复"，让回执状态机收尾）
-    log(f"[reply:log] → conv={conv_id[:16]} text={text[:120]!r}")
+    if _REPLY_MODE not in ("bot", "user"):
+        log(f"[reply:log] → conv={conv_id[:16]} text={text[:120]!r}")
+        return True
+
+    chunks = _split_text(text, _CHUNK_CHARS)
+    n = len(chunks)
+    if n > 1:
+        log(f"reply {_REPLY_MODE}: 长回复分 {n} 片发送 conv={conv_id[:16]} total_len={len(text)}")
+    for i, ch in enumerate(chunks, 1):
+        body = ch if n == 1 else f"（{i}/{n}）\n{ch}"
+        if _REPLY_MODE == "bot":
+            ok = _reply_bot(conv_id, body, at_user_id if i == 1 else None)
+        else:
+            ok = _reply_user(conv_id, body)
+        if not ok:
+            if n > 1:
+                log(f"reply {_REPLY_MODE}: 第 {i}/{n} 片发送失败，终止后续分片")
+            return False
     return True
 
 

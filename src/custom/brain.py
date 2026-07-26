@@ -128,8 +128,9 @@ _SYSTEM_PROMPT = os.environ.get(
     "用户可能会发送文档、图片、文件、链接，系统已为你识别/转写这些内容并内联在消息里。\n"
     "回答简洁、准确、专业，用中文。当用户需要总结或归纳时，关注关键信息和行动项。",
 )
-# 回复长度上限（防止刷屏）
-_MAX_REPLY_CHARS = int(os.environ.get("AGENT_MAX_REPLY_CHARS", "1000"))
+# 回复总长度上限（外层 backstop，防跑飞刷屏）。超长回复由 replier 按此上限内的内容
+# 分片成多条钉钉消息发出（见 custom/replier.py _split_text），不再一刀切到千字。
+_MAX_REPLY_CHARS = int(os.environ.get("AGENT_MAX_REPLY_CHARS", "12000"))
 
 
 def _oc_log(transport, model, elapsed, prompt, reply, ok, err=""):
