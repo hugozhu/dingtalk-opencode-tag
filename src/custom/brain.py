@@ -39,7 +39,7 @@ _CHAT_MODEL = os.environ.get("AGENT_CHAT_MODEL", "gpt-4o-mini")
 # opencode 后端用的模型（provider/model 格式；免鉴权可用 *-free）
 _OPENCODE_MODEL = os.environ.get("AGENT_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free")
 _OPENCODE_BIN = os.environ.get("AGENT_OPENCODE_BIN", "opencode")
-_OPENCODE_TIMEOUT = int(os.environ.get("AGENT_OPENCODE_TIMEOUT", "90"))
+_OPENCODE_TIMEOUT = int(os.environ.get("AGENT_OPENCODE_TIMEOUT", "300"))
 
 # 会话连续性（#56）：同一 conv_id 复用同一个 serve session，多轮历史由 serve 自带。
 #   AGENT_SESSION_REUSE   缺省开启（项目默认）；设 0 或空串回退旧的无状态语义（每条消息新建即删）。

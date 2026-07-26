@@ -471,7 +471,7 @@ def _post_user_message(full_sid, text):
         d = serve_request(
             "POST", f"/session/{full_sid}/message",
             {"input": text, "parts": [{"type": "text", "text": text}]},
-            timeout=180, port=port, pwd=pwd) or {}
+            timeout=300, port=port, pwd=pwd) or {}
         return d.get("info", {}).get("id") or None
     except Exception as e:
         log(f"post_user_message err: {e}")
