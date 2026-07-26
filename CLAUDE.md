@@ -193,6 +193,13 @@ AGENT_BRAIN="opencode"                     # echo | opencode | proxy
 AGENT_OPENCODE_MODEL="opencode/deepseek-v4-flash-free"  # Free text model
 AGENT_VISION_MODEL="opencode/mimo-v2.5-free"            # Free vision model
 
+# Long-running task timeout (#75) — activity-aware, not a flat wall-clock cap
+AGENT_OPENCODE_IDLE_TIMEOUT=300            # Abort if no session activity for N seconds
+AGENT_OPENCODE_MAX_TIMEOUT=3600            # Absolute backstop cap (0=unlimited)
+AGENT_OPENCODE_ACTIVITY_POLL=15           # Activity probe interval (polls GET /message)
+AGENT_CANCEL_KEYWORDS="/cancel,取消,停止,stop"  # User cancel → abort running session
+# (legacy AGENT_OPENCODE_TIMEOUT, if set, seeds IDLE_TIMEOUT for back-compat)
+
 # Session continuity (#56)
 AGENT_SESSION_REUSE=1                      # Enable multi-turn memory
 AGENT_SESSION_TTL=1800                     # Idle expiry (30min)
@@ -201,11 +208,16 @@ AGENT_SESSION_RESET_KEYWORDS="/new,新话题"  # Context reset triggers
 
 # Capabilities (CAP_<NAME>_ENABLED)
 CAP_TEXT_REPLY_ENABLED=1                   # Basic text chat
+CAP_CANCEL_ENABLED=1                       # User-cancel long tasks (#75)
 CAP_QUESTION_ENABLED=1                     # Interactive question prompts
 CAP_IMAGE_ENABLED=1                        # Image recognition
 CAP_FILE_ENABLED=1                         # File reading
 CAP_FORWARD_ENABLED=1                      # Merged forward messages
 CAP_ACK_ENABLED=1                          # Read receipts + status reactions
+# ACK long-task progress heartbeat (#75): every N sec, update the message's
+# text-emotion (with elapsed minutes) AND send a standalone progress message.
+ACK_PROGRESS_INTERVAL=300                  # Heartbeat cadence (0=off)
+ACK_PROGRESS_MESSAGE=1                     # Also send a progress message (0=emoji only)
 CAP_AGGREGATION_ENABLED=0                  # Message batching (off by default)
 ```
 

@@ -391,6 +391,89 @@ class TestLifecycleWorker(unittest.TestCase):
             ack._ack_worker(rec)  # 不应抛
 
 
+class TestProgressHeartbeat(unittest.TestCase):
+    """周期进度心跳（#75 长任务）：每 interval 更新表情 + 发独立进度消息，直到 reply-sent/超时。"""
+
+    def setUp(self):
+        with ack._pending_lock:
+            ack._pending.clear()
+        ack._seen.clear()
+
+    def _record(self):
+        calls = []
+        return calls, {
+            "_mark_read": lambda *a: calls.append(("read",) + a),
+            "_add_text_emotion": lambda *a: calls.append(("add",) + a),
+            "_remove_text_emotion": lambda *a: calls.append(("rm",) + a),
+        }
+
+    def test_heartbeat_updates_emoji_and_sends_message(self):
+        calls, m = self._record()
+        notices = []
+        with patch.object(ack, "_mark_read", m["_mark_read"]), \
+             patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
+             patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
+             patch.object(ack, "_PROGRESS_INTERVAL", 0.05), \
+             patch.object(ack, "_PROGRESS_MESSAGE", True), \
+             patch.object(ack, "_PROGRESS_EMOJI", "咖啡"), \
+             patch.object(ack, "_PROGRESS_EMOJI_TEXT", "处理中{mins}分钟"), \
+             patch.object(ack, "_PROGRESS_MSG", "还在跑 {mins}min"), \
+             patch.object(ack, "_DONE_TIMEOUT", 5), \
+             patch("custom.replier.send_notice", lambda cid, ct, text: notices.append((cid, ct, text))):
+            ack._begin(_msg(conv_id="cH==", msg_id="mH=="))
+            time.sleep(0.18)                       # 允许 ~3 次心跳
+            ack.on_reply_sent("cH==", "1", True)
+            self.assertTrue(_wait_gone("cH=="))
+        # 至少贴过一次进度表情（咖啡）
+        self.assertTrue(any(c[0] == "add" and c[3] == "咖啡" for c in calls), "应更新进度表情")
+        # 至少发过一条独立进度消息，且不影响收尾（最终仍切到完成态）
+        self.assertGreaterEqual(len(notices), 1, "应发出进度消息")
+        self.assertEqual(notices[0][0], "cH==")
+
+    def test_progress_message_disabled_only_emoji(self):
+        calls, m = self._record()
+        notices = []
+        with patch.object(ack, "_mark_read", m["_mark_read"]), \
+             patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
+             patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
+             patch.object(ack, "_PROGRESS_INTERVAL", 0.05), \
+             patch.object(ack, "_PROGRESS_MESSAGE", False), \
+             patch.object(ack, "_DONE_TIMEOUT", 5), \
+             patch("custom.replier.send_notice", lambda *a, **k: notices.append(a)):
+            ack._begin(_msg(conv_id="cN==", msg_id="mN=="))
+            time.sleep(0.12)
+            ack.on_reply_sent("cN==", "1", True)
+            self.assertTrue(_wait_gone("cN=="))
+        self.assertTrue(any(c[0] == "add" and c[3] == ack._PROGRESS_EMOJI for c in calls))
+        self.assertEqual(notices, [], "关闭进度消息时不应发送")
+
+    def test_heartbeat_disabled_no_tick(self):
+        calls, m = self._record()
+        with patch.object(ack, "_mark_read", m["_mark_read"]), \
+             patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
+             patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
+             patch.object(ack, "_PROGRESS_INTERVAL", 0), \
+             patch.object(ack, "_DONE_TIMEOUT", 0.05):
+            ack._begin(_msg(conv_id="cD==", msg_id="mD=="))
+            self.assertTrue(_wait_gone("cD=="))
+        added = [(c[3], c[4]) for c in calls if c[0] == "add"]
+        self.assertEqual(added, [("收到", "t0")], "关闭心跳应回退旧行为，无进度表情")
+
+    def test_progress_message_not_finalizing(self):
+        """send_notice 不广播 reply-sent：进度消息不会误触发 ack 收尾。"""
+        import core.capabilities as C
+        from custom import replier
+        fired = []
+        C.clear()
+        C.register(C.Capability(name="probe", on_reply_sent=lambda *a: fired.append(a)))
+        with patch.object(replier, "_dingtalk_send", lambda *a, **k: True):
+            self.assertTrue(replier.send_notice("cX==", "1", "进度"))
+        self.assertEqual(fired, [], "send_notice 不应广播 reply-sent")
+
+
 class TestDispatchReplySent(unittest.TestCase):
     def test_dispatch_calls_on_reply_sent(self):
         import core.capabilities as C

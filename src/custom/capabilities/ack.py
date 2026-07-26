@@ -6,13 +6,14 @@
 **原地更新**（不发独立消息、不刷屏、无卡片"生成中"加载态）：
 
   🈺 收到「稍等｜已收到，正在处理…」→ 1s「稍等｜正在处理中…」
-     → 5 分钟仍在处理「咖啡｜仍在处理（约 5 分钟）…」
+     → 长任务每 5 分钟：原地更新「咖啡｜处理中N分钟」+ 另发一条独立进度消息（#75）
   回复发出 → 「OK｜已完成」；处理失败 → 「疑问｜处理未完成」
 
 任一时刻消息上只有一个文字表情（升级=移除旧 + 贴新，remove/add text-emotion）。
 
 时间线由 ACK_STAGES 配置（`delay秒:表情名:文字`，多阶段用 `|` 分隔，按 delay 升序），
-完成/失败用 ACK_DONE / ACK_ERROR（`表情名:文字`）。
+完成/失败用 ACK_DONE / ACK_ERROR（`表情名:文字`）。长任务的周期进度心跳由 ACK_PROGRESS_*
+配置（默认每 300s：更新表情 + 发独立进度消息），进度消息走 replier.send_notice 不触发收尾。
 
 DingTalk 约定（实测）：
 - 文字表情需先 `create-text-emotion --emotion-name <表情> --text <文字>` 拿到
@@ -101,22 +102,36 @@ def _parse_status(spec, default_emoji, default_text):
     return (default_emoji, default_text)
 
 
-# 进度「文字表情」时间线：收到即贴，1s 处理中，5 分钟(300s)仍在处理。
-# 默认文案简洁清晰：收到 → 处理中 → 完成/未完成
+# 进度「文字表情」时间线：收到即贴，1s 处理中。5 分钟以上的长任务由**周期进度心跳**接管
+# （见下方 _PROGRESS_*），不再靠单个 300s 阶段。
 # 表情名本身已是钉钉贴纸（稍等/咖啡/OK/疑问），文字只作补充。
-# 注：将处理中延迟从5s改为1s，避免快速响应时状态滞后（#62）
 _STAGES = _parse_stages(
     os.environ.get("ACK_STAGES")
-    or "0:稍等:收到|1:稍等:处理中|300:咖啡:处理中"
+    or "0:稍等:收到|1:稍等:处理中"
 )
 _DONE = _parse_status(os.environ.get("ACK_DONE"), "OK", "完成")
 _ERROR = _parse_status(os.environ.get("ACK_ERROR"), "疑问", "未完成")
 
-# 等"回复已发出"信号的上限秒数（brain 慢 / 空回复不发时兜底收尾）。默认覆盖到最后一个
-# 进度阶段之后仍留足冗余（最后阶段 delay + 300s，至少 180s）。
+# 周期进度心跳（长任务）：每隔 ACK_PROGRESS_INTERVAL 秒，若仍在处理 → ①原地更新消息上的
+# 文字表情（带已耗时分钟），②另发一条独立进度消息到来源会话（send_notice，不触发收尾）。
+# 配合 #75 活动感知超时：任务可能跑很久，用户需要周期性"还在干活"的反馈。
+#   ACK_PROGRESS_INTERVAL   心跳间隔秒（默认 300=5min；0=关闭周期心跳，回退旧行为）
+#   ACK_PROGRESS_MESSAGE    是否额外发独立进度消息（默认开；关=只更新表情不发消息）
+#   ACK_PROGRESS_EMOJI      心跳阶段的表情名（默认「咖啡」）
+#   ACK_PROGRESS_EMOJI_TEXT 表情附带文字模板（{mins}=已耗时分钟；文字须能被 create-text-emotion 保存）
+#   ACK_PROGRESS_MSG        独立进度消息文案模板（{mins}=已耗时分钟）
+_PROGRESS_INTERVAL = float(os.environ.get("ACK_PROGRESS_INTERVAL", "300"))
+_PROGRESS_MESSAGE = env_flag("ACK_PROGRESS_MESSAGE", default=True)
+_PROGRESS_EMOJI = os.environ.get("ACK_PROGRESS_EMOJI", "咖啡")
+_PROGRESS_EMOJI_TEXT = os.environ.get("ACK_PROGRESS_EMOJI_TEXT", "处理中{mins}分钟")
+_PROGRESS_MSG = os.environ.get("ACK_PROGRESS_MSG", "⏳ 仍在处理中，已耗时约 {mins} 分钟，请稍候…")
+
+# 等"回复已发出"信号的上限秒数（brain 慢 / 空回复不发时兜底收尾）。默认覆盖到 opencode
+# 长任务上限（AGENT_OPENCODE_MAX_TIMEOUT，#75）之后仍留冗余，避免心跳中途被误收尾。
+_OPENCODE_MAX = float(os.environ.get("AGENT_OPENCODE_MAX_TIMEOUT", "3600") or 0)
 _DONE_TIMEOUT = float(
     os.environ.get("ACK_DONE_TIMEOUT")
-    or str(max(180.0, _STAGES[-1][0] + 300.0))
+    or str(max(180.0, _STAGES[-1][0] + 300.0, _OPENCODE_MAX + 300.0))
 )
 
 _CONV_TYPE_O2O = "1"
@@ -334,8 +349,30 @@ def _finalize(rec, ok):
     _set_status(rec, final)
 
 
+def _send_progress_message(conv_id, conv_type, mins):
+    """发一条独立进度消息（不触发 ack 收尾）。best-effort，失败只记日志。"""
+    if not _PROGRESS_MESSAGE:
+        return
+    try:
+        from custom.replier import send_notice   # 延迟导入避免 capabilities 载入期循环
+    except ImportError:
+        return
+    try:
+        send_notice(conv_id, conv_type, _PROGRESS_MSG.format(mins=mins))
+    except Exception as e:
+        log(f"ack: 进度消息发送失败 {e}")
+
+
+def _progress_tick(rec, mins):
+    """一次进度心跳：原地更新消息上的文字表情（带已耗时分钟）+ 另发独立进度消息。"""
+    _dlog("进度心跳 msgId=%s 已耗时=%d分钟" % (rec.msg_id or "-", mins))
+    emoji_text = _PROGRESS_EMOJI_TEXT.format(mins=mins)
+    _set_status(rec, (_PROGRESS_EMOJI, emoji_text))
+    _send_progress_message(rec.conv_id, rec.conv_type, mins)
+
+
 def _ack_worker(rec):
-    """单条消息的回执 worker：走文字表情时间线（按 elapsed 逐级升级），
+    """单条消息的回执 worker：走文字表情时间线（按 elapsed 逐级升级），再进入周期进度心跳，
     直到收到 reply-sent 信号或整体超时，再收尾切完成/失败。"""
     try:
         start = time.monotonic()
@@ -352,13 +389,29 @@ def _ack_worker(rec):
                 break
             _dlog("升级 msgId=%s elapsed=%.0fs → %s｜%s" % (
                 rec.msg_id or "-", time.monotonic() - start, emoji, text))
-            _set_status(rec, (emoji, text))   # 到点升级（如 5 分钟 → 咖啡｜仍在处理）
+            _set_status(rec, (emoji, text))   # 到点升级
 
-        # 所有进度阶段走完仍没信号 → 继续等到整体超时兜底
-        if not rec.event.is_set():
-            remaining = _DONE_TIMEOUT - (time.monotonic() - start)
-            if remaining > 0:
-                rec.event.wait(timeout=remaining)
+        # 进度阶段走完仍没信号 → 进入周期心跳，每 _PROGRESS_INTERVAL 秒更新表情 + 发进度消息，
+        # 直到 reply-sent 信号或整体超时兜底（#75 长任务：只要还在处理就周期反馈）。
+        while not rec.event.is_set():
+            elapsed = time.monotonic() - start
+            if elapsed >= _DONE_TIMEOUT:
+                break
+            if _PROGRESS_INTERVAL <= 0:
+                rec.event.wait(timeout=_DONE_TIMEOUT - elapsed)   # 关闭心跳：等到超时兜底（旧行为）
+                break
+            # 下一个心跳时刻（interval 整数倍）；若它已越过 done-timeout，则只等到超时、不再心跳
+            next_tick = (int(elapsed // _PROGRESS_INTERVAL) + 1) * _PROGRESS_INTERVAL
+            if next_tick > _DONE_TIMEOUT:
+                rec.event.wait(timeout=_DONE_TIMEOUT - elapsed)
+                break
+            wait = next_tick - elapsed
+            if wait > 0 and rec.event.wait(timeout=wait):
+                break   # 信号到达 → 收尾
+            if rec.event.is_set():
+                break
+            mins = int(round((time.monotonic() - start) / 60.0))
+            _progress_tick(rec, mins)
 
         # ok：有信号取 rec.ok（成功/失败）；无信号（超时）→ None 仅移除进度文字表情
         _finalize(rec, rec.ok if rec.event.is_set() else None)

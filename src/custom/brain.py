@@ -39,7 +39,21 @@ _CHAT_MODEL = os.environ.get("AGENT_CHAT_MODEL", "gpt-4o-mini")
 # opencode 后端用的模型（provider/model 格式；免鉴权可用 *-free）
 _OPENCODE_MODEL = os.environ.get("AGENT_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free")
 _OPENCODE_BIN = os.environ.get("AGENT_OPENCODE_BIN", "opencode")
-_OPENCODE_TIMEOUT = int(os.environ.get("AGENT_OPENCODE_TIMEOUT", "300"))
+# 长程任务超时（#75）：活动感知，不再一刀切墙钟硬超时。serve 的 message POST 是同步阻塞
+# 请求，任务跑完才返回，其间 socket 无字节流动，旧的 urllib socket 超时 = 任务总时长上限，
+# 长任务超 5min 即被强杀。改为：socket 超时放大到 MAX 兜底 + watchdog 轮询 session 活动，
+# 只要仍在产出就不 abort（见 _start_watchdog）。
+#   AGENT_OPENCODE_IDLE_TIMEOUT  无活动多少秒判定卡死并 abort（默认 300）
+#   AGENT_OPENCODE_MAX_TIMEOUT   绝对上限硬超时兜底（默认 3600；0=不设上限，socket timeout=None）
+#   AGENT_OPENCODE_ACTIVITY_POLL 活动探测间隔秒（默认 15）
+# 兼容：显式设了旧 AGENT_OPENCODE_TIMEOUT 时，作为 IDLE_TIMEOUT 的默认值，老配置无缝迁移。
+_LEGACY_TIMEOUT = os.environ.get("AGENT_OPENCODE_TIMEOUT")
+_OPENCODE_IDLE_TIMEOUT = int(os.environ.get("AGENT_OPENCODE_IDLE_TIMEOUT", _LEGACY_TIMEOUT or "300"))
+_OPENCODE_MAX_TIMEOUT = int(os.environ.get("AGENT_OPENCODE_MAX_TIMEOUT", "3600"))
+_OPENCODE_ACTIVITY_POLL = int(os.environ.get("AGENT_OPENCODE_ACTIVITY_POLL", "15"))
+_OPENCODE_SOCK_TIMEOUT = _OPENCODE_MAX_TIMEOUT or None   # 0 → None（阻塞到 watchdog/abort）
+# CLI 回退硬超时（serve 挂时的兜底路径，长程主要走 HTTP）
+_OPENCODE_TIMEOUT = _OPENCODE_MAX_TIMEOUT or None
 
 # 会话连续性（#56）：同一 conv_id 复用同一个 serve session，多轮历史由 serve 自带。
 #   AGENT_SESSION_REUSE   缺省开启（项目默认）；设 0 或空串回退旧的无状态语义（每条消息新建即删）。
@@ -521,7 +535,12 @@ def _brain_opencode(user, text, ctx, raw=False):
         return "🆕 已开启新话题，之前的上下文已清空。", STATUS_OK
 
     prompt = text if raw else f"{user}：{text}"
-    reply = _brain_opencode_http(prompt, ctx=ctx)
+    try:
+        reply = _brain_opencode_http(prompt, ctx=ctx)
+    except _IdleAbort as e:
+        # watchdog 空闲/超上限主动 abort → 终态失败，**不回退 CLI**（避免整轮长任务被重复执行）
+        log(f"brain(opencode): 活动感知超时 abort，判失败不回退 CLI：{e}")
+        return "", STATUS_FAILED
     if reply is not None:
         # HTTP 后端正常应答（可能空）：非空=ok，空=模型未产出=empty
         return reply, (STATUS_OK if reply else STATUS_EMPTY)
@@ -568,20 +587,143 @@ def _delete_session(port, pwd, sid):
         pass
 
 
+class _IdleAbort(Exception):
+    """watchdog 因空闲/超上限主动 abort 了会话 → 终态失败，**不回退 CLI**（避免整轮长任务被重复执行）。"""
+
+
+def _activity_fingerprint(port, pwd, sid):
+    """探测 session 当前活动指纹；变化=agent 仍在产出。
+
+    读 GET /session/{sid}/message，取最后一条（进行中的 assistant）消息的
+    (消息数, part 数, 文本总长, 最后更新时刻)。任一维变化即视为有活动。
+    GET 失败返回 None：watchdog 据此**不判卡死**（偏向保活，降低误杀）。
+    """
+    try:
+        msgs = _serve_request("GET", port, pwd, f"/session/{sid}/message", timeout=6)
+    except Exception:
+        return None
+    if not isinstance(msgs, list) or not msgs:
+        return (0, 0, 0, 0)
+    last = msgs[-1] or {}
+    info = last.get("info", {}) or {}
+    t = info.get("time", {}) or {}
+    updated = t.get("updated") or t.get("completed") or 0
+    parts = last.get("parts", []) or []
+    textlen = sum(len(p.get("text", "")) for p in parts if isinstance(p, dict))
+    return (len(msgs), len(parts), textlen, updated)
+
+
+def _start_watchdog(port, pwd, sid, done, aborted):
+    """启动活动感知 watchdog 线程（#75）。返回线程或 None（关闭时）。
+
+    - done：主线程 POST 结束后 set，watchdog 随即退出（POST 快返回时 0 次 GET 探测）。
+    - aborted：单元素 list，watchdog 触发 abort 时置 [True]，主线程据此抛 _IdleAbort。
+    IDLE<=0 且 MAX<=0 视为完全关闭，不启 watchdog（回退无超时兜底）。
+    """
+    idle, mx, poll = _OPENCODE_IDLE_TIMEOUT, _OPENCODE_MAX_TIMEOUT, max(_OPENCODE_ACTIVITY_POLL, 1)
+    if idle <= 0 and mx <= 0:
+        return None
+
+    def _run():
+        start = time.time()
+        last_active = start
+        prev = None
+        while not done.wait(poll):
+            now = time.time()
+            reason = None
+            # MAX 是绝对上限：无条件先判，**即使仍在产出**也要兜底（防真卡死/失控长任务）
+            if mx > 0 and now - start >= mx:
+                reason = f"总时长 {int(now - start)}s(>{mx}s) 超上限"
+            else:
+                fp = _activity_fingerprint(port, pwd, sid)
+                if fp is not None and fp != prev:
+                    prev, last_active = fp, now       # 仍在产出：刷新活跃时刻，不空闲超时
+                    continue
+                if idle > 0 and now - last_active >= idle:
+                    reason = f"空闲 {int(now - last_active)}s(>{idle}s) 无活动"
+            if reason:
+                aborted[0] = True
+                log(f"brain: session {sid[:12]} {reason}，abort")
+                try:
+                    _serve_request("POST", port, pwd, f"/session/{sid}/abort", {}, timeout=6)
+                except Exception as e:
+                    log(f"brain: idle abort 请求失败 {e}")
+                return
+
+    wd = threading.Thread(target=_run, name=f"oc-watchdog-{sid[:8]}", daemon=True)
+    wd.start()
+    return wd
+
+
+# 在跑任务登记（#75 用户取消）：conv_id -> {"sid","port","pwd"}。取消能力据此直接 abort，
+# **不走 brain / 不抢 _conv_lock**，从而解阻塞正卡在 message POST 的 worker 线程。
+_inflight = {}
+_inflight_lock = threading.Lock()
+
+
+def _mark_inflight(conv_id, sid, port, pwd):
+    """登记某 conv 正在跑的会话（POST 前调用）。conv_id/sid 为空则跳过。"""
+    if not conv_id or not sid:
+        return
+    with _inflight_lock:
+        _inflight[conv_id] = {"sid": sid, "port": port, "pwd": pwd}
+
+
+def _clear_inflight(conv_id, sid=None):
+    """清理在跑登记（POST 结束 finally 调用）。指定 sid 时仅当匹配才清，避免误删新一轮。"""
+    if not conv_id:
+        return
+    with _inflight_lock:
+        rec = _inflight.get(conv_id)
+        if rec and (sid is None or rec.get("sid") == sid):
+            _inflight.pop(conv_id, None)
+
+
+def cancel_inflight(conv_id):
+    """供取消能力调用：abort 该 conv 正在跑的会话。返回是否命中在跑任务。"""
+    if not conv_id:
+        return False
+    with _inflight_lock:
+        rec = _inflight.get(conv_id)
+    if not rec:
+        return False
+    sid, port, pwd = rec.get("sid"), rec.get("port"), rec.get("pwd")
+    log(f"brain: 用户取消 conv={conv_id[:12]} sid={str(sid)[:12]}")
+    try:
+        _serve_request("POST", port, pwd, f"/session/{sid}/abort", {}, timeout=6)
+    except Exception as e:
+        log(f"brain: cancel abort 请求失败 {e}")
+    return True
+
+
 def _post_message(port, pwd, sid, prompt, provider, model_id):
     """向 session 发一条 message，拼接 text parts 返回回复文本和统计信息。
 
     返回 (reply_text, usage_dict)，usage_dict 包含 input/output/reasoning/cache tokens。
+
+    活动感知超时（#75）：POST socket 超时放大到 MAX 兜底，外挂 watchdog 轮询 session 活动；
+    只要仍在产出就不 abort。watchdog 触发 abort → 抛 _IdleAbort（上层判 failed，不回退 CLI）。
     """
-    d = _serve_request(
-        "POST", port, pwd, f"/session/{sid}/message",
-        {
-            "model": {"providerID": provider, "modelID": model_id},
-            "system": _SYSTEM_PROMPT,
-            "parts": [{"type": "text", "text": prompt}],
-        },
-        timeout=_OPENCODE_TIMEOUT,
-    ) or {}
+    done = threading.Event()
+    aborted = [False]
+    wd = _start_watchdog(port, pwd, sid, done, aborted)
+    try:
+        d = _serve_request(
+            "POST", port, pwd, f"/session/{sid}/message",
+            {
+                "model": {"providerID": provider, "modelID": model_id},
+                "system": _SYSTEM_PROMPT,
+                "parts": [{"type": "text", "text": prompt}],
+            },
+            timeout=_OPENCODE_SOCK_TIMEOUT,
+        ) or {}
+    finally:
+        done.set()
+        if wd:
+            wd.join(timeout=2)
+    if aborted[0]:
+        raise _IdleAbort(
+            f"session {sid[:12]} aborted (idle>{_OPENCODE_IDLE_TIMEOUT}s / max>{_OPENCODE_MAX_TIMEOUT}s)")
     reply = "".join(
         p.get("text", "") for p in d.get("parts", []) if p.get("type") == "text"
     ).strip()
@@ -636,19 +778,26 @@ def _brain_opencode_http(prompt, ctx=None):
 def _http_oneshot(port, pwd, prompt, ctx):
     """旧语义：建 → 发 → 删，无状态。"""
     provider, model_id = _split_model(_OPENCODE_MODEL)
+    conv_id = (ctx or {}).get("conv_id", "")
     t0 = time.time()
     sid = None
     try:
         sid = _create_session(port, pwd)
         _register_textreply_sid(sid, ctx)
+        _mark_inflight(conv_id, sid, port, pwd)
         reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
         _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
         return reply
+    except _IdleAbort as e:
+        # 活动感知超时 abort：终态失败，向上传播（_brain_opencode 判 failed 不回退 CLI）
+        _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
+        raise
     except Exception as e:
         _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
         log(f"brain opencode http err: {e}")
         return None  # 交给调用方回退 CLI
     finally:
+        _clear_inflight(conv_id, sid)
         _delete_session(port, pwd, sid)
 
 
@@ -663,6 +812,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
             if sid is None:
                 sid = _create_session(port, pwd)
             _register_textreply_sid(sid, ctx)   # 刷新 conv ctx（回程路由用最新来源）
+            _mark_inflight(conv_id, sid, port, pwd)
             try:
                 reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
             except urllib.error.HTTPError as he:
@@ -672,6 +822,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                     _forget_sid(conv_id)
                     sid = _create_session(port, pwd)
                     _register_textreply_sid(sid, ctx)
+                    _mark_inflight(conv_id, sid, port, pwd)
                     reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
                     reused = False  # 重建了，视为新会话
                 else:
@@ -688,6 +839,13 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                          cache_write=usage.get("cache_write", 0))
             _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
             return reply
+        except _IdleAbort as e:
+            # 活动感知超时 abort：会话已被 abort，丢记录 + 删远端，向上传播（不回退 CLI）
+            _forget_sid(conv_id)
+            _delete_session(port, pwd, sid)
+            _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
+            log(f"brain: 活动感知超时 abort conv={conv_id[:12]}")
+            raise
         except Exception as e:
             # 失败别把坏 sid 留在表里，避免后续消息一直命中坏会话
             _forget_sid(conv_id)
@@ -695,6 +853,8 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
             _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
             log(f"brain opencode http err: {e}")
             return None  # 交给调用方回退 CLI
+        finally:
+            _clear_inflight(conv_id)
 
 
 def _brain_opencode_cli(prompt):
