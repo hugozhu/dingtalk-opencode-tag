@@ -25,6 +25,7 @@ from core.builtin_caps import aggregation   # noqa: F401  群消息聚合（默�
 # 顺序不影响分发（分发按 Capability.priority），只影响注册日志顺序。
 # 钉钉强耦合能力留 custom（FDE 定制）：
 from custom.capabilities import trace       # noqa: F401  入站埋点：记 msgId/kind 到 monitor.log
+from custom.capabilities import cancel       # noqa: F401  用户主动取消长程任务（#75）
 from custom.capabilities import ack         # noqa: F401  回执：已读+状态表情（默认开）
 from custom.capabilities import forward     # noqa: F401  合并转发（chatRecord）
 from custom.capabilities import image       # noqa: F401  图片识别（vision 兜底）
@@ -32,4 +33,4 @@ from custom.capabilities import file        # noqa: F401  文档/文件处理（
 from custom.capabilities import stats       # noqa: F401  会话统计查询（/stats 命令）
 from custom.capabilities import startup_report  # noqa: F401  服务启动报告
 
-__all__ = ["trace", "ack", "text_reply", "forward", "image", "file", "question", "permission", "aggregation", "stats", "startup_report"]
+__all__ = ["trace", "cancel", "ack", "text_reply", "forward", "image", "file", "question", "permission", "aggregation", "stats", "startup_report"]

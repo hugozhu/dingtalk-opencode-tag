@@ -79,6 +79,14 @@ export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-
 # CAP_PERMISSION_TIMEOUT 默认 60s 未回自动拒绝）。空=不启用（serve 默认全放行）。示例：
 #   export AGENT_OPENCODE_PERMISSION='[{"permission":"bash","pattern":"*","action":"ask"}]'
 export AGENT_OPENCODE_PERMISSION="${AGENT_OPENCODE_PERMISSION:-}"
+# 长程任务超时（#75）：活动感知，不再一刀切墙钟硬超时。只要 session 仍在产出就不主动超时，
+# 直到完成 / 空闲卡死 / 超绝对上限 / 用户取消（发「取消/停止/stop//cancel」）。
+export AGENT_OPENCODE_IDLE_TIMEOUT="${AGENT_OPENCODE_IDLE_TIMEOUT:-300}"    # 无活动多少秒判卡死并 abort
+export AGENT_OPENCODE_MAX_TIMEOUT="${AGENT_OPENCODE_MAX_TIMEOUT:-3600}"     # 绝对上限硬超时兜底（0=不设上限）
+export AGENT_OPENCODE_ACTIVITY_POLL="${AGENT_OPENCODE_ACTIVITY_POLL:-15}"   # 活动探测间隔秒
+# 兼容：旧 AGENT_OPENCODE_TIMEOUT 若显式设置，会作为 AGENT_OPENCODE_IDLE_TIMEOUT 的默认值。
+# 用户取消关键词（整句匹配 → abort 当前会话正在跑的任务），逗号分隔：
+export AGENT_CANCEL_KEYWORDS="${AGENT_CANCEL_KEYWORDS:-/cancel,取消,停止,stop}"
 # 会话连续性（#56）：同一会话复用 serve session，带多轮上下文记忆。
 # 开（默认）=同一 conv 复用 session：TTL 闲置过期 / LRU 逐出 / 用户发重置关键词断上下文。
 # 设 AGENT_SESSION_REUSE=0（或空）回退旧的无状态语义（每条消息新建 session 即删，无记忆）。
@@ -119,6 +127,7 @@ export AGENT_SELF_NAMES="${AGENT_SELF_NAMES:-数字员工,Claude Code}"
 # 每个能力一个 CAP_<NAME>_ENABLED 开关。1/true/yes/on=开，0/false/no/off=关；
 # 不设则用能力自带默认。关掉的能力压根不注册、不参与分发。
 export CAP_TEXT_REPLY_ENABLED="${CAP_TEXT_REPLY_ENABLED:-1}"   # 普通文本回复（brain→replier）
+export CAP_CANCEL_ENABLED="${CAP_CANCEL_ENABLED:-1}"          # 用户主动取消长程任务（#75）
 export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（chatRecord 聊天记录）
 # 合并转发检测正则（匹配 content 摘要特征）。DingTalk 合并转发 content 形如
 # "群聊的聊天记录\n..."；默认匹配"聊天记录"。命中后 list-by-ids 反查 forwardMessages 二次确认。
@@ -169,12 +178,19 @@ export ACK_MARK_READ="${ACK_MARK_READ:-1}"
 # 默认文案用纯文字：实测含 emoji/特殊标点的文案（🈺、（约 5 分钟）…）会被 create-text-emotion
 # 拒（"暂不支持保存该文字表情"），纯文字稳定可存。改文案后建议先手测 create-text-emotion 能存。
 # 注：从 5s 改为 1s，避免快速响应时状态滞后于实际回复（#62）
-export ACK_STAGES="${ACK_STAGES:-0:稍等:收到|1:稍等:处理中|300:咖啡:处理中}"
+export ACK_STAGES="${ACK_STAGES:-0:稍等:收到|1:稍等:处理中}"
 export ACK_DONE="${ACK_DONE:-OK:完成}"          # 完成（表情名:文字）
 export ACK_ERROR="${ACK_ERROR:-疑问:未完成}"      # 失败（表情名:文字）
+# 周期进度心跳（长任务，#75）：每隔 N 秒若仍在处理 → 原地更新消息上的文字表情（带已耗时分钟）
+# + 另发一条独立进度消息到来源会话。配合活动感知超时，长任务用户能周期看到"还在干活"。
+export ACK_PROGRESS_INTERVAL="${ACK_PROGRESS_INTERVAL:-300}"   # 心跳间隔秒（默认 5min；0=关闭）
+export ACK_PROGRESS_MESSAGE="${ACK_PROGRESS_MESSAGE:-1}"       # 是否额外发独立进度消息（0=只更新表情）
+export ACK_PROGRESS_EMOJI="${ACK_PROGRESS_EMOJI:-咖啡}"        # 心跳阶段的表情名
+export ACK_PROGRESS_EMOJI_TEXT="${ACK_PROGRESS_EMOJI_TEXT:-处理中{mins}分钟}"   # 表情文字（{mins}=已耗时分钟）
+export ACK_PROGRESS_MSG="${ACK_PROGRESS_MSG:-⏳ 仍在处理中，已耗时约 {mins} 分钟，请稍候…}"  # 进度消息模板
 # 等"回复已发出"信号的上限秒数（brain 慢 / 空回复不发送时兜底收尾）。留空=自动取
-# max(180, 最后阶段delay + 300)，保证时间线走完后仍留足冗余。
-# export ACK_DONE_TIMEOUT="600"
+# max(180, 最后阶段delay + 300, AGENT_OPENCODE_MAX_TIMEOUT + 300)，覆盖长任务全程再留冗余。
+# export ACK_DONE_TIMEOUT="4200"
 
 
 # --- 调试 ---

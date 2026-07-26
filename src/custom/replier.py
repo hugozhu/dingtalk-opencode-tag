@@ -92,5 +92,23 @@ def _run(cmd, mode):
 # 注入钉钉实现，让能力经 core.replier.send_reply 统一发送。
 register_replier(_dingtalk_send)
 
+
+def send_notice(conv_id, conv_type, text, *, at_user_id=None):
+    """发一条通知/进度消息，**不广播 reply-sent**（不触发 ack 收尾）。best-effort。
+
+    与 send_reply 的区别：send_reply 发完会 dispatch_reply_sent，驱动 ack 切换完成/失败终态；
+    进度/心跳消息若走 send_reply 会被 ack 误判为「回复已发出」而提前收尾。故单开此口——
+    直接调平台发送实现，只发不广播。用途：长任务每 N 分钟的进度心跳（见 ack 能力）。
+    """
+    text = (text or "").strip()
+    if not text or not conv_id:
+        return False
+    try:
+        return bool(_dingtalk_send(conv_id, conv_type, text, at_user_id=at_user_id))
+    except Exception as e:
+        log(f"send_notice err: {e}")
+        return False
+
+
 # 向后兼容：仍暴露 send_reply（= core 版），旧代码/测试 `from custom.replier import send_reply` 不破。
 from core.replier import send_reply  # noqa: E402,F401
