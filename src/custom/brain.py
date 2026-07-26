@@ -54,6 +54,11 @@ _OPENCODE_ACTIVITY_POLL = int(os.environ.get("AGENT_OPENCODE_ACTIVITY_POLL", "15
 _OPENCODE_SOCK_TIMEOUT = _OPENCODE_MAX_TIMEOUT or None   # 0 → None（阻塞到 watchdog/abort）
 # CLI 回退硬超时（serve 挂时的兜底路径，长程主要走 HTTP）
 _OPENCODE_TIMEOUT = _OPENCODE_MAX_TIMEOUT or None
+# 会话中毒自愈（后端 stream-error 会让复用 session 回空/终态坏回合，卡住后续所有轮）：
+#   AGENT_OPENCODE_EMPTY_RETRY  复用会话回空 → 丢弃 sid 并新建重试一次（默认开）
+#   AGENT_OPENCODE_ERROR_ABORT  助手消息 completed-with-error/空 → watchdog 立即 abort，不等 idle（默认开）
+_OPENCODE_EMPTY_RETRY = os.environ.get("AGENT_OPENCODE_EMPTY_RETRY", "1") in ("1", "true", "yes", "on")
+_OPENCODE_ERROR_ABORT = os.environ.get("AGENT_OPENCODE_ERROR_ABORT", "1") in ("1", "true", "yes", "on")
 
 # 会话连续性（#56）：同一 conv_id 复用同一个 serve session，多轮历史由 serve 自带。
 #   AGENT_SESSION_REUSE   缺省开启（项目默认）；设 0 或空串回退旧的无状态语义（每条消息新建即删）。
@@ -668,6 +673,33 @@ def _activity_fingerprint(port, pwd, sid):
     return (len(msgs), len(parts), textlen, updated)
 
 
+def _message_errored(port, pwd, sid):
+    """探测最后一条 assistant 消息是否"终态但不可用"——用于快速判定会话中毒。
+
+    True 的两种情形：
+      - info.error 为真（后端显式记了 stream-error 等）；
+      - info.time.completed 已置（回合已结束）且拼接的 text parts 为空（模型没产出文本）。
+    进行中的消息（completed 未置）恒返回 False，不误杀正在流式产出的回合。
+    GET 失败返回 False（偏保活，同 _activity_fingerprint 返回 None 的哲学）。
+    """
+    try:
+        msgs = _serve_request("GET", port, pwd, f"/session/{sid}/message", timeout=6)
+    except Exception:
+        return False
+    if not isinstance(msgs, list) or not msgs:
+        return False
+    last = msgs[-1] or {}
+    info = last.get("info", {}) or {}
+    if info.get("error"):
+        return True
+    completed = (info.get("time", {}) or {}).get("completed")
+    if not completed:
+        return False
+    parts = last.get("parts", []) or []
+    textlen = sum(len(p.get("text", "")) for p in parts if isinstance(p, dict))
+    return textlen == 0
+
+
 def _start_watchdog(port, pwd, sid, done, aborted):
     """启动活动感知 watchdog 线程（#75）。返回线程或 None（关闭时）。
 
@@ -694,7 +726,10 @@ def _start_watchdog(port, pwd, sid, done, aborted):
                 if fp is not None and fp != prev:
                     prev, last_active = fp, now       # 仍在产出：刷新活跃时刻，不空闲超时
                     continue
-                if idle > 0 and now - last_active >= idle:
+                # 活动已停：若回合终态但坏（error/completed-空），立即 abort，不干等满 idle
+                if _OPENCODE_ERROR_ABORT and _message_errored(port, pwd, sid):
+                    reason = "助手消息 completed-with-error/空"
+                elif idle > 0 and now - last_active >= idle:
                     reason = f"空闲 {int(now - last_active)}s(>{idle}s) 无活动"
             if reason:
                 aborted[0] = True
@@ -889,6 +924,17 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                     reused = False  # 重建了，视为新会话
                 else:
                     raise
+            # 会话中毒自愈：复用的 session 回空（多半后端 stream-error 把回合 completed 成空），
+            # 丢弃 sid + 删远端，新建一次重试——既清毒又让当前这条消息答上（仿 404 rebuild-once）。
+            if _OPENCODE_EMPTY_RETRY and reused and not reply:
+                log(f"brain: 复用 session {sid[:12]} 回空(疑似 stream-error)，丢弃并新建重试 conv={conv_id[:12]}")
+                _forget_sid(conv_id)
+                _delete_session(port, pwd, sid)
+                sid = _create_session(port, pwd)
+                _register_textreply_sid(sid, ctx)
+                _mark_inflight(conv_id, sid, port, pwd)
+                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                reused = False  # 重建了，按新会话登记（下面 is_new=True）
             # 成功：登记/刷新 last，处理 LRU 逐出（删被挤掉会话的远端 session）
             for _cid, _sid in _remember_sid(conv_id, sid, is_new=(not reused)):
                 _delete_session(port, pwd, _sid)

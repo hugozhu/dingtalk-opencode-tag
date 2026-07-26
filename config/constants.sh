@@ -84,6 +84,9 @@ export AGENT_OPENCODE_PERMISSION="${AGENT_OPENCODE_PERMISSION:-}"
 export AGENT_OPENCODE_IDLE_TIMEOUT="${AGENT_OPENCODE_IDLE_TIMEOUT:-300}"    # 无活动多少秒判卡死并 abort
 export AGENT_OPENCODE_MAX_TIMEOUT="${AGENT_OPENCODE_MAX_TIMEOUT:-3600}"     # 绝对上限硬超时兜底（0=不设上限）
 export AGENT_OPENCODE_ACTIVITY_POLL="${AGENT_OPENCODE_ACTIVITY_POLL:-15}"   # 活动探测间隔秒
+# 会话中毒自愈：后端 stream-error 会让复用 session 回空/终态坏回合，卡住后续所有轮。
+export AGENT_OPENCODE_EMPTY_RETRY="${AGENT_OPENCODE_EMPTY_RETRY:-1}"   # 复用会话回空 → 丢弃并新建重试一次
+export AGENT_OPENCODE_ERROR_ABORT="${AGENT_OPENCODE_ERROR_ABORT:-1}"   # 助手消息 completed-with-error/空 → 立即 abort，不等 idle 超时
 # 兼容：旧 AGENT_OPENCODE_TIMEOUT 若显式设置，会作为 AGENT_OPENCODE_IDLE_TIMEOUT 的默认值。
 # 用户取消关键词（整句匹配 → abort 当前会话正在跑的任务），逗号分隔：
 export AGENT_CANCEL_KEYWORDS="${AGENT_CANCEL_KEYWORDS:-/cancel,取消,停止,stop}"
