@@ -125,6 +125,11 @@ export CAP_STARTUP_REPORT_ENABLED="${CAP_STARTUP_REPORT_ENABLED:-1}"
 export OPENCODE_SERVE_PORT="${OPENCODE_SERVE_PORT:-4096}"
 # 回复模式: log(默认,只记日志不真发) | bot(机器人 send-by-bot) | user(当前用户 send)
 export AGENT_REPLY_MODE="${AGENT_REPLY_MODE:-log}"
+# 回复总长度上限（字符，外层 backstop 防跑飞刷屏），默认 12000。超出才截断加「…（已截断）」。
+export AGENT_MAX_REPLY_CHARS="${AGENT_MAX_REPLY_CHARS:-12000}"
+# 单条钉钉消息分片上限（字符），默认 3500。长回复按段落/换行拆成多条「（i/n）」顺序发出，
+# 不丢内容也不撑爆钉钉服务端单消息上限（~20000 字节）。设很大可实质关闭分片。
+export AGENT_REPLY_CHUNK_CHARS="${AGENT_REPLY_CHUNK_CHARS:-3500}"
 # 防回环：数字员工自己的发送名（逗号分隔），过滤掉避免自问自答。
 # ⚠️ user 模式：回复以你本人身份发出，必须把你的真实显示名加进来（如 hugozhu）。
 export AGENT_SELF_NAMES="${AGENT_SELF_NAMES:-数字员工,Claude Code}"
