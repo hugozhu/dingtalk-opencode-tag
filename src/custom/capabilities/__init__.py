@@ -31,6 +31,7 @@ from custom.capabilities import forward     # noqa: F401  合并转发（chatRec
 from custom.capabilities import image       # noqa: F401  图片识别（vision 兜底）
 from custom.capabilities import file        # noqa: F401  文档/文件处理（受控下载+注入）
 from custom.capabilities import stats       # noqa: F401  会话统计查询（/stats 命令）
+from custom.capabilities import task_stats  # noqa: F401  任务完成后推送本次统计（#76，默认关）
 from custom.capabilities import startup_report  # noqa: F401  服务启动报告
 
-__all__ = ["trace", "cancel", "ack", "text_reply", "forward", "image", "file", "question", "permission", "aggregation", "stats", "startup_report"]
+__all__ = ["trace", "cancel", "ack", "text_reply", "forward", "image", "file", "question", "permission", "aggregation", "stats", "task_stats", "startup_report"]
