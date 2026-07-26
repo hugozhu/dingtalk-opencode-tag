@@ -441,6 +441,60 @@ def _send_session_summary(conv_id, conv_type, trigger="reset"):
         log(f"brain: 发送统计摘要失败: {e}")
 
 
+# ---------------------------------------------------------------------------
+# 单次任务统计（#76）：每次任务成功产出后暂存本次 delta，供 task_stats 能力在「回复已发出」
+# 后推送（用 send_notice 不广播，避免误触发 ack 收尾，且顺序在回复之后）。与 #63 会话摘要
+# （累计、会话结束触发）互补：这里是**单次交互**的耗时/规模/缓存命中。
+# ---------------------------------------------------------------------------
+_last_task_stats = {}                    # conv_id -> {"usage": dict, "elapsed": float}
+_last_task_stats_lock = threading.Lock()
+_TASK_STATS_MAX = 256
+
+
+def _stash_task_stats(conv_id, usage, elapsed):
+    """暂存某 conv 最近一次任务的统计（成功产出后调用）。有界，防泄漏。"""
+    if not conv_id:
+        return
+    with _last_task_stats_lock:
+        _last_task_stats[conv_id] = {"usage": dict(usage or {}), "elapsed": elapsed}
+        while len(_last_task_stats) > _TASK_STATS_MAX:
+            _last_task_stats.pop(next(iter(_last_task_stats)))
+
+
+def pop_task_stats(conv_id):
+    """取出并清除某 conv 最近一次任务统计（无则 None）。供 task_stats 能力调用。"""
+    if not conv_id:
+        return None
+    with _last_task_stats_lock:
+        return _last_task_stats.pop(conv_id, None)
+
+
+def format_task_stats(rec):
+    """格式化单次任务统计消息（本次 delta + 缓存命中率）。rec={"usage","elapsed"}。无有效数据返回 None。"""
+    if not rec:
+        return None
+    usage = rec.get("usage", {}) or {}
+    elapsed = rec.get("elapsed", 0) or 0
+    it = usage.get("input_tokens", 0) or 0
+    ot = usage.get("output_tokens", 0) or 0
+    rt = usage.get("reasoning_tokens", 0) or 0
+    cr = usage.get("cache_read", 0) or 0
+    tool_calls = usage.get("tool_calls", 0) or 0
+
+    lines = ["📊 **本次任务统计**", ""]
+    lines.append(f"- ⏱️ **耗时:** {elapsed:.1f}s")
+    if tool_calls > 0:
+        lines.append(f"- 🔧 **工具调用:** {tool_calls}")
+    lines.append(f"- 💬 **Tokens:** 输入 {_format_tokens(it)}↑ / 输出 {_format_tokens(ot)}↓")
+    if rt > 0:
+        lines.append(f"- 🧠 **推理:** {_format_tokens(rt)}")
+    if cr > 0:
+        total_in = it + cr
+        hit_rate = (cr / total_in * 100) if total_in > 0 else 0
+        lines.append(f"- 🔄 **缓存命中:** {hit_rate:.1f}%（{_format_tokens(cr)}/{_format_tokens(total_in)}）")
+    return "\n".join(lines)
+
+
 def _reset_sessions():
     """清空复用表（测试用）。"""
     with _conv_meta_lock:
@@ -741,12 +795,18 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
 
     # 优先使用 info.tokens（实际响应格式），然后 fallback
     cache = info_tokens.get("cache") or tokens.get("cache", {}) or {}
+    # 工具调用轮次（#76）：本条消息里 type 以 "tool" 开头的 part 数，best-effort（schema 不含则 0）
+    tool_calls = sum(
+        1 for p in d.get("parts", [])
+        if isinstance(p, dict) and str(p.get("type", "")).startswith("tool")
+    )
     return reply, {
         "input_tokens": info_tokens.get("input") or tokens.get("input") or usage.get("inputTokens", 0),
         "output_tokens": info_tokens.get("output") or tokens.get("output") or usage.get("outputTokens", 0),
         "reasoning_tokens": info_tokens.get("reasoning") or tokens.get("reasoning") or usage.get("reasoningTokens", 0),
         "cache_read": cache.get("read") or usage.get("cacheReadTokens", 0),
         "cache_write": cache.get("write") or usage.get("cacheWriteTokens", 0),
+        "tool_calls": tool_calls,
     }
 
 
@@ -787,6 +847,7 @@ def _http_oneshot(port, pwd, prompt, ctx):
         _mark_inflight(conv_id, sid, port, pwd)
         reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
         _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
+        _stash_task_stats(conv_id, usage, time.time() - t0)
         return reply
     except _IdleAbort as e:
         # 活动感知超时 abort：终态失败，向上传播（_brain_opencode 判 failed 不回退 CLI）
@@ -837,6 +898,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                          reasoning_tokens=usage.get("reasoning_tokens", 0),
                          cache_read=usage.get("cache_read", 0),
                          cache_write=usage.get("cache_write", 0))
+            _stash_task_stats(conv_id, usage, time.time() - t0)
             _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
             return reply
         except _IdleAbort as e:

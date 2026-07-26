@@ -108,6 +108,12 @@ export AGENT_SESSION_SUMMARY_TRIGGERS="${AGENT_SESSION_SUMMARY_TRIGGERS:-reset,c
 # 是否仅在单聊中发送（默认 1，群聊不发避免噪音）
 export AGENT_SESSION_SUMMARY_O2O_ONLY="${AGENT_SESSION_SUMMARY_O2O_ONLY:-1}"
 
+# 单次任务统计（#76）：每次任务产出回复后，单独发一条「本次任务统计」（耗时/工具调用/
+# 输入输出 token/缓存命中率）。与上面 #63 会话摘要（累计、会话结束触发）互补——这里是
+# 单次交互 delta、回复发出后即发。默认关（避免每条消息刷一条统计）。
+export CAP_TASK_STATS_ENABLED="${CAP_TASK_STATS_ENABLED:-0}"          # 开启每次任务完成推送统计
+export AGENT_TASK_STATS_O2O_ONLY="${AGENT_TASK_STATS_O2O_ONLY:-1}"   # 仅单聊发（群聊默认不发）
+
 # LLM 不可用/超时/出错时给用户的兜底提示（#59）：避免消息被静默吞掉、ack 永远停在
 # 「处理中」。设为空串关闭兜底（回退旧的静默行为）。模型正常但没话说（empty）仍静默。
 export AGENT_FALLBACK_REPLY="${AGENT_FALLBACK_REPLY:-⚠️ 暂时无法处理你的消息，请稍后再试。}"

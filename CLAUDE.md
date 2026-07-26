@@ -214,6 +214,9 @@ CAP_IMAGE_ENABLED=1                        # Image recognition
 CAP_FILE_ENABLED=1                         # File reading
 CAP_FORWARD_ENABLED=1                      # Merged forward messages
 CAP_ACK_ENABLED=1                          # Read receipts + status reactions
+# Per-task stats push (#76): after each task, send 耗时/tool-calls/tokens/cache-hit
+CAP_TASK_STATS_ENABLED=0                   # Push a "本次任务统计" message per task (off by default)
+AGENT_TASK_STATS_O2O_ONLY=1               # Single-chat only (groups off to avoid noise)
 # ACK long-task progress heartbeat (#75): every N sec, update the message's
 # text-emotion (with elapsed minutes) AND send a standalone progress message.
 ACK_PROGRESS_INTERVAL=300                  # Heartbeat cadence (0=off)
