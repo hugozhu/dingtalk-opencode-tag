@@ -313,6 +313,110 @@ class TestSessionReuse(unittest.TestCase):
         self.assertEqual(reply, "cli")
         self.assertIsNone(brain._lookup_sid("cidA"))
 
+    # --- 会话中毒自愈（复用会话回空 → 丢弃并新建重试一次）---
+
+    def _serve_empty(self, calls, empty_sids, sids=None):
+        """假 serve：命中 empty_sids 的 message 回空 parts（模拟 stream-error 坏回合），其余回文本。"""
+        seq = iter(sids or ["ses_new1", "ses_new2", "ses_new3"])
+
+        def fake(method, port, pwd, path, body=None, timeout=8):
+            calls.append((method, path, body))
+            if method == "POST" and path == "/session":
+                return {"id": next(seq)}
+            if method == "POST" and path.endswith("/message"):
+                sid = path.split("/")[2]
+                if sid in empty_sids:
+                    return {"parts": []}                      # 中毒：空回合
+                return {"parts": [{"type": "text", "text": f"reply@{sid}"}]}
+            return None  # GET（_message_errored/fingerprint）/ DELETE
+        return fake
+
+    def test_reuse_empty_reply_rebuilds_and_answers(self):
+        # 复用会话回空 → 丢弃 ses_old、新建 ses_new1 重试成功答上
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "_OPENCODE_EMPTY_RETRY", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request",
+                          side_effect=self._serve_empty(calls, empty_sids={"ses_old"})):
+            brain._remember_sid("cidA", "ses_old")
+            reply = brain.generate_reply("u", "hi", ctx=self._ctx())
+        self.assertEqual(reply, "reply@ses_new1")
+        self.assertEqual(brain._lookup_sid("cidA"), "ses_new1")   # 换成干净新会话
+        self.assertIn(("DELETE", "/session/ses_old", None), calls)  # 毒会话删了
+
+    def test_reuse_empty_then_empty_returns_empty_but_clean_sid(self):
+        # 两次都空 → 返回空，但留的是干净新 sid（非 ses_old），不死循环
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "_OPENCODE_EMPTY_RETRY", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request",
+                          side_effect=self._serve_empty(calls, empty_sids={"ses_old", "ses_new1"})):
+            brain._remember_sid("cidA", "ses_old")
+            reply = brain.generate_reply("u", "hi", ctx=self._ctx())
+        self.assertEqual(reply, "")                               # 合法空回复的归宿
+        self.assertEqual(brain._lookup_sid("cidA"), "ses_new1")   # 不留毒 sid
+        creates = [c for c in calls if c[0] == "POST" and c[1] == "/session"]
+        self.assertEqual(len(creates), 1)                         # 只重建一次，不死循环
+
+    def test_empty_retry_disabled_keeps_old_behavior(self):
+        # 开关关 → 不重建：回空即返回空，sid 不变
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "_OPENCODE_EMPTY_RETRY", False), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request",
+                          side_effect=self._serve_empty(calls, empty_sids={"ses_old"})):
+            brain._remember_sid("cidA", "ses_old")
+            reply = brain.generate_reply("u", "hi", ctx=self._ctx())
+        self.assertEqual(reply, "")
+        self.assertEqual(brain._lookup_sid("cidA"), "ses_old")    # 未重建
+        self.assertEqual([c for c in calls if c[0] == "POST" and c[1] == "/session"], [])
+
+    def test_fresh_session_empty_does_not_retry(self):
+        # 全新会话回空（reused=False）→ 不重试，只建一次 session
+        calls = []
+        with patch.object(brain, "_BRAIN", "opencode"), \
+             patch.object(brain, "_SESSION_REUSE", True), \
+             patch.object(brain, "_OPENCODE_EMPTY_RETRY", True), \
+             patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
+             patch.object(brain, "_serve_request",
+                          side_effect=self._serve_empty(calls, empty_sids={"ses_new1"})):
+            reply = brain.generate_reply("u", "hi", ctx=self._ctx())   # 无预置 sid
+        self.assertEqual(reply, "")
+        creates = [c for c in calls if c[0] == "POST" and c[1] == "/session"]
+        self.assertEqual(len(creates), 1)                         # 只建一次，没有第二次重试
+
+    def test_message_errored_detection(self):
+        def resp(msgs):
+            return lambda method, port, pwd, path, body=None, timeout=8: msgs
+        # completed + 空 → True
+        with patch.object(brain, "_serve_request",
+                          side_effect=resp([{"info": {"time": {"completed": 123}}, "parts": []}])):
+            self.assertTrue(brain._message_errored(4096, "pw", "s"))
+        # 显式 error 字段 → True（即便有文本）
+        with patch.object(brain, "_serve_request",
+                          side_effect=resp([{"info": {"error": {"name": "stream"}},
+                                             "parts": [{"type": "text", "text": "x"}]}])):
+            self.assertTrue(brain._message_errored(4096, "pw", "s"))
+        # 进行中（无 completed，有文本）→ False
+        with patch.object(brain, "_serve_request",
+                          side_effect=resp([{"info": {"time": {}},
+                                             "parts": [{"type": "text", "text": "partial"}]}])):
+            self.assertFalse(brain._message_errored(4096, "pw", "s"))
+        # completed + 有文本 → False（正常回合）
+        with patch.object(brain, "_serve_request",
+                          side_effect=resp([{"info": {"time": {"completed": 1}},
+                                             "parts": [{"type": "text", "text": "done"}]}])):
+            self.assertFalse(brain._message_errored(4096, "pw", "s"))
+        # GET 失败 → False（偏保活）
+        with patch.object(brain, "_serve_request", side_effect=RuntimeError("boom")):
+            self.assertFalse(brain._message_errored(4096, "pw", "s"))
+
 
 class TestReplierLogMode(unittest.TestCase):
     def test_log_mode_returns_true_without_sending(self):
