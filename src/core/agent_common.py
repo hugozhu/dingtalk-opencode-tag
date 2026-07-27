@@ -124,25 +124,47 @@ _CREDS_CACHE_TTL = float(os.environ.get("AGENT_CREDS_CACHE_TTL", "10"))
 _creds_cache = {}
 _creds_lock = threading.Lock()
 
-# 业务 handler 派发线程池（有界并发）
+# 业务 handler 派发线程池（有界并发，双池隔离）
 # 此前每条消息 threading.Thread().start() 无上限；消息突发 + 每个 handler 阻塞
 # 数十秒（轮询 + post_user_message）会导致线程数无界。用有界池限流。
-_HANDLER_MAX_WORKERS = int(os.environ.get("AGENT_HANDLER_WORKERS", "8"))
-_handler_pool = ThreadPoolExecutor(
-    max_workers=_HANDLER_MAX_WORKERS, thread_name_prefix="handler")
+#
+# 单池的坑（#82）：所有能力（文本/图片/文件/转发/聚合）共用一个 8-worker 池，
+# 而每个 handler 同步阻塞在 opencode POST（最长 AGENT_OPENCODE_MAX_TIMEOUT，默认
+# 3600s）。8 个长任务即可打满整池 → 之后所有会话的消息全部排队饿死（跨会话
+# head-of-line blocking）。拆成两条独立限流的车道，让重活不阻塞轻交互：
+#   - reply 池：交互式文本回复（text_reply），走快车道
+#   - task 池：媒体/文件/合并转发/聚合等较重处理
+# 两池独立配置 worker 数；某一池打满不会拖垮另一池。
+_TASK_MAX_WORKERS = int(os.environ.get("AGENT_HANDLER_WORKERS", "8"))
+_REPLY_MAX_WORKERS = int(os.environ.get("AGENT_REPLY_WORKERS", "4"))
+_task_pool = ThreadPoolExecutor(
+    max_workers=_TASK_MAX_WORKERS, thread_name_prefix="task")
+_reply_pool = ThreadPoolExecutor(
+    max_workers=_REPLY_MAX_WORKERS, thread_name_prefix="reply")
 
 
-def submit_handler(fn, *args, **kwargs):
-    """把业务 handler 提交到有界线程池执行（替代裸 threading.Thread）。
-
-    返回 Future。handler 内部异常会被吞掉并记日志，避免污染池。
-    """
+def _submit(pool, fn, args, kwargs):
+    """把 handler 提交到指定有界池；内部异常吞掉并记日志，避免污染池。"""
     def _wrapped():
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             log(f"handler {getattr(fn, '__name__', fn)} err: {e}")
-    return _handler_pool.submit(_wrapped)
+    return pool.submit(_wrapped)
+
+
+def submit_handler(fn, *args, **kwargs):
+    """把较重的业务 handler 提交到 task 池执行（替代裸 threading.Thread）。
+
+    返回 Future。图片/文件/合并转发/聚合等走这里。交互式文本回复请用
+    submit_reply()，避免长任务饿死轻量对话。
+    """
+    return _submit(_task_pool, fn, args, kwargs)
+
+
+def submit_reply(fn, *args, **kwargs):
+    """把交互式文本回复提交到独立的 reply 池，与 task 池隔离限流（#82）。"""
+    return _submit(_reply_pool, fn, args, kwargs)
 
 
 # ---------------------------------------------------------------------------

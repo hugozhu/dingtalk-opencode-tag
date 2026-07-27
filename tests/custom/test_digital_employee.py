@@ -458,7 +458,7 @@ class TestTextReplyCapability(unittest.TestCase):
 
     def test_normal_message_dispatches(self):
         calls = []
-        with patch.object(text_reply, "submit_handler",
+        with patch.object(text_reply, "submit_reply",
                           side_effect=lambda fn, *a: calls.append(a)):
             consumed = text_reply.on_inbound(self._msg("张三", "你好"))
         self.assertTrue(consumed)
@@ -508,7 +508,7 @@ class TestTextReplyCapability(unittest.TestCase):
     def test_route_reply_shim_still_works(self):
         """兼容垫片 routes.route_reply 仍能派发（走 InboundMessage → 能力）。"""
         calls = []
-        with patch.object(text_reply, "submit_handler",
+        with patch.object(text_reply, "submit_reply",
                           side_effect=lambda fn, *a: calls.append(a)):
             routes.route_reply("张三", "你好", "2", self._msg("张三", "你好").raw_line)
         self.assertEqual(len(calls), 1)

@@ -19,7 +19,7 @@ empty（模型正常但没话说）仍静默，不打扰用户。
 
 import os
 
-from core.agent_common import log, submit_handler
+from core.agent_common import log, submit_reply
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
 from core.brain import generate_reply_ex, is_textreply_session, STATUS_FAILED
@@ -56,8 +56,8 @@ def on_inbound(msg):
     防回环（自己发的）+ msgId 去重由 core dispatch_inbound 依 loop_guard/dedup 声明处理，
     命中的消息压根不会进到这里。
     """
-    submit_handler(_handle_text_reply, msg.user, msg.text, msg.conv_type,
-                   msg.conv_id, msg.msg_id)
+    submit_reply(_handle_text_reply, msg.user, msg.text, msg.conv_type,
+                 msg.conv_id, msg.msg_id)
     return True
 
 
