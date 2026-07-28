@@ -207,5 +207,45 @@ class TestFindSessionWithPredicate(unittest.TestCase):
         self.assertIsNone(agent_common._find_session_with_predicate(predicate=lambda m: True))
 
 
+class TestHandlerPools(unittest.TestCase):
+    """双池隔离限流（#82）：reply 池与 task 池互不阻塞。"""
+
+    def test_reply_and_task_use_distinct_pools(self):
+        self.assertIsNot(agent_common._reply_pool, agent_common._task_pool)
+
+    def test_submit_handler_runs_on_task_pool(self):
+        name = agent_common.submit_handler(
+            lambda: __import__("threading").current_thread().name).result(timeout=5)
+        self.assertTrue(name.startswith("task"), name)
+
+    def test_submit_reply_runs_on_reply_pool(self):
+        name = agent_common.submit_reply(
+            lambda: __import__("threading").current_thread().name).result(timeout=5)
+        self.assertTrue(name.startswith("reply"), name)
+
+    def test_submit_passes_args_and_kwargs(self):
+        f = agent_common.submit_handler(lambda a, b=0: a + b, 2, b=3)
+        self.assertEqual(f.result(timeout=5), 5)
+
+    def test_handler_exception_is_swallowed(self):
+        # 内部异常被吞掉记日志，Future 正常完成（返回 None），不污染池
+        def boom():
+            raise ValueError("boom")
+        f = agent_common.submit_handler(boom)
+        self.assertIsNone(f.result(timeout=5))
+
+    def test_task_pool_saturation_does_not_block_reply_pool(self):
+        import threading
+        release = threading.Event()
+        started = []
+        # 占满 task 池的所有 worker
+        for _ in range(agent_common._TASK_MAX_WORKERS):
+            agent_common.submit_handler(lambda: (started.append(1), release.wait(5)))
+        # reply 池仍应能立即执行
+        got = agent_common.submit_reply(lambda: "ok").result(timeout=5)
+        self.assertEqual(got, "ok")
+        release.set()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

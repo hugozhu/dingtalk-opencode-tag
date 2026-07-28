@@ -96,6 +96,10 @@ export AGENT_CANCEL_KEYWORDS="${AGENT_CANCEL_KEYWORDS:-/cancel,取消,停止,sto
 export AGENT_SESSION_REUSE="${AGENT_SESSION_REUSE:-1}"
 export AGENT_SESSION_TTL="${AGENT_SESSION_TTL:-1800}"          # 闲置多少秒后过期重建（默认 30min）
 export AGENT_SESSION_MAX="${AGENT_SESSION_MAX:-64}"            # 最多保活多少个 conv 的 session（LRU）
+# handler 派发线程池（#82）：拆成两条独立限流车道，避免长任务饿死轻交互。
+# 某一池打满不会拖垮另一池（跨会话 head-of-line blocking 隔离）。
+export AGENT_HANDLER_WORKERS="${AGENT_HANDLER_WORKERS:-8}"     # task 池：图片/文件/合并转发/聚合等较重处理
+export AGENT_REPLY_WORKERS="${AGENT_REPLY_WORKERS:-4}"         # reply 池：交互式文本回复（快车道）
 # 触发断上下文（删旧 session）的整句关键词，逗号分隔
 export AGENT_SESSION_RESET_KEYWORDS="${AGENT_SESSION_RESET_KEYWORDS:-/new,新话题,重新开始,清空上下文}"
 
