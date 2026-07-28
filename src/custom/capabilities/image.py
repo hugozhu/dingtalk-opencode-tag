@@ -19,6 +19,7 @@
 import base64
 import os
 import re
+import shutil
 import tempfile
 
 from core.agent_common import _proxy_vision, _run_cli, find_serve_credentials, log, serve_request, submit_handler
@@ -56,7 +57,10 @@ _IMAGE_PROMPT_FOOTER = os.environ.get(
 
 
 def _download_image(media_id, msg_id, conv_id):
-    """download-media 下载图片到临时文件，返回本地路径或 None。"""
+    """download-media 下载图片到临时文件，返回 (image_path, tmp_dir) 或 (None, None)。
+
+    调用方负责在用完后 shutil.rmtree(tmp_dir)。
+    """
     tmp_dir = tempfile.mkdtemp(prefix="agent_img_")
     rc, _ = _run_cli([
         "chat", "message", "download-media",
@@ -68,11 +72,13 @@ def _download_image(media_id, msg_id, conv_id):
     ], timeout=30)
     if rc != 0:
         log(f"image: 下载失败 rc={rc} mediaId={media_id[:24]}")
-        return None
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None, None
     for name in os.listdir(tmp_dir):
-        return os.path.join(tmp_dir, name)
+        return os.path.join(tmp_dir, name), tmp_dir
     log(f"image: 下载目录为空 mediaId={media_id[:24]}")
-    return None
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return None, None
 
 
 def _split_model(model):
@@ -132,8 +138,8 @@ def _recognize_via_serve(img_bytes, mime="image/png"):
                 pass
 
 
-def _recognize(image_path):
-    """读图片字节 → vision 识别，返回描述文本（失败返回 ""）。用完删临时文件。
+def _recognize(image_path, tmp_dir):
+    """读图片字节 → vision 识别，返回描述文本（失败返回 ""）。用完删临时目录。
 
     优先经 opencode serve 用 AGENT_VISION_MODEL 识别（免外部 proxy）；空则回退
     agent_common._proxy_vision（外部 PROXY_URL）。
@@ -150,10 +156,7 @@ def _recognize(image_path):
         log(f"image: 识别读文件失败 {e}")
         return ""
     finally:
-        try:
-            os.unlink(image_path)
-        except Exception:
-            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def handle_image(user, text, msg_id, conv_id, conv_type):
@@ -165,12 +168,12 @@ def handle_image(user, text, msg_id, conv_id, conv_type):
     media_id = mid_m.group(1)
     caption = _RE_IMAGE_TAG.sub("", text or "").strip()  # 图外的说明文字
 
-    image_path = _download_image(media_id, msg_id, conv_id)
+    image_path, tmp_dir = _download_image(media_id, msg_id, conv_id)
     if not image_path:
         send_reply(conv_id, conv_type, "抱歉，这张图片我没能下载下来，能再发一次吗？")
         return
 
-    desc = _recognize(image_path)
+    desc = _recognize(image_path, tmp_dir)
     if not desc:
         send_reply(conv_id, conv_type,
                    "抱歉，图片内容识别失败了（可能是识别服务不可达）。你可以把关键内容用文字发我。")
