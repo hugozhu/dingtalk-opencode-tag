@@ -243,9 +243,18 @@ def _mark_read(conv_id, msg_id):
 def _emotion_id(emoji, text):
     """按 (表情名, 文字) 拿到 (emotionId, backgroundId)，进程内缓存；首次 create。
 
+    缓存 key 标准化（#82）：进度心跳的动态文字「处理中5分钟」含实例化分钟数，每分钟产生
+    新 key → 无界缓存增长 + 每次 CLI 往返。检测到数字+「分钟」模式时，还原为模板
+    「处理中{mins}分钟」作缓存 key，复用同一 emotionId。
+
     失败返回 (None, None)。
     """
     key = (emoji, text)
+    # 标准化 key：若 text 形如「处理中5分钟」（数字+分钟），还原为模板作缓存 key
+    if emoji == _PROGRESS_EMOJI and re.search(r'\d+\s*分钟', text):
+        normalized_text = re.sub(r'\d+', '{mins}', text)
+        key = (emoji, normalized_text)
+
     with _emotion_lock:
         if key in _emotion_cache:
             return _emotion_cache[key]

@@ -50,7 +50,7 @@ class TestImageRouting(unittest.TestCase):
 
 class TestHandleImage(unittest.TestCase):
     def test_full_pipeline_replies_to_group(self):
-        with patch.object(image, "_download_image", return_value="/tmp/fake.png"), \
+        with patch.object(image, "_download_image", return_value=("/tmp/fake.png", "/tmp/dir")), \
              patch.object(image, "_recognize", return_value="图中是等式 1 + 1 = 2"), \
              patch.object(image, "generate_reply", return_value="这张图是 1+1=2，正确。") as gen, \
              patch.object(image, "send_reply", return_value=True) as snd:
@@ -68,7 +68,7 @@ class TestHandleImage(unittest.TestCase):
         self.assertEqual(snd.call_args[0][2], "这张图是 1+1=2，正确。")
 
     def test_download_failure_notifies(self):
-        with patch.object(image, "_download_image", return_value=None), \
+        with patch.object(image, "_download_image", return_value=(None, None)), \
              patch.object(image, "generate_reply") as gen, \
              patch.object(image, "send_reply") as snd:
             image.handle_image("u", "[图片消息](mediaId=$x)", "m==", "c==", "2")
@@ -77,7 +77,7 @@ class TestHandleImage(unittest.TestCase):
         self.assertIn("下载", snd.call_args[0][2])
 
     def test_recognize_failure_notifies(self):
-        with patch.object(image, "_download_image", return_value="/tmp/f.png"), \
+        with patch.object(image, "_download_image", return_value=("/tmp/f.png", "/tmp/dir")), \
              patch.object(image, "_recognize", return_value=""), \
              patch.object(image, "generate_reply") as gen, \
              patch.object(image, "send_reply") as snd:
@@ -99,28 +99,30 @@ class TestRecognize(unittest.TestCase):
 
     def _tmp_png(self):
         import tempfile
-        fd, path = tempfile.mkstemp(suffix=".png")
-        os.write(fd, b"\x89PNG\r\n\x1a\nfakebytes")
-        os.close(fd)
-        return path
+        tmp_dir = tempfile.mkdtemp(prefix="test_img_")
+        path = os.path.join(tmp_dir, "test.png")
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\nfakebytes")
+        return path, tmp_dir
 
     def test_prefers_serve_over_proxy(self):
-        path = self._tmp_png()
+        path, tmp_dir = self._tmp_png()
         with patch.object(image, "_recognize_via_serve", return_value="serve识别结果") as srv, \
              patch.object(image, "_proxy_vision") as proxy:
-            desc = image._recognize(path)
+            desc = image._recognize(path, tmp_dir)
         self.assertEqual(desc, "serve识别结果")
         srv.assert_called_once()
         proxy.assert_not_called()            # serve 成功 → 不回退
-        self.assertFalse(os.path.exists(path))  # 用完删文件
+        self.assertFalse(os.path.exists(tmp_dir))  # 用完删目录
 
     def test_falls_back_to_proxy_when_serve_empty(self):
-        path = self._tmp_png()
+        path, tmp_dir = self._tmp_png()
         with patch.object(image, "_recognize_via_serve", return_value=""), \
              patch.object(image, "_proxy_vision", return_value="proxy识别结果") as proxy:
-            desc = image._recognize(path)
+            desc = image._recognize(path, tmp_dir)
         self.assertEqual(desc, "proxy识别结果")
         proxy.assert_called_once()
+        self.assertFalse(os.path.exists(tmp_dir))  # 用完删目录
 
     def test_serve_disabled_when_no_model(self):
         with patch.object(image, "_VISION_MODEL", ""):
