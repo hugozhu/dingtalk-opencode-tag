@@ -243,33 +243,87 @@ class TestAddRemove(unittest.TestCase):
 
 
 class TestSetStatus(unittest.TestCase):
-    def test_add_swap_remove(self):
+    def test_add_update_remove(self):
+        """首次 add；升级走原地 update（不 remove+add）；清除走 remove（#85）。"""
         rec = ack._Pending("c==", "1", "m==")
         with patch.object(ack, "_add_text_emotion") as add, \
-             patch.object(ack, "_remove_text_emotion") as rm:
-            ack._set_status(rec, ("稍等", "已收到"))
+             patch.object(ack, "_remove_text_emotion") as rm, \
+             patch.object(ack, "_update_text_emotion", return_value=True) as upd:
+            ack._set_status(rec, ("稍等", "已收到"))       # 首次贴 → add
             add.assert_called_once_with("c==", "m==", "稍等", "已收到")
             rm.assert_not_called()
+            upd.assert_not_called()
             self.assertEqual(rec.cur, ("稍等", "已收到"))
 
             add.reset_mock()
-            ack._set_status(rec, ("咖啡", "还在处理"))   # 升级
-            rm.assert_called_once_with("c==", "m==", "稍等", "已收到")
-            add.assert_called_once_with("c==", "m==", "咖啡", "还在处理")
+            ack._set_status(rec, ("咖啡", "还在处理"))       # 升级 → update 一次
+            upd.assert_called_once_with("c==", "m==", ("稍等", "已收到"), ("咖啡", "还在处理"))
+            add.assert_not_called()
+            rm.assert_not_called()
+            self.assertEqual(rec.cur, ("咖啡", "还在处理"))
 
-            add.reset_mock(); rm.reset_mock()
-            ack._set_status(rec, None)                    # 收尾只移除
+            upd.reset_mock()
+            ack._set_status(rec, None)                    # 清除 → remove
             rm.assert_called_once_with("c==", "m==", "咖啡", "还在处理")
             add.assert_not_called()
+            upd.assert_not_called()
             self.assertIsNone(rec.cur)
+
+    def test_upgrade_falls_back_to_remove_add(self):
+        """update 失败时兜底回退 remove 旧 + add 新（#85）。"""
+        rec = ack._Pending("c==", "1", "m==")
+        rec.cur = ("稍等", "已收到")
+        with patch.object(ack, "_add_text_emotion") as add, \
+             patch.object(ack, "_remove_text_emotion") as rm, \
+             patch.object(ack, "_update_text_emotion", return_value=False) as upd:
+            ack._set_status(rec, ("咖啡", "还在处理"))
+            upd.assert_called_once()
+            rm.assert_called_once_with("c==", "m==", "稍等", "已收到")
+            add.assert_called_once_with("c==", "m==", "咖啡", "还在处理")
+            self.assertEqual(rec.cur, ("咖啡", "还在处理"))
 
     def test_same_status_noop(self):
         rec = ack._Pending("c==", "1", "m==")
         rec.cur = ("稍等", "处理中")
         with patch.object(ack, "_add_text_emotion") as add, \
-             patch.object(ack, "_remove_text_emotion") as rm:
+             patch.object(ack, "_remove_text_emotion") as rm, \
+             patch.object(ack, "_update_text_emotion") as upd:
             ack._set_status(rec, ("稍等", "处理中"))
-            add.assert_not_called(); rm.assert_not_called()
+            add.assert_not_called(); rm.assert_not_called(); upd.assert_not_called()
+
+
+class TestUpdateTextEmotion(unittest.TestCase):
+    def test_update_resolves_ids_and_passes_args(self):
+        seen = {}
+        def fake_cli(args, timeout=15):
+            seen["args"] = args
+            return 0, "{}"
+        # old→emotionId "10"（复用 backgroundId 无关），new→("42","im_bg_3")
+        ids = {("稍等", "处理中"): ("10", "im_bg_1"),
+               ("咖啡", "更新"): ("42", "im_bg_3")}
+        with patch.object(ack, "_emotion_id", lambda e, t: ids[(e, t)]), \
+             patch.object(ack, "_run_cli", fake_cli):
+            self.assertTrue(
+                ack._update_text_emotion("c==", "m==", ("稍等", "处理中"), ("咖啡", "更新")))
+        a = seen["args"]
+        self.assertIn("update-text-emotion", a)
+        for tok in ("--old-emotion-id", "10", "--emotion-id", "42",
+                    "--emotion-name", "咖啡", "--text", "更新",
+                    "--background-id", "im_bg_3", "--msg-id", "m=="):
+            self.assertIn(tok, a)
+
+    def test_update_skips_when_id_unresolved(self):
+        with patch.object(ack, "_emotion_id", lambda e, t: (None, None)), \
+             patch.object(ack, "_run_cli") as cli:
+            self.assertFalse(
+                ack._update_text_emotion("c==", "m==", ("x", "y"), ("a", "b")))
+            cli.assert_not_called()
+
+    def test_update_returns_false_on_cli_error(self):
+        with patch.object(ack, "_emotion_id", lambda e, t: ("1", "bg")), \
+             patch.object(ack, "_run_cli", lambda a, timeout=15: (1, "boom")):
+            self.assertFalse(
+                ack._update_text_emotion("c==", "m==", ("x", "y"), ("a", "b")))
 
 
 class TestProcessingAndFinalize(unittest.TestCase):
@@ -294,27 +348,30 @@ class TestProcessingAndFinalize(unittest.TestCase):
     def test_finalize_ok(self):
         rec = ack._Pending("c==", "1", "m=="); rec.cur = ("稍等", "处理中")
         with patch.object(ack, "_DONE", ("OK", "完成")), \
+             patch.object(ack, "_update_text_emotion", return_value=True) as upd, \
              patch.object(ack, "_remove_text_emotion") as rm, \
              patch.object(ack, "_add_text_emotion") as add:
             ack._finalize(rec, True)
-            rm.assert_called_once_with("c==", "m==", "稍等", "处理中")
-            add.assert_called_once_with("c==", "m==", "OK", "完成")
+            upd.assert_called_once_with("c==", "m==", ("稍等", "处理中"), ("OK", "完成"))
+            rm.assert_not_called(); add.assert_not_called()
 
     def test_finalize_error(self):
         rec = ack._Pending("c==", "1", "m=="); rec.cur = ("稍等", "处理中")
         with patch.object(ack, "_ERROR", ("疑问", "失败")), \
+             patch.object(ack, "_update_text_emotion", return_value=True) as upd, \
              patch.object(ack, "_remove_text_emotion") as rm, \
              patch.object(ack, "_add_text_emotion") as add:
             ack._finalize(rec, False)
-            add.assert_called_once_with("c==", "m==", "疑问", "失败")
+            upd.assert_called_once_with("c==", "m==", ("稍等", "处理中"), ("疑问", "失败"))
 
     def test_finalize_none_only_removes(self):
         rec = ack._Pending("c==", "1", "m=="); rec.cur = ("咖啡", "还在处理")
         with patch.object(ack, "_remove_text_emotion") as rm, \
+             patch.object(ack, "_update_text_emotion") as upd, \
              patch.object(ack, "_add_text_emotion") as add:
             ack._finalize(rec, None)
             rm.assert_called_once_with("c==", "m==", "咖啡", "还在处理")
-            add.assert_not_called()
+            add.assert_not_called(); upd.assert_not_called()
 
 
 class TestLifecycleWorker(unittest.TestCase):
@@ -331,24 +388,38 @@ class TestLifecycleWorker(unittest.TestCase):
             "_mark_read": lambda *a: calls.append(("read",) + a),
             "_add_text_emotion": lambda *a: calls.append(("add",) + a),
             "_remove_text_emotion": lambda *a: calls.append(("rm",) + a),
+            # 原地更新：记录 ("upd", conv, msg, old, new)，返回 True（成功=不回退）
+            "_update_text_emotion": lambda c, m, old, new: (calls.append(("upd", c, m, old, new)) or True),
         }
+
+    @staticmethod
+    def _shown(calls):
+        """按时间顺序还原「消息上显示过的 (表情,文字)」：首次 add 的参数，或每次 upd 的新状态。"""
+        out = []
+        for c in calls:
+            if c[0] == "add":
+                out.append((c[3], c[4]))
+            elif c[0] == "upd":
+                out.append(c[4])
+        return out
 
     def test_escalates_then_done(self):
         calls, m = self._record()
         with patch.object(ack, "_mark_read", m["_mark_read"]), \
              patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
              patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_update_text_emotion", m["_update_text_emotion"]), \
              patch.object(ack, "_STAGES", [(0.0, "收到", "t0"), (0.05, "稍等", "t1"), (0.1, "咖啡", "t2")]), \
              patch.object(ack, "_DONE_TIMEOUT", 5), patch.object(ack, "_DONE", ("OK", "done")):
             ack._begin(_msg(conv_id="cE==", msg_id="mE=="))
             time.sleep(0.25)
             ack.on_reply_sent("cE==", "1", True)
             self.assertTrue(_wait_gone("cE=="))
-        added = [(c[3], c[4]) for c in calls if c[0] == "add"]
-        self.assertEqual(added[0], ("收到", "t0"))
-        self.assertIn(("稍等", "t1"), added)
-        self.assertIn(("咖啡", "t2"), added)
-        self.assertEqual(added[-1], ("OK", "done"))
+        shown = self._shown(calls)
+        self.assertEqual(shown[0], ("收到", "t0"))       # 首贴 add
+        self.assertIn(("稍等", "t1"), shown)              # 升级走 upd
+        self.assertIn(("咖啡", "t2"), shown)
+        self.assertEqual(shown[-1], ("OK", "done"))       # 收尾走 upd
         self.assertIn(("read", "cE==", "mE=="), calls)
 
     def test_reply_before_escalation_skips(self):
@@ -356,29 +427,31 @@ class TestLifecycleWorker(unittest.TestCase):
         with patch.object(ack, "_mark_read", m["_mark_read"]), \
              patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
              patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_update_text_emotion", m["_update_text_emotion"]), \
              patch.object(ack, "_STAGES", [(0.0, "收到", "t0"), (5.0, "稍等", "t1")]), \
              patch.object(ack, "_DONE_TIMEOUT", 30), patch.object(ack, "_DONE", ("OK", "done")):
             ack._begin(_msg(conv_id="cF==", msg_id="mF=="))
             time.sleep(0.05)
             ack.on_reply_sent("cF==", "1", True)
             self.assertTrue(_wait_gone("cF=="))
-        added = [(c[3], c[4]) for c in calls if c[0] == "add"]
-        self.assertNotIn(("稍等", "t1"), added)
-        self.assertEqual(added[-1], ("OK", "done"))
+        shown = self._shown(calls)
+        self.assertNotIn(("稍等", "t1"), shown)
+        self.assertEqual(shown[-1], ("OK", "done"))
 
     def test_timeout_only_removes(self):
         calls, m = self._record()
         with patch.object(ack, "_mark_read", m["_mark_read"]), \
              patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
              patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_update_text_emotion", m["_update_text_emotion"]), \
              patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
              patch.object(ack, "_DONE_TIMEOUT", 0.05):
             ack._begin(_msg(conv_id="cT==", msg_id="mT=="))
             self.assertTrue(_wait_gone("cT=="))
-        added = [(c[3], c[4]) for c in calls if c[0] == "add"]
+        shown = self._shown(calls)
         rms = [c for c in calls if c[0] == "rm"]
-        self.assertEqual(added, [("收到", "t0")])
-        self.assertEqual(len(rms), 1)
+        self.assertEqual(shown, [("收到", "t0")])     # 只贴过首个，无升级
+        self.assertEqual(len(rms), 1)                   # 超时收尾仅移除
 
     def test_best_effort_no_raise(self):
         def boom(*a):
@@ -386,6 +459,7 @@ class TestLifecycleWorker(unittest.TestCase):
         rec = ack._Pending("c==", "1", "m==")
         with patch.object(ack, "_add_text_emotion", boom), patch.object(ack, "_mark_read", boom), \
              patch.object(ack, "_remove_text_emotion", boom), \
+             patch.object(ack, "_update_text_emotion", boom), \
              patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
              patch.object(ack, "_DONE_TIMEOUT", 0.01):
             ack._ack_worker(rec)  # 不应抛
@@ -405,7 +479,15 @@ class TestProgressHeartbeat(unittest.TestCase):
             "_mark_read": lambda *a: calls.append(("read",) + a),
             "_add_text_emotion": lambda *a: calls.append(("add",) + a),
             "_remove_text_emotion": lambda *a: calls.append(("rm",) + a),
+            "_update_text_emotion": lambda c, m, old, new: (calls.append(("upd", c, m, old, new)) or True),
         }
+
+    @staticmethod
+    def _shows_emoji(calls, emoji):
+        """消息上是否显示过某表情：首贴 add(emoji=c[3]) 或原地 upd(new=c[4])。"""
+        return any(
+            (c[0] == "add" and c[3] == emoji) or (c[0] == "upd" and c[4][0] == emoji)
+            for c in calls)
 
     def test_heartbeat_updates_emoji_and_sends_message(self):
         calls, m = self._record()
@@ -413,6 +495,7 @@ class TestProgressHeartbeat(unittest.TestCase):
         with patch.object(ack, "_mark_read", m["_mark_read"]), \
              patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
              patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_update_text_emotion", m["_update_text_emotion"]), \
              patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
              patch.object(ack, "_PROGRESS_INTERVAL", 0.05), \
              patch.object(ack, "_PROGRESS_MESSAGE", True), \
@@ -426,7 +509,7 @@ class TestProgressHeartbeat(unittest.TestCase):
             ack.on_reply_sent("cH==", "1", True)
             self.assertTrue(_wait_gone("cH=="))
         # 至少贴过一次进度表情（咖啡）
-        self.assertTrue(any(c[0] == "add" and c[3] == "咖啡" for c in calls), "应更新进度表情")
+        self.assertTrue(self._shows_emoji(calls, "咖啡"), "应更新进度表情")
         # 至少发过一条独立进度消息，且不影响收尾（最终仍切到完成态）
         self.assertGreaterEqual(len(notices), 1, "应发出进度消息")
         self.assertEqual(notices[0][0], "cH==")
@@ -437,6 +520,7 @@ class TestProgressHeartbeat(unittest.TestCase):
         with patch.object(ack, "_mark_read", m["_mark_read"]), \
              patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
              patch.object(ack, "_remove_text_emotion", m["_remove_text_emotion"]), \
+             patch.object(ack, "_update_text_emotion", m["_update_text_emotion"]), \
              patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
              patch.object(ack, "_PROGRESS_INTERVAL", 0.05), \
              patch.object(ack, "_PROGRESS_MESSAGE", False), \
@@ -446,7 +530,7 @@ class TestProgressHeartbeat(unittest.TestCase):
             time.sleep(0.12)
             ack.on_reply_sent("cN==", "1", True)
             self.assertTrue(_wait_gone("cN=="))
-        self.assertTrue(any(c[0] == "add" and c[3] == ack._PROGRESS_EMOJI for c in calls))
+        self.assertTrue(self._shows_emoji(calls, ack._PROGRESS_EMOJI))
         self.assertEqual(notices, [], "关闭进度消息时不应发送")
 
     def test_heartbeat_disabled_no_tick(self):

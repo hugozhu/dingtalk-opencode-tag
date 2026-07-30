@@ -9,7 +9,9 @@
      → 长任务每 5 分钟：原地更新「咖啡｜处理中N分钟」+ 另发一条独立进度消息（#75）
   回复发出 → 「OK｜已完成」；处理失败 → 「疑问｜处理未完成」
 
-任一时刻消息上只有一个文字表情（升级=移除旧 + 贴新，remove/add text-emotion）。
+任一时刻消息上只有一个文字表情。状态升级优先走 `update-text-emotion` **原地更新**
+（单次调用把旧表情/文字直接改成新的，无中间空档、无闪烁、少一半 CLI 往返；#85）；
+仅「首次贴」用 add、「清除」用 remove。update 失败时兜底回退到 remove 旧 + add 新。
 
 时间线由 ACK_STAGES 配置（`delay秒:表情名:文字`，多阶段用 `|` 分隔，按 delay 升序），
 完成/失败用 ACK_DONE / ACK_ERROR（`表情名:文字`）。长任务的周期进度心跳由 ACK_PROGRESS_*
@@ -19,7 +21,8 @@ DingTalk 约定（实测）：
 - 文字表情需先 `create-text-emotion --emotion-name <表情> --text <文字>` 拿到
   emotionId + backgroundId，再 `add-text-emotion`；本模块按 (表情名,文字) 进程内缓存
   emotionId，避免重复创建。
-- add/remove-text-emotion 用 --conversation-id + --msg-id，单聊/群聊通用（无需 openDingTalkId）。
+- add/remove/update-text-emotion 用 --conversation-id + --msg-id，单聊/群聊通用（无需 openDingTalkId）。
+  update 额外需 --old-emotion-id（原表情 emotionId）+ 新的 emotionId/name/text/backgroundId。
 
 设计要点：
 - **非消费型**：on_inbound 只做回执副作用后返回 False，让 text_reply 等照常回复
@@ -39,6 +42,7 @@ DingTalk 约定（实测）：
 
 import json
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -307,16 +311,48 @@ def _remove_text_emotion(conv_id, msg_id, emoji, text):
     return rc == 0
 
 
+def _update_text_emotion(conv_id, msg_id, old, new):
+    """原地更新文字表情：把 old=(表情,文字) 直接改成 new=(表情,文字)，单次 CLI 调用（#85）。
+
+    需先解析出 old 的 emotionId（--old-emotion-id）与 new 的 emotionId/backgroundId。
+    任一解析失败或 CLI 失败返回 False，由调用方回退 remove+add 兜底。
+    """
+    old_eid, _ = _emotion_id(old[0], old[1])
+    new_eid, new_bid = _emotion_id(new[0], new[1])
+    if not old_eid or not new_eid:
+        return False
+    args = ["chat", "message", "update-text-emotion",
+            "--conversation-id", conv_id, "--msg-id", msg_id,
+            "--old-emotion-id", old_eid,
+            "--emotion-id", new_eid, "--emotion-name", new[0], "--text", new[1]]
+    if new_bid:
+        args += ["--background-id", new_bid]
+    rc, out = _run_cli(args, timeout=15)
+    if rc != 0:
+        log(f"ack: update-text-emotion 失败 rc={rc} {new[0]}/{new[1][:12]} out={out[:80]}")
+    return rc == 0
+
+
 def _set_status(rec, status):
-    """把文字表情切到 status=(表情,文字)：移除当前的（若有）再贴新的。status=None 只移除。
+    """把文字表情切到 status=(表情,文字)。status=None 只移除当前的。
+
+    升级（当前有表情且新状态非空）优先走 update-text-emotion **原地更新**（单次调用，
+    无闪烁、少一半开销，#85）；失败兜底回退 remove 旧 + add 新。首次贴用 add、清除用 remove。
 
     单个消息的表情操作都在其 worker 线程内串行发生（rec.cur 只由 worker 读写），无需加锁。
     """
     if rec.cur == status:
         return
-    if rec.cur:
+    if rec.cur and status:
+        # 升级：原地更新；失败回退 remove+add
+        if not _update_text_emotion(rec.conv_id, rec.msg_id, rec.cur, status):
+            _remove_text_emotion(rec.conv_id, rec.msg_id, rec.cur[0], rec.cur[1])
+            _add_text_emotion(rec.conv_id, rec.msg_id, status[0], status[1])
+    elif rec.cur:
+        # 清除：仅移除
         _remove_text_emotion(rec.conv_id, rec.msg_id, rec.cur[0], rec.cur[1])
-    if status:
+    elif status:
+        # 首次贴
         _add_text_emotion(rec.conv_id, rec.msg_id, status[0], status[1])
     rec.cur = status
 
