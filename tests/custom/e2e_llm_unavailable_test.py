@@ -52,9 +52,16 @@ def fake_remove(conv_id, msg_id, emoji, text):
     emotions.append(("remove", emoji, text))
     return True
 
+def fake_update(conv_id, msg_id, old, new):
+    # 原地更新（#85）：记为显示出 new 状态（沿用 "add" 语义，兼容下方断言）
+    emotions.append(("add", new[0], new[1]))
+    print(f"  [ack表情↻] {old[0]}｜{old[1]} → {new[0]}｜{new[1]}")
+    return True
+
 CR.register_replier(fake_send_impl)     # 真 send_reply 协议，仅换平台实现
 ACK._add_text_emotion = fake_add
 ACK._remove_text_emotion = fake_remove
+ACK._update_text_emotion = fake_update
 ACK._mark_read = lambda conv_id, msg_id: True
 ACK._emotion_id = lambda emoji, text: ("eid", "bid")
 
