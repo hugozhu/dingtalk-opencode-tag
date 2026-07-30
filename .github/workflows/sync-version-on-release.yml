@@ -1,0 +1,55 @@
+name: Sync VERSION on release
+
+# 发布 GitHub Release 时，把 VERSION 同步为该 release 的 tag（去掉可选的 `v` 前缀），
+# 提交回 main，并让 tag 指向这条提交 —— 保证「tag 号 == VERSION == 发布版本」三者一致。
+# VERSION 是版本号唯一真相源（README 指向它，见 tests/core/unit_test.sh）。
+#
+# 为什么 release-triggered：main 每次合并不再自动 bump，历史干净；版本号只在你正式
+# 打 release 时前进，且直接等于你选定的 tag，无需再猜 patch/minor/major。
+#
+# 用法：打 tag（如 v1.2.0 或 1.2.0）并 Publish release 即可。tag 需形如 [v]x.y.z。
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main                      # 提交回默认分支，而非 detached tag
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync VERSION to release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"                 # 去掉可选 v 前缀：v1.2.0 → 1.2.0
+          if ! printf '%s' "$ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "release tag '$TAG' 不是 [v]x.y.z 形式，跳过 VERSION 同步" >&2
+            exit 1
+          fi
+
+          if [ "$(cat VERSION)" = "$ver" ]; then
+            echo "VERSION 已是 $ver，无需改动"
+            exit 0
+          fi
+
+          printf '%s\n' "$ver" > VERSION
+          echo "VERSION → $ver（来自 release $TAG）"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: sync VERSION to ${ver} for release ${TAG}"
+          git push origin HEAD:main
+
+          # 让 release 的 tag 指向这条 VERSION 提交，避免 tag 停在旧提交、与 VERSION 漂移
+          git tag -f "$TAG"
+          git push -f origin "refs/tags/${TAG}"
