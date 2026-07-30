@@ -625,9 +625,40 @@ def _serve_request(method, port, pwd, path, body=None, timeout=8):
     return serve_request(method, path, body, timeout, port=port, pwd=pwd)
 
 
-def _create_session(port, pwd):
-    """建一个 serve session（带可选 per-session 权限规则）。返回 sid 或抛错。"""
-    body = {"title": "agent-textreply"}
+def _session_title(ctx=None, prompt="", default="agent-textreply"):
+    """为 serve session 生成一个可辨识的 title，便于在 opencode 后台按名字定位（#89）。
+
+    旧行为：所有 session 都叫 "agent-textreply"，后台列表长一个样、无法区分来源。
+    现在带上会话来源标记 + 发送者 + 首条消息摘要，例如：
+      "[群] 张三 · 帮我看下这个报错的原因"
+      "[私] 李四 · image"
+
+    无 ctx / 无摘要时回退到 default，保证行为向后兼容（e2e 直接调 _create_session(port,pwd) 不受影响）。
+    title 只用于后台展示：单行、脱换行、限长，避免过长或泄露大段内容。
+    """
+    ctx = ctx or {}
+    conv_type = str(ctx.get("conv_type", "")).strip()
+    marker = {"1": "[私]", "2": "[群]"}.get(conv_type, "")
+    user = str(ctx.get("user", "")).strip()
+    # 摘要：折叠所有空白为单空格并截断；prompt 可能形如 "user：text"，去掉冗余的前缀。
+    summary = " ".join((prompt or "").split())
+    if user and summary.startswith(f"{user}："):
+        summary = summary[len(user) + 1:].lstrip()
+    if len(summary) > 24:
+        summary = summary[:24] + "…"
+    parts = [p for p in (marker, user) if p]
+    head = " ".join(parts)
+    if head and summary:
+        return f"{head} · {summary}"
+    return head or summary or default
+
+
+def _create_session(port, pwd, title=None):
+    """建一个 serve session（带可选 per-session 权限规则）。返回 sid 或抛错。
+
+    title 缺省时回退到 "agent-textreply"（旧行为）；传入时用它做后台展示名（#89）。
+    """
+    body = {"title": title or "agent-textreply"}
     if _OPENCODE_PERMISSION:
         body["permission"] = _OPENCODE_PERMISSION
     created = _serve_request("POST", port, pwd, "/session", body, timeout=10)
@@ -878,7 +909,7 @@ def _http_oneshot(port, pwd, prompt, ctx):
     t0 = time.time()
     sid = None
     try:
-        sid = _create_session(port, pwd)
+        sid = _create_session(port, pwd, _session_title(ctx, prompt))
         _register_textreply_sid(sid, ctx)
         _mark_inflight(conv_id, sid, port, pwd)
         reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
@@ -902,12 +933,13 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
     """复用语义：同一 conv 串行走同一 session；404 失效则重建一次重试。"""
     provider, model_id = _split_model(_OPENCODE_MODEL)
     t0 = time.time()
+    title = _session_title(ctx, prompt)
     with _conv_lock(conv_id):
         sid = _lookup_sid(conv_id, ctx=ctx)
         reused = sid is not None
         try:
             if sid is None:
-                sid = _create_session(port, pwd)
+                sid = _create_session(port, pwd, title)
             _register_textreply_sid(sid, ctx)   # 刷新 conv ctx（回程路由用最新来源）
             _mark_inflight(conv_id, sid, port, pwd)
             try:
@@ -917,7 +949,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                 if reused and he.code == 404:
                     log(f"brain: 复用 session {sid[:12]} 失效(404)，重建 conv={conv_id[:12]}")
                     _forget_sid(conv_id)
-                    sid = _create_session(port, pwd)
+                    sid = _create_session(port, pwd, title)
                     _register_textreply_sid(sid, ctx)
                     _mark_inflight(conv_id, sid, port, pwd)
                     reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
@@ -930,7 +962,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                 log(f"brain: 复用 session {sid[:12]} 回空(疑似 stream-error)，丢弃并新建重试 conv={conv_id[:12]}")
                 _forget_sid(conv_id)
                 _delete_session(port, pwd, sid)
-                sid = _create_session(port, pwd)
+                sid = _create_session(port, pwd, title)
                 _register_textreply_sid(sid, ctx)
                 _mark_inflight(conv_id, sid, port, pwd)
                 reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
