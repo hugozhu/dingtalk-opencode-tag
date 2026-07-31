@@ -157,6 +157,12 @@ export CAP_FORWARD_ENABLED="${CAP_FORWARD_ENABLED:-1}"        # 合并转发（c
 export CAP_IMAGE_ENABLED="${CAP_IMAGE_ENABLED:-1}"           # 图片识别（vision 兜底）
 # 图片识别需要多模态 proxy 可达（见下方 PROXY_URL/VISION_MODEL）。注入 agent 的末句指令可覆盖：
 # export CAP_IMAGE_PROMPT_FOOTER="以上「图片识别内容」由多模态模型提取…请结合说明回应。"
+export CAP_AUDIO_ENABLED="${CAP_AUDIO_ENABLED:-1}"           # 语音消息识别（Whisper ASR）
+# 语音识别使用本地 Whisper 模型（openai-whisper），将语音转录为文字后发送给大模型处理。
+# export AGENT_AUDIO_WHISPER_MODEL="base"     # Whisper 模型：tiny/base/small/medium（默认 base）
+# export AGENT_AUDIO_WHISPER_LANGUAGE="zh"    # 识别语言：zh/en/auto（默认 zh 中文）
+# export CAP_AUDIO_WHISPER_TIMEOUT="120"      # 转录超时秒数（默认 120）
+# export CAP_AUDIO_PROMPT_FOOTER="以上「语音转录内容」由语音识别模型转录…请根据内容回应。"
 export CAP_FILE_ENABLED="${CAP_FILE_ENABLED:-1}"             # 文档/文件处理（受控下载+注入）
 # 文件能力主动 drive download 到临时目录、读前 N 字节文本注入 agent（避免 agent 自主下载到
 # 项目目录）。文本类文件（txt/md/csv/json/日志/代码等）读正文；二进制文件给说明不硬读。

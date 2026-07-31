@@ -217,6 +217,10 @@ systemctl --user start dingtalk-agent.service     # 启动
   - **后端两条路都走 opencode serve HTTP**：普通文本回复走 `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI；合并转发业务走 `inject_and_forward` 的 serve HTTP `/session`。两者都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
   - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**（统一调试总开关，原 `AGENT_SERVE_DEBUG` 已并入）：每次 opencode 调用记一条摘要（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败），**并把每个 serve 请求/响应的完整 body（含发给模型的 prompt 与模型返回）写到同一文件**，长 body（图片 data_url 等）自动截断头尾。想确认"回复到底走 HTTP 还是 CLI 回退"或"到底发了什么 prompt / serve 返回了什么"都看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
 
+## 事件消息处理
+
+数字员工收到自动化事件推送（监控告警、数据推送、安全封禁等）时，按 [docs/EVENT_HANDLING_POLICY.md](./docs/EVENT_HANDLING_POLICY.md) 执行分类过滤与升级策略。核心：默认静默，SSH 封禁永久忽略，监控连续 ≥6h 升级，价格异常波动（≥5%）立即告警。
+
 ## 不要做的事
 
 - **不要**改 `src/core/` `bin/core/` `tests/core/` 下的任何文件——bug fix 走 PR 贡献回 upstream（见 [CONTRIBUTING.md](./CONTRIBUTING.md)）
