@@ -162,7 +162,7 @@ _emotion_lock = threading.Lock()
 
 class _Pending:
     """一条消息的回执生命周期状态。"""
-    __slots__ = ("conv_id", "conv_type", "msg_id", "event", "ok", "cur")
+    __slots__ = ("conv_id", "conv_type", "msg_id", "event", "ok", "cur", "cur_eid", "cur_bid")
 
     def __init__(self, conv_id, conv_type, msg_id):
         self.conv_id = conv_id
@@ -171,6 +171,8 @@ class _Pending:
         self.event = threading.Event()
         self.ok = None            # None=未收到/被取代/超时；True=成功；False=失败
         self.cur = None           # 当前贴着的 (表情, 文字)（worker 独占，无需锁）
+        self.cur_eid = None       # 当前贴着的 emotionId（#95：update 需精确定位旧表情）
+        self.cur_bid = None       # 当前贴着的 backgroundId
 
 
 def _note_and_plan(msg_id, want_begin, want_read):
@@ -247,18 +249,13 @@ def _mark_read(conv_id, msg_id):
 def _emotion_id(emoji, text):
     """按 (表情名, 文字) 拿到 (emotionId, backgroundId)，进程内缓存；首次 create。
 
-    缓存 key 标准化（#82）：进度心跳的动态文字「处理中5分钟」含实例化分钟数，每分钟产生
-    新 key → 无界缓存增长 + 每次 CLI 往返。检测到数字+「分钟」模式时，还原为模板
-    「处理中{mins}分钟」作缓存 key，复用同一 emotionId。
+    #95 fix：移除进度文字的缓存 key 标准化。每个不同的「处理中N分钟」创建独立 emotionId，
+    使 update-text-emotion 能正确识别 old != new 并原地更新。静态文字（收到/完成/失败）
+    仍缓存复用。
 
     失败返回 (None, None)。
     """
     key = (emoji, text)
-    # 标准化 key：若 text 形如「处理中5分钟」（数字+分钟），还原为模板作缓存 key
-    if emoji == _PROGRESS_EMOJI and re.search(r'\d+\s*分钟', text):
-        normalized_text = re.sub(r'\d+', '{mins}', text)
-        key = (emoji, normalized_text)
-
     with _emotion_lock:
         if key in _emotion_cache:
             return _emotion_cache[key]
@@ -311,25 +308,25 @@ def _remove_text_emotion(conv_id, msg_id, emoji, text):
     return rc == 0
 
 
-def _update_text_emotion(conv_id, msg_id, old, new):
-    """原地更新文字表情：把 old=(表情,文字) 直接改成 new=(表情,文字)，单次 CLI 调用（#85）。
+def _update_text_emotion(conv_id, msg_id, old_eid, old_bid, new_emoji, new_text, new_eid, new_bid):
+    """原地更新文字表情：把 old emotionId 直接改成 new (表情,文字,emotionId)，单次 CLI 调用（#85）。
 
-    需先解析出 old 的 emotionId（--old-emotion-id）与 new 的 emotionId/backgroundId。
-    任一解析失败或 CLI 失败返回 False，由调用方回退 remove+add 兜底。
+    #95 fix：接收实际挂载的 old_eid（由 _Pending.cur_eid 传入），不再从缓存反查。
+    避免缓存漂移导致 old==new 而无法原地更新。
+
+    任一参数缺失或 CLI 失败返回 False，由调用方回退 remove+add 兜底。
     """
-    old_eid, _ = _emotion_id(old[0], old[1])
-    new_eid, new_bid = _emotion_id(new[0], new[1])
     if not old_eid or not new_eid:
         return False
     args = ["chat", "message", "update-text-emotion",
             "--conversation-id", conv_id, "--msg-id", msg_id,
             "--old-emotion-id", old_eid,
-            "--emotion-id", new_eid, "--emotion-name", new[0], "--text", new[1]]
+            "--emotion-id", new_eid, "--emotion-name", new_emoji, "--text", new_text]
     if new_bid:
         args += ["--background-id", new_bid]
     rc, out = _run_cli(args, timeout=15)
     if rc != 0:
-        log(f"ack: update-text-emotion 失败 rc={rc} {new[0]}/{new[1][:12]} out={out[:80]}")
+        log(f"ack: update-text-emotion 失败 rc={rc} {new_emoji}/{new_text[:12]} out={out[:80]}")
     return rc == 0
 
 
@@ -339,22 +336,55 @@ def _set_status(rec, status):
     升级（当前有表情且新状态非空）优先走 update-text-emotion **原地更新**（单次调用，
     无闪烁、少一半开销，#85）；失败兜底回退 remove 旧 + add 新。首次贴用 add、清除用 remove。
 
+    #95 fix：记录并使用实际挂载的 emotionId/backgroundId（rec.cur_eid/cur_bid），
+    避免缓存与实际状态漂移导致 update 用同一 eid 无法原地更新。
+
     单个消息的表情操作都在其 worker 线程内串行发生（rec.cur 只由 worker 读写），无需加锁。
     """
     if rec.cur == status:
         return
+
+    # 准备新状态的 emotionId（若需要）
+    new_eid = new_bid = None
+    if status:
+        new_eid, new_bid = _emotion_id(status[0], status[1])
+        if not new_eid:
+            return  # 创建失败，放弃本次状态切换
+
     if rec.cur and status:
         # 升级：原地更新；失败回退 remove+add
-        if not _update_text_emotion(rec.conv_id, rec.msg_id, rec.cur, status):
-            _remove_text_emotion(rec.conv_id, rec.msg_id, rec.cur[0], rec.cur[1])
+        if not _update_text_emotion(rec.conv_id, rec.msg_id, rec.cur_eid, rec.cur_bid,
+                                     status[0], status[1], new_eid, new_bid):
+            # update 失败，兜底 remove+add（用实际挂载的 eid 移除）
+            if rec.cur_eid:
+                args = ["chat", "message", "remove-text-emotion",
+                        "--conversation-id", rec.conv_id, "--msg-id", rec.msg_id,
+                        "--emotion-id", rec.cur_eid, "--emotion-name", rec.cur[0], "--text", rec.cur[1]]
+                if rec.cur_bid:
+                    args += ["--background-id", rec.cur_bid]
+                rc, out = _run_cli(args, timeout=15)
+                if rc != 0:
+                    log(f"ack: remove-text-emotion(兜底) 失败 rc={rc} {rec.cur[0]}/{rec.cur[1][:12]} out={out[:80]}")
             _add_text_emotion(rec.conv_id, rec.msg_id, status[0], status[1])
     elif rec.cur:
-        # 清除：仅移除
-        _remove_text_emotion(rec.conv_id, rec.msg_id, rec.cur[0], rec.cur[1])
+        # 清除：仅移除（用实际挂载的 eid）
+        if rec.cur_eid:
+            args = ["chat", "message", "remove-text-emotion",
+                    "--conversation-id", rec.conv_id, "--msg-id", rec.msg_id,
+                    "--emotion-id", rec.cur_eid, "--emotion-name", rec.cur[0], "--text", rec.cur[1]]
+            if rec.cur_bid:
+                args += ["--background-id", rec.cur_bid]
+            rc, out = _run_cli(args, timeout=15)
+            if rc != 0:
+                log(f"ack: remove-text-emotion 失败 rc={rc} {rec.cur[0]}/{rec.cur[1][:12]} out={out[:80]}")
     elif status:
         # 首次贴
         _add_text_emotion(rec.conv_id, rec.msg_id, status[0], status[1])
+
+    # 更新状态：记录实际挂载的 (表情,文字) 及其 emotionId/backgroundId
     rec.cur = status
+    rec.cur_eid = new_eid if status else None
+    rec.cur_bid = new_bid if status else None
 
 
 def _first_status(stages):
