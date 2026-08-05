@@ -61,6 +61,7 @@ from core.agent_common import (
     _md,
     _post_user_message,
     _proxy_vision,
+    _run_cli,
     find_serve_credentials,
     inject_and_forward,
     log,
@@ -246,9 +247,38 @@ def _recall_empty_reply(_unused_msg_id=None):
     log("recall: 检测到空回复，撤回逻辑由用户实现")
 
 
-def handle_reboot(user):
-    """收到 /reboot 指令：发通知 → 派生 reboot.sh → os._exit(0)。"""
+def _reboot_ack(msg):
+    """best-effort：标记已读 + 贴「稍等｜正在重启…」文字表情，让用户即时确认指令已收到。"""
+    conv_id, msg_id = msg.conv_id, msg.msg_id
+    if not conv_id or not msg_id:
+        return
+    try:
+        _run_cli(["chat", "mark-read",
+                  "--conversation-id", conv_id, "--message-id", msg_id], timeout=10)
+    except Exception as e:
+        log(f"reboot: mark-read 失败 {e}")
+    try:
+        rc, out = _run_cli(["chat", "message", "create-text-emotion",
+                            "--emotion-name", "稍等", "--text", "正在重启…"], timeout=10)
+        if rc == 0:
+            res = (json.loads(out).get("result", {}) or {})
+            eid = res.get("emotionId")
+            bid = res.get("backgroundId")
+            if eid:
+                args = ["chat", "message", "add-text-emotion",
+                        "--conversation-id", conv_id, "--msg-id", msg_id,
+                        "--emotion-id", str(eid), "--emotion-name", "稍等", "--text", "正在重启…"]
+                if bid:
+                    args += ["--background-id", str(bid)]
+                _run_cli(args, timeout=10)
+    except Exception as e:
+        log(f"reboot: 贴表情失败 {e}")
+
+
+def handle_reboot(msg):
+    """收到 /reboot 指令：已读+表情 → 发通知 → 派生 reboot.sh → os._exit(0)。"""
     global last_reboot_at
+    user = msg.user
     now = time.time()
     with reboot_lock:
         if now - last_reboot_at < REBOOT_COOLDOWN:
@@ -258,6 +288,8 @@ def handle_reboot(user):
                                   f"请 {int(REBOOT_COOLDOWN - (now - last_reboot_at))}s 后再试"))
             return
         last_reboot_at = now
+
+    _reboot_ack(msg)
 
     log(f"reboot: 收到 {user} 的 /reboot 指令，派生 reboot.sh 并退出")
     send_notification("🔄 正在重启",
@@ -342,7 +374,7 @@ def log_tail_thread(stop_flag):
                     if msg.kind == _inbound.KIND_REBOOT:
                         # /reboot 由 core 直接处理（不是可关的业务能力）
                         log(f"reboot: 命中 /reboot 指令 user={msg.user}")
-                        threading.Thread(target=handle_reboot, args=(msg.user,),
+                        threading.Thread(target=handle_reboot, args=(msg,),
                                          daemon=True).start()
                     else:
                         _dispatch_inbound(msg)

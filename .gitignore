@@ -235,3 +235,18 @@ start-digital-employee.sh
 
 # monitor 运行时状态（下次健康检查时间戳）
 .next-check
+
+# firecrawl 抓取的中间产物（报告数据缓存，勿提交）
+.firecrawl/
+
+# digest 定时报告脚本（仅本地使用，勿提交）
+bin/custom/aliway_hot_report.sh
+bin/custom/aliway-hot-report.plist
+bin/custom/amazon_bestsellers_report.sh
+bin/custom/ga_traffic_report.sh
+bin/custom/ga-traffic-report.plist
+bin/custom/wechat_mp_report.sh
+bin/custom/wechat-mp-report.plist
+bin/custom/x_timeline_report.sh
+bin/custom/x-timeline-report.plist
+bin/custom/xhs_trend_report.sh

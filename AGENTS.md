@@ -221,6 +221,14 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 数字员工收到自动化事件推送（监控告警、数据推送、安全封禁等）时，按 [docs/EVENT_HANDLING_POLICY.md](./docs/EVENT_HANDLING_POLICY.md) 执行分类过滤与升级策略。核心：默认静默，SSH 封禁永久忽略，监控连续 ≥6h 升级，价格异常波动（≥5%）立即告警。
 
+## 指令约定：「存入notes」
+
+用户（hugozhu）发送「存入notes」时，把**最近一条消息**的内容（链接则抓取正文、文本则原文）存入**钉钉知识库 wiki**，而不是本地/第三方 notepad：
+
+- 目标空间：`hugozhu的知识库`（workspaceId=`r98znONN9JrLXLxn`），`notes` 文件夹（nodeId=`XPwkYGxZV3eG6jaAF9OD1E168AgozOKL`）
+- 必须用 hugozhu 本人 profile `dinga626d60c1128d449:0420506555`（数字员工 profile 无该 wiki 权限）
+- 流程：抓取正文 → 清洗（去微信/网页噪声）→ `dws doc create --workspace r98znONN9JrLXLxn --folder XPwkYGxZV3eG6jaAF9OD1E168AgozOKL --name "<标题>" --content-file <tmp.md>` → `dws doc read` 回读验证 → 回复 docUrl
+
 ## 不要做的事
 
 - **不要**改 `src/core/` `bin/core/` `tests/core/` 下的任何文件——bug fix 走 PR 贡献回 upstream（见 [CONTRIBUTING.md](./CONTRIBUTING.md)）
