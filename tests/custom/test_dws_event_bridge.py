@@ -98,6 +98,20 @@ class TestToConnectLine(unittest.TestCase):
         self.assertIsNone(bridge._to_connect_line(
             _event("user_im_message_receive_at", content="   ")))
 
+    def test_empty_content_counted(self):
+        """空 content 丢弃要**计数**（#71）：供健康检查扣分母，且日志里可见。"""
+        bridge._stats["empty"] = 0
+        bridge._to_connect_line(_event("user_im_message_receive_at", content=""))
+        bridge._to_connect_line(_event("user_im_message_receive_o2o", content="  "))
+        self.assertEqual(bridge._stats["empty"], 2)
+
+    def test_unparseable_not_counted_as_empty(self):
+        """格式不认识不计入 empty——否则真故障时分母也被扣掉，告警永远不触发（#71）。"""
+        bridge._stats["empty"] = 0
+        bridge._to_connect_line({"type": "event", "event_type": "user_im_message_receive_at",
+                                 "event_id": "x", "data": "{not-json"})
+        self.assertEqual(bridge._stats["empty"], 0)
+
     def test_no_data_returns_none(self):
         self.assertIsNone(bridge._to_connect_line(
             {"type": "event", "event_type": "user_im_message_receive_at"}))
@@ -204,6 +218,36 @@ class TestFormatHealthCheck(unittest.TestCase):
         """已报过 → 不再重复告警（防刷屏）。"""
         self.assertFalse(bridge._should_warn_format(
             bridge._FORMAT_WARN_THRESHOLD, 0, True))
+
+    def test_empty_content_excluded_from_denominator(self):
+        """全是空 content（贴纸/表情包）→ 不告警（#71）。
+
+        这是预期丢弃、不是格式不匹配；否则用户连发几个贴纸就误报"dws 格式疑似不匹配"，
+        把正常行为当故障。
+        """
+        n = bridge._FORMAT_WARN_THRESHOLD
+        self.assertFalse(bridge._should_warn_format(n, 0, False, empty_count=n))
+
+    def test_warns_when_real_events_exceed_threshold_despite_empties(self):
+        """扣掉空 content 后仍达阈值 → 照常告警（扣分母不能把真故障也掩盖掉）。"""
+        n = bridge._FORMAT_WARN_THRESHOLD
+        self.assertTrue(bridge._should_warn_format(n + 2, 0, False, empty_count=2))
+
+    def test_field_drift_still_warns(self):
+        """字段整体漂移（dws 改名）时告警仍要触发（#71 回归）。
+
+        这类事件没有 content、也没有 convId/msgId → 不能算作"空 content"去扣分母，
+        否则 empty==raw、分母归零，告警永不触发，恰好掩盖它要抓的静默失效。
+        """
+        bridge._stats["empty"] = 0
+        n = bridge._FORMAT_WARN_THRESHOLD
+        for i in range(n):
+            self.assertIsNone(bridge._to_connect_line(
+                {"type": "user_im_message_receive_o2o",   # 认得类型，字段全改名了
+                 "from": "hugozhu", "body": "hi",
+                 "convId_v2": "cidX==", "msgId_v2": f"m{i}"}))
+        self.assertEqual(bridge._stats["empty"], 0)
+        self.assertTrue(bridge._should_warn_format(n, 0, False, bridge._stats["empty"]))
 
 
 if __name__ == "__main__":

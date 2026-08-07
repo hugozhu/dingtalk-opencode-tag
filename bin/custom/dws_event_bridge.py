@@ -34,6 +34,11 @@ _CONV_TYPE_BY_EVENT = {
 # 是最隐蔽的故障。达到阈值即在日志报错（只报一次），让运维能主动发现。
 _FORMAT_WARN_THRESHOLD = 3
 
+# 空 content 丢弃计数（#71）。_to_connect_line 对"结构解析成功但 content 为空"和
+# "格式完全不认识"都返回 None，调用方无从区分；用这个计数器把前者单独记下来，
+# 供格式健康检查扣除分母。用 dict 而非裸 int，便于测试用 _stats["empty"]=0 重置。
+_stats = {"empty": 0}
+
 
 def _log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -58,10 +63,15 @@ def _log_to_monitor(msg):
         pass
 
 
-def _should_warn_format(raw_count, parsed_count, already_warned):
-    """判定是否该报"格式不匹配"告警：收到足够多原始事件但一条都没解析出，且没报过。"""
+def _should_warn_format(raw_count, parsed_count, already_warned, empty_count=0):
+    """判定是否该报"格式不匹配"告警：收到足够多**可解析**原始事件但一条都没解析出，且没报过。
+
+    empty_count 是"结构解析成功、但 content 为空"（贴纸/表情包等）的条数——这类是**已知的、
+    预期的**丢弃，不是格式不匹配。从分母里扣掉（#71），否则用户连发几个贴纸就会误报
+    "dws 输出格式疑似不匹配"，把正常行为当成故障。
+    """
     return (not already_warned
-            and raw_count >= _FORMAT_WARN_THRESHOLD
+            and (raw_count - empty_count) >= _FORMAT_WARN_THRESHOLD
             and parsed_count == 0)
 
 
@@ -104,6 +114,20 @@ def _to_connect_line(evt):
     at_mention = etype == "user_im_message_receive_at"
 
     if not content:
+        # 空 content（贴纸/表情包/手写等）不构成可处理的消息，仍然丢弃——但**记一笔**（#71）。
+        # 原来是静默 return None：这类消息既不进 trace（priority 0「收到即记」）也不进 ack，
+        # 运维在日志里看不到"来了但没处理"，只能怀疑是链路挂了。这里补一行 stderr 诊断，
+        # 让"用户发了贴纸、数字员工没反应"能被一眼确认为预期行为而非故障。
+        #
+        # 但只有**结构确实认出来了**（拿到 convId 或 msgId）才算 empty 去扣告警分母：
+        # 格式若整体漂移（dws 改字段名），每条事件都会落到这里、empty==raw，分母被扣光
+        # → 格式告警永不触发，正好掩盖掉它本来要抓的静默失效。
+        if conv_id or msg_id:
+            _stats["empty"] += 1
+            _log(f"跳过空 content 事件 etype={etype or '?'} "
+                 f"convId={conv_id or '?'} msgId={msg_id or '?'}")
+        else:
+            _log(f"跳过无法识别的事件 etype={etype or '?'} event_id={evt.get('event_id') or '?'}")
         return None
     # 格式对齐 event_watcher.REPLY_RE：'\[connect\] 收到 @(.+?):\s*(.+?)\s+\(convType=(\d+)'
     tail = f"convType={conv_type} convId={conv_id} msgId={msg_id}"
@@ -140,14 +164,15 @@ def main():
             seen += 1
         # 格式健康检查：收到多条原始事件却一条都没解析出 → 大概率格式不匹配，报错一次。
         # 同时写 connect-log(stderr) 和 monitor.log，便于运维主动发现"静默失效"。
-        if _should_warn_format(raw, seen, warned):
+        if _should_warn_format(raw, seen, warned, _stats["empty"]):
             warned = True
-            msg = (f"⚠️ 格式健康告警：已收到 {raw} 条原始事件但成功解析 0 条 —— "
-                   f"dws 输出格式疑似与 bridge 解析不匹配（dws 升级？），"
+            msg = (f"⚠️ 格式健康告警：已收到 {raw} 条原始事件（其中 {_stats['empty']} 条空 content）"
+                   f"但成功解析 0 条 —— dws 输出格式疑似与 bridge 解析不匹配（dws 升级？），"
                    f"数字员工将收不到任何消息。样例行: {line[:200]}")
             _log(msg)
             _log_to_monitor(msg)
-    _log(f"stdin 结束，共收到 {raw} 条原始事件、成功处理 {seen} 条")
+    _log(f"stdin 结束，共收到 {raw} 条原始事件、成功处理 {seen} 条"
+         f"、跳过空 content {_stats['empty']} 条")
 
 
 if __name__ == "__main__":

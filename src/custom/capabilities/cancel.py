@@ -10,7 +10,8 @@
 
 优先级 5：在 permission(15)/question(20)/text_reply(100) 之前，避免「取消」被当普通文本
 发给 LLM 或被当作审批答复。命中关键词但当前无在跑任务 → 返回 False 放行后续能力
-（用户可能只是在正常聊天里说「停止」）。
+（用户可能只是在正常聊天里说「停止」）。例外：该会话有**待答提问**时也放行——「取消」
+是 question 的取消关键词，抢在它前面会取消错对象（#71）。
 
 开关：CAP_CANCEL_ENABLED（默认开）。
 """
@@ -30,6 +31,25 @@ _CANCEL_KEYWORDS = {
 }
 
 
+def _question_pending(conv_id):
+    """该会话是否有待答的 question？（#71）
+
+    「取消」同时是本能力和 question 能力的关键词，而本能力 priority=5 跑在 question(20)
+    之前。用户为"撤掉这个提问"而回「取消」时，若该会话恰好又有在跑任务，本能力会抢先
+    abort 掉那个任务并消费掉消息——提问还挂着，用户取消了自己没打算取消的东西。
+    故：有 pending question 时放行，让 question 按它自己的语义处理。
+    """
+    try:
+        from core.builtin_caps.question import _find_pending_for_conv
+    except ImportError:
+        return False
+    try:
+        req_id, _ = _find_pending_for_conv(conv_id)
+        return bool(req_id)
+    except Exception:
+        return False
+
+
 def on_inbound(msg):
     """取消命令：命中关键词且该 conv 有在跑任务 → abort 并回执。返回 True=已消费。"""
     text = (msg.text or "").strip().lower()
@@ -38,6 +58,11 @@ def on_inbound(msg):
 
     conv_id = msg.conv_id
     conv_type = msg.conv_type
+
+    # 有待答提问 → 这句「取消」大概率是冲提问去的，放行给 question（#71）
+    if _question_pending(conv_id):
+        log(f"cancel: conv={conv_id[:12]} 有待答提问，放行给 question")
+        return False
 
     # 延迟导入避免循环依赖（cancel ← brain ← capabilities）
     try:

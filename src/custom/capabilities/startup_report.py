@@ -22,10 +22,16 @@ import subprocess
 import time
 from datetime import datetime
 
-from core.agent_common import PROFILE, log, _run_cli
+from core.agent_common import PROFILE, log, _run_cli, env_flag
 from core.capabilities import Capability, register
 
-_ENABLED = os.environ.get("CAP_STARTUP_REPORT_ENABLED", "1") in ("1", "true", "yes", "on")
+
+def _enabled():
+    """读开关。用 env_flag 而非手搓元组（#71）：env_flag 会 lower()，否则
+    CAP_STARTUP_REPORT_ENABLED=TRUE 在这里是"关"、在其他所有能力那里是"开"，口径不一。
+    每次调用现读（而非 import 时快照），与 Capability.enabled() 的时机一致。
+    """
+    return env_flag("CAP_STARTUP_REPORT_ENABLED", default=True)
 
 
 def _get_user_info(user_id):
@@ -354,7 +360,7 @@ def _send_to_group_with_at(user_id, report_text):
 
 def send_startup_report():
     """生成并发送启动报告给数字员工的主管"""
-    if not _ENABLED:
+    if not _enabled():
         log("[startup_report] 功能未启用，跳过")
         return
 

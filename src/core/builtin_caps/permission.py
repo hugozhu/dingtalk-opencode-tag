@@ -262,6 +262,7 @@ CAPABILITY = Capability(
     on_sse_event=on_sse_event,
     priority=15,                 # 先于 question20/image40/forward50/text100 看到用户回复
     default_enabled=True,
+    dedup=True,                  # 重连重投的同一条审批答复不再二次处理（#71）
     loop_guard=True,             # 数字员工自己的确认消息不进审批匹配
 )
 register(CAPABILITY)
