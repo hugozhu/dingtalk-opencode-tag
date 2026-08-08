@@ -37,6 +37,7 @@ fi
 : "${CHECK_INTERVAL:=1800}"           # 健康检查间隔（秒）
 : "${MAX_FAILURES:=3}"               # 连续失败熔断阈值
 : "${WARMUP_TIMEOUT:=60}"            # warmup 超时
+: "${HEALTHCHECK_TIMEOUT:=120}"      # 单次健康检查的硬超时（秒），防 serve 卡死时监督循环停摆
 : "${LOCK_FILE:=/tmp/agent-monitor.lock}"
 
 # 组件日志路径 —— start_funcs.sh 的 start_* 函数引用（如 start_connect 用 CONNECT_LOG、
@@ -125,8 +126,12 @@ warmup() {
 }
 
 # 健康检查（用户实现 do_healthcheck 返回 0/非0）
+#
+# 用 run_with_timeout 包裹：healthcheck 内部要发 HTTP 探测，serve 卡死时可能久久不返回。
+# 不设超时的话 run_forever 会停在这一行，既不重启也不告警 —— 监督器自己先哑了。
+# 超时返回 124（非零）→ 计入不健康 → 走重启/熔断路径，这正是我们要的行为。
 run_healthcheck() {
-    bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
+    run_with_timeout "$HEALTHCHECK_TIMEOUT" bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
 }
 
 # 熔断告警（用户实现 notify_alert <msg>）
