@@ -76,30 +76,60 @@ class TestParseSSEEvents(unittest.TestCase):
         self.assertEqual(list(event_watcher.parse_sse_events(resp)), [])
 
 
+def _task(sid, title, elapsed, conv_id="cid1"):
+    """构造 core.brain.list_inflight 形状的一条记录（started 已被 core 归一成 elapsed）。"""
+    return {"conv_id": conv_id, "sid": sid, "title": title,
+            "started": 0.0, "elapsed": elapsed}
+
+
 class TestRebootBody(unittest.TestCase):
-    """Test _reboot_body — /reboot 通知正文带 session id/title，取不到就降级 (#98)."""
+    """Test _reboot_body — /reboot 通知列出「这一停会打断哪些在跑任务」(#98)."""
 
-    @patch.object(event_watcher, "_find_bot_session_info",
-                  return_value=("ses_abc123", "[群] 张三 · 看下这个报错"))
-    def test_includes_session_id_and_title(self, _fbsi):
+    @patch.object(event_watcher, "list_inflight", return_value=[
+        _task("ses_abc123456789", "[群] 张三 · 看下这个报错", 125.7),
+        _task("ses_def987654321", "[私] 李四 · 帮我查下日志", 8.2, conv_id="cid2"),
+    ])
+    def test_lists_inflight_tasks(self, _li):
         body = event_watcher._reboot_body()
-        self.assertIn("- session: `ses_abc123`", body)
-        self.assertIn("- title: [群] 张三 · 看下这个报错", body)
+        self.assertIn("将中断 2 个在跑任务", body)
+        # sid 截断到 12 位，够定位又不刷屏
+        self.assertIn("`ses_abc12345`", body)
+        self.assertIn("`ses_def98765`", body)
+        self.assertIn("[群] 张三 · 看下这个报错", body)
+        self.assertIn("已跑 125s", body)
         self.assertIn("约 10s 后恢复", body)
 
-    @patch.object(event_watcher, "_find_bot_session_info", return_value=None)
-    def test_omits_session_lines_when_unavailable(self, _fbsi):
-        # serve 不可达 / 无 session：正文只剩时间和恢复预期，不能出现空的 session 行
+    @patch.object(event_watcher, "list_inflight", return_value=[])
+    def test_omits_section_when_idle(self, _li):
+        # 空闲时整节消失，而不是留一个「将中断 0 个」的空壳
         body = event_watcher._reboot_body()
-        self.assertNotIn("session:", body)
-        self.assertNotIn("title:", body)
+        self.assertNotIn("在跑任务", body)
         self.assertIn("约 10s 后恢复", body)
 
-    @patch.object(event_watcher, "_find_bot_session_info", return_value=("ses_notitle", ""))
-    def test_omits_title_line_when_title_empty(self, _fbsi):
+    @patch.object(event_watcher, "list_inflight",
+                  return_value=[_task("ses_notitle0000", "", 5.0)])
+    def test_untitled_task_renders_placeholder(self, _li):
         body = event_watcher._reboot_body()
-        self.assertIn("- session: `ses_notitle`", body)
-        self.assertNotIn("title:", body)
+        self.assertIn("`ses_notitle0`", body)
+        self.assertIn("(无标题)", body)
+
+    @patch.object(event_watcher, "_REBOOT_INFLIGHT_MAX", new=3)
+    @patch.object(event_watcher, "list_inflight", return_value=[
+        _task(f"ses_{i}" + "0" * 10, f"任务{i}", float(i)) for i in range(5)
+    ])
+    def test_truncates_long_list(self, _li):
+        body = event_watcher._reboot_body()
+        self.assertIn("将中断 5 个在跑任务", body)
+        self.assertIn("…另 2 个", body)
+        self.assertIn("任务2", body)
+        self.assertNotIn("任务3", body)   # 超出 MAX 的不逐条列
+
+    @patch.object(event_watcher, "list_inflight", side_effect=RuntimeError("boom"))
+    def test_registry_failure_does_not_block_reboot(self, _li):
+        # 最关键的一条：可观测性绝不能挡住重启本身
+        body = event_watcher._reboot_body()
+        self.assertIn("约 10s 后恢复", body)
+        self.assertNotIn("在跑任务", body)
 
 
 if __name__ == "__main__":

@@ -6,10 +6,12 @@ FDE 按自己业务调整：
   2. _classify_message 消息分类逻辑
   3. fetch_attachments + _fetch_image_entry + _fetch_file_entry 附件下载
   4. render_prompt 末句 prompt
-  5. _predicate 匹配自己业务消息特征
-  6. make_reply_msgs 通知消息格式
 
-业务路由注册在 custom/routes.py（不要改 core/event_watcher.py）。
+本文件只做**消息解析与附件获取**；「拿到 prompt 之后怎么生成回复」不在这里——
+那是能力（src/custom/capabilities/）调 core.brain.generate_reply 的事，会话复用
+按 conv_id 由 custom/brain.py 统一管（见 AGENT_SESSION_REUSE）。
+
+业务路由注册在能力插件里（不要改 core/event_watcher.py）。
 
 upstream 升级 handler_template.py 后，FDE 可 diff 参考新最佳实践：
   diff src/templates/handler_template.py src/custom/handler.py
@@ -29,15 +31,8 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from core.agent_common import (
-    _abort_and_clean_session,
     _run_cli,
-    _find_bot_session,
-    _find_session_with_predicate,
-    _md,
-    inject_and_forward,
     log,
-    send_notification,
-    submit_handler,
 )
 
 # ---------------------------------------------------------------------------
@@ -46,10 +41,6 @@ from core.agent_common import (
 
 # 业务消息正文里附件最大内联字节数
 ATTACHMENT_MAX_BYTES = 16384
-
-# 轮询等待依赖服务转发完成的参数（测试 patch 为 0）
-_POLL_MAX_SECONDS = 60
-_POLL_INTERVAL = 5
 
 # 通用：检测消息类型的正则（用户按业务调整）
 _RE_MEDIA_ID = re.compile(r"mediaId=([^\s)]+)")
@@ -505,112 +496,3 @@ def render_prompt(body, senders, attachments, sender):
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Orchestration — list-by-ids → fetch → render → cleanup → inject_and_forward
-# ---------------------------------------------------------------------------
-
-def handle_message(msg_id, original_convs=None):
-    """业务消息处理：反查消息体 → fetch + render → cleanup spurious 轮次 → inject_and_forward。
-
-    Args:
-        msg_id: 业务消息的 openMessageId
-        original_convs: 从日志提取的原始会话 ID 列表，用于反查附件的 fileId
-    """
-    import time as _time
-    # asked_ts 用于过滤需要 DELETE 的"多余轮次"消息。-5s buffer 容忍时钟偏移
-    asked_ts_ms = int(_time.time() * 1000) - 5000
-    log(f"handle: msgId={msg_id} asked_ts={asked_ts_ms}")
-
-    # 1. 反查完整消息体
-    rc, out = _run_cli([
-        "chat", "message", "list-by-ids",
-        "--msg-ids", msg_id,
-    ], timeout=30)
-    if rc != 0:
-        log(f"list-by-ids failed rc={rc}")
-        send_notification("⚠️ 处理失败",
-                          _md("处理失败", f"⚠️ 反查消息体失败 (rc={rc})", f"msgId: `{msg_id}`"))
-        return
-    try:
-        d = json.loads(out)
-        msgs = d.get("result", {}).get("messages", [])
-    except Exception as e:
-        log(f"parse list-by-ids response err: {e}")
-        return
-    if not msgs:
-        log(f"no message found for msgId={msg_id}")
-        return
-
-    body = msgs[0]
-    content = body.get("content", "") or ""
-    sender = body.get("sender", "用户")
-    messages = body.get("messages") or body.get("forwardMessages") or []
-    if not messages:
-        log(f"no messages in msgId={msg_id}")
-        return
-
-    send_notification("📨 处理中", _md(
-        "处理中",
-        f"🔍 检测到消息（{len(messages)} 条），正在解析…",
-        f"msgId: `{msg_id}`"
-    ))
-
-    # 2. fetch attachments (I/O) + render prompt (pure)
-    raw_senders = []  # 用户按业务调整：从 summary 文本解析 senders
-    # 诊断：summary 行数与 messages 数量不一致时记 raw content 头 300 字符
-    if len(raw_senders) != len(messages):
-        preview = content[:300].replace("\n", " | ")
-        log(f"senders mismatch msgId={msg_id} "
-            f"senders={len(raw_senders)} msgs={len(messages)} content[:300]={preview!r}")
-
-    senders = _fetch_senders(messages, raw_senders)
-    attachments = fetch_attachments(messages, lookup_convs=original_convs)
-    prompt = render_prompt(body, senders, attachments, sender)
-    if not prompt:
-        log(f"render_prompt returned None for msgId={msg_id}")
-        return
-
-    # 3. Cleanup 依赖服务转发的原始 JSON 轮次
-    #    依赖服务可能延迟转发，**轮询**等待命中（每 POLL_INTERVAL 秒一次，
-    #    最多 POLL_MAX_SECONDS 秒），命中后立即 abort+cleanup，阻止 LLM 处理原始 JSON
-    import time as _time_poll
-    # 用户实现 _predicate 匹配自己业务消息的特征（如含 'msgtype=business-special'）
-    def _predicate(msg):
-        text = "".join(p.get("text", "") for p in msg.get("parts", []) if p.get("type") == "text")
-        return 'msgtype="business-special"' in text
-
-    fwd_sid = _find_session_with_predicate(_predicate, asked_ts_ms=asked_ts_ms)
-    poll_deadline = _time_poll.time() + _POLL_MAX_SECONDS
-    while not fwd_sid and _time_poll.time() < poll_deadline:
-        _time_poll.sleep(_POLL_INTERVAL)
-        fwd_sid = _find_session_with_predicate(_predicate, asked_ts_ms=asked_ts_ms)
-    if fwd_sid:
-        aborted, deleted = _abort_and_clean_session(fwd_sid, asked_ts_ms)
-        log(f"cleanup session={fwd_sid[:12]}... aborted={aborted} deleted={deleted}")
-    else:
-        log(f"no business session found after {_POLL_MAX_SECONDS}s polling")
-
-    # 4. inject_and_forward: 公共模板负责 find/create 会话 → post → get reply → send_notification
-    msg_count = len(messages)
-    prompt_preview = prompt[:3500]
-    inject_and_forward(
-        prompt=prompt,
-        session_title="agent-handler",
-        make_reply_msgs=lambda reply: [
-            ("📨 解析结果", _md("解析结果", "📋 从消息提取的内容：", prompt_preview)),
-            (f"📨 总结（{msg_count} 条）", reply),  # reply 直接作正文，不被 _md 的 ** 包裹
-        ],
-        make_no_session_msg=lambda: (
-            "⚠️ 无法处理",
-            _md("处理失败", "⚠️ 无法找到或创建 agent 会话", "agent serve 可能未运行，请稍后重试。")
-        ),
-        make_no_reply_msg=lambda: (
-            "⚠️ 无回复",
-            _md("处理失败", "⚠️ agent 未生成回复", "")
-        ),
-    )
-
-
-def handle_message_async(msg_id, original_convs=None):
-    """Submit handle_message to the bounded handler pool (matches log_tail usage)."""
-    submit_handler(handle_message, msg_id, original_convs)

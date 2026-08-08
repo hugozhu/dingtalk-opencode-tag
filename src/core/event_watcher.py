@@ -54,20 +54,13 @@ if SRC_DIR not in sys.path:
 PROJECT_ROOT = os.path.dirname(SRC_DIR)
 
 from core.agent_common import (
-    PROFILE,
-    _create_session,
-    _find_bot_session,
-    _find_bot_session_info,
-    _get_message_text,
     _md,
-    _post_user_message,
-    _proxy_vision,
     _run_cli,
     find_serve_credentials,
-    inject_and_forward,
     log,
     send_notification,
 )
+from core.brain import list_inflight
 from core import inbound as _inbound
 from core.capabilities import (
     classify_line as _cap_classify_line,
@@ -112,6 +105,9 @@ _last_agent_reply_lock = threading.Lock()
 REBOOT_COOLDOWN = 60
 last_reboot_at = 0.0
 reboot_lock = threading.Lock()
+
+# /reboot 通知里最多列几个在跑任务（其余折叠成「另 N 个」，避免刷屏）
+_REBOOT_INFLIGHT_MAX = 3
 
 running = True
 sse_lock = threading.Lock()
@@ -277,22 +273,30 @@ def _reboot_ack(msg):
 
 
 def _reboot_body():
-    """拼重启通知正文：时间 + 恢复预期 + 当前 opencode session 的 id/title（#98）。
+    """拼重启通知正文：时间 + 恢复预期 + **这一停会打断哪些在跑任务**（#98）。
 
-    带上 session 是为了「重启后能回看重启前正在处理什么」——有进行中的长任务时，
-    可直接按 id 定位，或按 title 在 opencode 后台找到那次会话。
+    数据源是 core.brain 的在跑登记表（per-conv 会话复用机制维护），不是扫 serve 的
+    session 目录——后者只能回答「最近哪个会话被动过」，既会把无关会话算进来，
+    也答不出真正被中断的是什么。顺带少一次对 serve 的 HTTP 调用：
+    要重启的时候，serve 很可能正是卡住的那个东西。
 
-    session 部分是 best-effort：serve 不可达 / 尚无 session 时静默省略这两行，
-    绝不让取信息的失败挡住重启本身。
+    best-effort：取不到就只留时间和恢复预期。list_inflight 自身已吞异常，
+    这里再包一层 try 是因为「通知渲染」永远不该挡住重启。
     """
     body = (f"- 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"- 约 10s 后恢复")
-    info = _find_bot_session_info()
-    if info:
-        sid, title = info
-        body += f"\n- session: `{sid}`"
-        if title:
-            body += f"\n- title: {title}"
+    try:
+        tasks = list_inflight()
+    except Exception as e:
+        log(f"reboot: 取在跑任务失败 {e}")
+        tasks = []
+    if tasks:
+        body += f"\n- 将中断 {len(tasks)} 个在跑任务："
+        for t in tasks[:_REBOOT_INFLIGHT_MAX]:
+            title = t.get("title") or "(无标题)"
+            body += f"\n  - `{t['sid'][:12]}` {title} · 已跑 {int(t['elapsed'])}s"
+        if len(tasks) > _REBOOT_INFLIGHT_MAX:
+            body += f"\n  - …另 {len(tasks) - _REBOOT_INFLIGHT_MAX} 个"
     return body
 
 

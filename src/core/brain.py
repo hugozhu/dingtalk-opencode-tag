@@ -15,9 +15,10 @@ SSE 流冒出 session.status/idle 事件；登记 sid（连同来源会话 conv 
 """
 
 import threading
+import time
 from collections import OrderedDict
 
-from core.agent_common import log
+from core.agent_common import _clean_session_title, log
 
 # ---------------------------------------------------------------------------
 # 生成实现：协议 + 注册 + 默认 echo
@@ -133,3 +134,58 @@ def session_conv(sid):
     with _sessions_lock:
         v = _sessions.get(sid)
         return dict(v) if v is not None else None
+
+
+# ---------------------------------------------------------------------------
+# 在跑任务登记表（协议 + 注册；实现由 custom 提供）
+#
+# 「现在有哪些任务正在跑」是**后端特定**的知识：只有真正驱动模型的实现（如
+# custom/brain.py 的 opencode 版）知道自己开了哪些会话、跑了多久。core 只定义协议，
+# 让 /reboot 这类通用逻辑能问"我这一停会打断什么"，而不必知道后端长什么样。
+# ---------------------------------------------------------------------------
+_inflight_impl = None      # () -> list[dict]
+
+
+def register_inflight(fn):
+    """注册「在跑任务快照」实现。签名 () -> list[dict]。
+
+    每项建议含 conv_id / sid / title / started(epoch 秒)；缺字段由 list_inflight 补齐。
+    """
+    global _inflight_impl
+    _inflight_impl = fn
+    log(f"brain(inflight) 实现已注册: {getattr(fn, '__module__', '?')}.{getattr(fn, '__name__', fn)}")
+
+
+def list_inflight():
+    """当前在跑任务快照，按 started 升序（跑得最久的在前）。
+
+    返回 [{"conv_id", "sid", "title", "started", "elapsed"}]，title 已归一成单行短文本。
+    未注册实现 / 实现抛异常 → 返回 []。
+
+    **绝不向上抛**：唯一的调用方是 /reboot 通知，可观测性不能挡住重启本身。
+    """
+    fn = _inflight_impl
+    if fn is None:
+        return []
+    try:
+        raw = fn() or []
+    except Exception as e:
+        log(f"list_inflight err: {e}")
+        return []
+    now = time.time()
+    out = []
+    for rec in raw:
+        try:
+            started = float(rec.get("started") or 0)
+        except (TypeError, ValueError):
+            started = 0.0
+        out.append({
+            "conv_id": rec.get("conv_id", "") or "",
+            "sid": rec.get("sid", "") or "",
+            "title": _clean_session_title(rec.get("title")),
+            "started": started,
+            # started 缺失（0）时 elapsed 记 0，而不是"从 1970 年跑到现在"
+            "elapsed": max(0.0, now - started) if started else 0.0,
+        })
+    out.sort(key=lambda r: r["started"] or now)
+    return out

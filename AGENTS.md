@@ -43,13 +43,11 @@ cp config/constants.sh config/constants.local.sh
    - 默认是 "请基于上述消息内容回应用户。"
    - 改成符合你业务场景的 prompt
 
-5. **改 `_predicate`**:
-   - 在 `handle_message` 的 cleanup 轮询里，`_predicate(msg)` 用来识别依赖服务转发的原始消息
-   - 替换 `'msgtype="business-special"'` 为你的业务消息特征字符串
-
-6. **改 `make_reply_msgs`**:
-   - 在 `inject_and_forward` 调用里，构造自己的通知消息格式（标题 + 正文）
-   - 注意：reply 不要被 `_md` 的 `**...**` 包裹（避免 agent 返回 `## 标题` 时变成 `**## 标题**`）
+5. **回复怎么生成，不在 handler 里**:
+   - handler 只负责「消息 → prompt」；生成交给能力调
+     `core.brain.generate_reply(user, prompt, raw=True, ctx={"conv_id": ...})`
+   - **ctx 一定要带 conv_id**：会话复用按 conv 粒度（`AGENT_SESSION_REUSE`），
+     不带就退化成每次新建的无状态会话，多轮上下文丢失
 
 ### Step 3: 注册业务路由
 
@@ -62,7 +60,7 @@ def route_reply(user, text, conv_type, raw_line):
         threading.Thread(target=handle_image, args=(time.time(),), daemon=True).start()
     elif match_business_line(raw_line):
         mid, convs = match_business_line(raw_line)
-        threading.Thread(target=handle_message, args=(mid, convs), daemon=True).start()
+        threading.Thread(target=handle_business, args=(mid, convs), daemon=True).start()
     else:
         handle_reply(user, text)
 
@@ -108,12 +106,12 @@ bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路�
 | `bin/core/stop.sh` | @core | (脚本本身) | 停止服务（launchd/nohup） |
 | `bin/core/reboot.sh` | @core | (脚本本身) | /reboot 指令执行体（委托 stop + start） |
 | `bin/custom/agent-template.plist` | @custom | (plist 本身) | launchd 配置模板 |
-| `src/core/agent_common.py` | @core | `inject_and_forward` / `_abort_and_clean_session` / `find_serve_credentials` / `_find_session_with_predicate` | 共享 Python 工具 |
+| `src/core/agent_common.py` | @core | `find_serve_credentials` / `serve_request` / `_proxy_vision` / `_clean_session_title` | 共享 Python 工具 |
 | `src/core/event_watcher.py` | @core | `connect_sse` / `log_tail_thread` / `format_and_forward` | 事件流主进程（调用 custom.routes 的 hook） |
-| `src/custom/handler.py` | @custom | `handle_message` / `fetch_attachments` / `render_prompt` / `_lookup_senders_batch` | 业务 handler（FDE 改这里） |
+| `src/custom/handler.py` | @custom | `fetch_attachments` / `render_prompt` / `_lookup_senders_batch` / `match_business_line` | 业务 handler（FDE 改这里） |
 | `src/custom/routes.py` | @custom | `route_reply` / `route_business_line` / `route_sse_event` | 业务路由注册（FDE 改这里，不改 core） |
 | `src/templates/handler_template.py` | @template | (同 custom/handler.py 的纯净版) | diff 基线，不要改 |
-| `tests/core/test_agent_common.py` | @core | `TestInjectAndForward` / `TestAbortAndCleanSession` / `TestFindSessionWithPredicate` | Python 单测 |
+| `tests/core/test_agent_common.py` | @core | `TestCleanSessionTitle` / `TestHandlerPools` | Python 单测 |
 | `tests/core/unit_test.sh` | @core | (脚本本身，含 dws-connect 订阅选择) | shell 单测 |
 | `tests/custom/test_dws_event_bridge.py` | @custom | `TestToConnectLine`（@我/群/单聊 convType 映射） | Python 单测 |
 | `tests/custom/test_ack_capability.py` | @custom | `TestShouldAck` / `TestLifecycleWorker` / `TestDispatchReplySent`（回执：已读+状态表情） | Python 单测 |
@@ -175,7 +173,7 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 ## 常见坑
 
-1. **`_find_bot_session` 按 time.updated 倒序选最新**，不是按 id 字典序——多个 session 共享 directory 时，id 字典序最大不等于最新活跃
+1. **会话复用只按 conv_id，不按工作目录**——一个目录下会有上百个 session，「最近活跃的那个」未必属于当前这场对话，按目录复用会串上下文。复用逻辑统一在 `custom/brain.py`（`AGENT_SESSION_REUSE`），能力侧只需在 ctx 里带上 `conv_id`
 2. **asked_ts buffer 设 5s**——依赖服务写日志时刻 vs serve POST 时刻有微小偏差
 3. **轮询 do-while 风格**（先调一次再判断）——保证至少调一次，避免常量 patch 为 0 时跳过整个循环
 4. **patch.object 第三参数是 `new` 不是 `return_value`**——指定 new 后不传 mock 给测试函数，测试函数不该有对应参数
@@ -193,7 +191,7 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 - shell 单测：`bash -n` 语法检查 + 函数级断言，不依赖网络/钉钉/serve
 - Python 单测：`unittest` + `patch.object(<module>, "<func>", return_value=...)`
-- 业务 handler 测试：mock `inject_and_forward` 验证 prompt 拼装 + 调用回调，不测模板内部
+- 业务 handler 测试：mock `core.brain.generate_reply` 验证 prompt 拼装 + **ctx 带 conv_id**，不测大脑内部
 - e2e 通用范式：**实际触发 + 监控日志 + DWS 独立拉群消息**（两侧对照的双校验）
   - **基础文本 e2e（最底层冒烟）**：以真人身份发一条纯文本、断言数字员工回复。这条不碰合并转发/serve，只验"收→大脑→发"闭环——最快定位链路断在哪。**已脚本化：`bash tests/custom/e2e_text_reply_test.sh`**（opencode / Claude Code / Codex 通用；参数化身份不写死，SKIP 友好）。
     ```bash
@@ -214,7 +212,7 @@ systemctl --user start dingtalk-agent.service     # 启动
   - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）；群聊场景可回退 `list-by-sender`（按发送者拉）。**但 o2o 私聊回复实测 `list-by-sender` 索引不到**——私聊校验必须用 `list --group <o2o-convId>`（convId 从 connect log 入站行 `convId=…` 取）。`e2e_text_reply_test.sh` 的 V4 即如此。
   - **坑#2**：实时订阅（connect 日志）**不回显当前登录用户自己发的消息**——数字员工的回复不会出现在它自己的接收流里，别把"connect 日志没看到回复"误判为没发出去；用校验 B 的 DWS 拉取确认。
   - **坑#3**：`dws event` 订阅偶发**投递停滞**——`dws event consume` 子进程还活着（healthcheck 只查进程存活会误判"健康"），但连接静默失活、消息迟迟不进 connect log，只延到下次重启。跑基础文本 e2e 时若 V2 超时未见入站，先 `bash bin/core/reboot.sh` 重建订阅再跑。
-  - **后端两条路都走 opencode serve HTTP**：普通文本回复走 `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI；合并转发业务走 `inject_and_forward` 的 serve HTTP `/session`。两者都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
+  - **所有能力共走同一条后端路**：文本回复、合并转发、图片、文件都调 `core.brain.generate_reply(ctx={"conv_id": ...})` → `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI。因为共享同一个 conv 的 session，**转发完再追问能接上上下文**。都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
   - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**（统一调试总开关，原 `AGENT_SERVE_DEBUG` 已并入）：每次 opencode 调用记一条摘要（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败），**并把每个 serve 请求/响应的完整 body（含发给模型的 prompt 与模型返回）写到同一文件**，长 body（图片 data_url 等）自动截断头尾。想确认"回复到底走 HTTP 还是 CLI 回退"或"到底发了什么 prompt / serve 返回了什么"都看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
 
 ## 事件消息处理
@@ -233,9 +231,7 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 - **不要**改 `src/core/` `bin/core/` `tests/core/` 下的任何文件——bug fix 走 PR 贡献回 upstream（见 [CONTRIBUTING.md](./CONTRIBUTING.md)）
 - **不要**用 `pgrep -f` 检测进程（会误匹配 send-by-bot 转发进程）——用 `verify_pid`
-- **不要**按 session id 字典序选最新——用 `time.updated` 倒序
-- **不要**在 handle_message 一开头就 cleanup——依赖服务可能延迟转发，应轮询等待
-- **不要**把 abort 触发的空 finalizer 留在 session history——用 `_abort_and_clean_session` 清理
+- **不要**在能力里自己找/建 session——调 `generate_reply(ctx={"conv_id": ...})`，复用交给 `custom/brain.py`
 - **不要**用 `flock`（macOS 不可用）——用 `shlock` 或文件存在性判断
 - **不要**用 `tee -a file >&2`（launchd 已重定向 stderr 到同一文件，会双写）——`log()` 只写 stderr
 - **不要**把真实凭据写入 `config/config.example.json` 或 `config/constants.sh`——只填 `*.local.*`（已 gitignore）
