@@ -100,3 +100,44 @@ stop_extra_cleanup() {
     done
     return 0
 }
+
+# ---------------------------------------------------------------------------
+# brain_probe — 大脑真实自检探针（core 的 check_brain 在失败计数超阈值时调用）
+#
+# 放 custom 是因为「怎么问一次模型」是 opencode 特定的；core 只负责计数、判阈值、
+# 出裁决。退出码：0=通过 1=失败 2=无法探测（无凭据）。
+# ---------------------------------------------------------------------------
+brain_probe() {
+    PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}" \
+    HEALTHCHECK_BRAIN_PROBE_TIMEOUT="${HEALTHCHECK_BRAIN_PROBE_TIMEOUT:-60}" \
+        python3 "$SCRIPT_DIR/bin/custom/brain_probe.py"
+}
+
+# ---------------------------------------------------------------------------
+# notify_alert_handler <msg> — 熔断告警发钉钉（monitor.sh / start.sh 的钩子）
+#
+# 没有它的话，熔断只往 monitor.log 写一行然后 exit 0；launchd 因
+# KeepAlive={SuccessfulExit:false} 故意不再拉起 —— 数字员工就那么躺着等人发现。
+# 这和 healthcheck 的盲区是同一类静默失败，只修一个等于留着环没闭。
+# dws 不依赖 opencode serve，所以 serve 死了它照样能发出去。
+#
+# **必须永不失败**：monitor 带 set -e，且调用点紧邻 exit 0。
+# ---------------------------------------------------------------------------
+notify_alert_handler() {
+    local msg="$1"
+    command -v dws >/dev/null 2>&1 || return 0
+    [[ -n "${AGENT_PROFILE:-}" && -n "${DWS_EVENT_O2O_USERS:-}" ]] || return 0
+    # 收件人取单聊订阅列表的第一个（通常就是主管）
+    local to="${DWS_EVENT_O2O_USERS%%,*}"
+    [[ -n "$to" ]] || return 0
+    dws chat message send --user "$to" \
+        --text "### 🚨 数字员工熔断
+
+**$msg**
+
+- 主机: $(hostname)
+- 时间: $(date '+%Y-%m-%d %H:%M:%S')
+- 恢复: \`bash bin/core/start.sh\`" \
+        --profile "$AGENT_PROFILE" -y >/dev/null 2>&1 || true
+    return 0
+}

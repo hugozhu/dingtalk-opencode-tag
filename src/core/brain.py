@@ -14,6 +14,7 @@ SSE 流冒出 session.status/idle 事件；登记 sid（连同来源会话 conv 
 - 默认（未注册）：echo 规则式回复（无网络依赖）。
 """
 
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -120,11 +121,79 @@ def register_session(sid, ctx=None):
 
 
 def is_textreply_session(sid):
-    """该 SSE sessionID 是否是大脑临时 session（命中则抑制其业务通知）。"""
+    """该 SSE sessionID 是否是大脑临时 session（命中则抑制其业务通知）。
+
+    除进程内登记表外，还查**跨进程**登记文件（见 _ext_sessions）：healthcheck 的大脑
+    探针在独立进程里建 session，进程内表看不见它，不抑制的话每次探针都会往钉钉推
+    「📥 收到新请求」+「✅ 会话完成」。
+    """
     if not sid:
         return False
     with _sessions_lock:
-        return sid in _sessions
+        if sid in _sessions:
+            return True
+    return sid in _ext_sessions()
+
+
+# --- 跨进程 session 登记（文件旁路）---
+#
+# 场景：healthcheck 的大脑探针是**独立进程**，它建的 session 不在本进程的 _sessions 里，
+# SSE 事件会漏到默认转发逻辑上去刷屏。用一个小文件当旁路，探针写、本进程读。
+# 按 mtime 缓存：SSE 是热路径，不能每个事件都去 stat + 读文件。
+_EXT_SESSION_FILE = os.environ.get(
+    "AGENT_EXT_SESSION_FILE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                 ".ext-sessions"))
+_ext_cache = {"mtime": -1.0, "sids": frozenset()}
+_ext_lock = threading.Lock()
+
+
+def _ext_sessions():
+    """读跨进程登记的待抑制 sid 集合。best-effort：文件不存在/读失败一律当空集。"""
+    try:
+        mtime = os.path.getmtime(_EXT_SESSION_FILE)
+    except OSError:
+        return frozenset()
+    with _ext_lock:
+        if _ext_cache["mtime"] == mtime:
+            return _ext_cache["sids"]
+    try:
+        with open(_EXT_SESSION_FILE, "r", encoding="utf-8") as f:
+            sids = frozenset(ln.strip() for ln in f if ln.strip())
+    except OSError:
+        return frozenset()
+    with _ext_lock:
+        _ext_cache["mtime"] = mtime
+        _ext_cache["sids"] = sids
+    return sids
+
+
+def register_ext_session(sid, path=None):
+    """把 sid 追加进跨进程登记文件（探针进程调用）。best-effort。"""
+    if not sid:
+        return
+    try:
+        with open(path or _EXT_SESSION_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{sid}\n")
+    except OSError as e:
+        log(f"register_ext_session err: {e}")
+
+
+def unregister_ext_session(sid, path=None):
+    """把 sid 从跨进程登记文件里摘掉（探针 finally 调用）。best-effort。"""
+    if not sid:
+        return
+    p = path or _EXT_SESSION_FILE
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            keep = [ln for ln in f if ln.strip() and ln.strip() != sid]
+        if keep:
+            with open(p, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+        else:
+            os.remove(p)
+    except OSError:
+        pass
 
 
 def session_conv(sid):

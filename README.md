@@ -185,7 +185,7 @@ monitor 起来后，**去群里发条消息试试** —— 数字员工就回你
 ## 验证在线
 
 ```bash
-bash bin/core/healthcheck.sh                 # 6 项健康检查，应 ✅ 健康
+bash bin/core/healthcheck.sh                 # 7 项健康检查，应 ✅ 健康
 # 群里发 "1+1" → 数字员工回 "2"
 ```
 

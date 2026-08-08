@@ -255,7 +255,7 @@ Complete index in AGENTS.md "关键文件 / 函数索引". Key files:
 | File | Purpose |
 |------|---------|
 | `bin/core/monitor.sh` | Daemon supervisor (cleanup → start → healthcheck → circuit breaker) |
-| `bin/core/healthcheck.sh` | 6 health checks |
+| `bin/core/healthcheck.sh` | 7 health checks (incl. real brain probe) |
 | `bin/core/lib.sh` | Shared utilities (verify_pid, acquire_lock, stop_components) |
 | `src/core/event_watcher.py` | Main event loop (SSE + log-tail + capability dispatch) |
 | `src/core/capabilities.py` | Plugin registry |

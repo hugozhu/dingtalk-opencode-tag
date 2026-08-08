@@ -18,13 +18,14 @@ launchd agent (com.example.agent-connect)
                           （exit 0 → launchd 不再拉起，等人工；
                            崩溃 exit 非零 / SIGTERM cleanup exit 1 → launchd 自动恢复）
 
-healthcheck.sh (monitor 调用) — 6 项检查（4 硬 + 2 告警）
+healthcheck.sh (monitor 调用) — 7 项检查（5 硬 + 2 告警）
   ├── 检查1: connect 进程存活（PID 文件 + kill -0 + cmdline 签名，硬失败）
   ├── 检查2: 日志活跃度（35 分钟内有活动，仅告警）
   ├── 检查3: 日志尾部致命错误（grep FATAL/panic，硬失败）
   ├── 检查4: event-watcher 进程活跃（仅告警）
   ├── 检查5: serve 进程存活（PID + kill -0，硬失败）
   └── 检查6: serve HTTP /session 响应（凭据自刷新，硬失败）
+  └── 检查7: 大脑真实自检（失败计数超阈值才真发一次模型调用，硬失败）
 
 event-watcher.py (3 个独立线程 + 主线程)
   ├── 主线程: connect_sse() — 无限重试 + 退避（3s→30s）连 opencode serve /event
