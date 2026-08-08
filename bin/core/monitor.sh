@@ -130,8 +130,11 @@ warmup() {
 # 用 run_with_timeout 包裹：healthcheck 内部要发 HTTP 探测，serve 卡死时可能久久不返回。
 # 不设超时的话 run_forever 会停在这一行，既不重启也不告警 —— 监督器自己先哑了。
 # 超时返回 124（非零）→ 计入不健康 → 走重启/熔断路径，这正是我们要的行为。
+# --consume：只有守护循环消费「距上次检查以来」的大脑失败计数窗口。手动运行
+# healthcheck、startup_report 的门禁、各 e2e 脚本都走默认的 peek，不会把窗口清掉
+# （否则它们会把真实失败对下一次守护检查静默掩盖）。
 run_healthcheck() {
-    run_with_timeout "$HEALTHCHECK_TIMEOUT" bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
+    run_with_timeout "$HEALTHCHECK_TIMEOUT" bash "$SCRIPT_DIR/bin/core/healthcheck.sh" --consume
 }
 
 # 熔断告警（用户实现 notify_alert <msg>）
@@ -246,7 +249,7 @@ main() {
     start_all
     sleep 3
     warmup
-    bash "$SCRIPT_DIR/bin/core/healthcheck.sh"
+    bash "$SCRIPT_DIR/bin/core/healthcheck.sh" --consume
     # .next-check 仅作展示（下次检查时间戳）。macOS `date -v+Ns`，Linux `date -d "+N sec"`；
     # 两个都不行就退回"当前时间+间隔"算术，保证跨平台不报错。
     { date -v+"${CHECK_INTERVAL}"S '+%s' 2>/dev/null \

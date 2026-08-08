@@ -130,6 +130,53 @@ run_with_timeout() {
     wait "$cmd_pid"
 }
 
+# count_new_matches <log_file> <offset_file> <grep_pattern> <consume>
+#
+# 统计 <log_file> 里**距上次调用以来**新增的、匹配 <grep_pattern> 的行数。
+# 输出一行：`<inode> <size> <count>`。consume 非空时把 `<inode> <size>` 写回
+# <offset_file>，作为下次的窗口起点；为空则只看不动（peek）。
+#
+# 为什么按字节偏移而不是时间戳：目标日志（opencode.log）在 AGENT_DEBUG=1 下混有大量
+# 多行 REQ/RESP body，按时间戳切窗要逐行解析；按偏移只需 tail -c，且天然不受
+# body 里的时间戳文本干扰。
+#
+# **首次调用（无 offset 文件）只建基线、计数 0** —— 不倒算历史。这条很关键：
+# 服务重启后 clean_runtime_state 会删掉 offset 文件，若此时把积压的历史失败全算进来，
+# 一启动就会误判成"刚刚坏了"。
+# 轮转（inode 变）或截断（size < 记录的 offset）→ 从新文件头开始算。
+count_new_matches() {
+    local log_file="$1" offset_file="$2" pattern="$3" consume="${4:-}"
+    local off=0 saved_ino="" cur_ino=0 size=0 n=0
+
+    if [[ ! -f "$log_file" ]]; then
+        echo "0 0 0"
+        return
+    fi
+    size=$(wc -c < "$log_file" 2>/dev/null | tr -d ' ')
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    # inode：macOS `stat -f %i`，Linux `stat -c %i`——两个都试（同 healthcheck 的 mtime 写法）
+    cur_ino=$(stat -f %i "$log_file" 2>/dev/null || stat -c %i "$log_file" 2>/dev/null || echo 0)
+
+    if [[ ! -f "$offset_file" ]]; then
+        [[ -n "$consume" ]] && echo "$cur_ino $size" > "$offset_file"
+        echo "$cur_ino $size 0"
+        return
+    fi
+
+    read -r saved_ino off < "$offset_file" 2>/dev/null || true
+    [[ "$off" =~ ^[0-9]+$ ]] || off=0
+    if [[ "$saved_ino" != "$cur_ino" || "$size" -lt "$off" ]]; then
+        off=0
+    fi
+
+    # grep -c 零匹配时退出码为 1，set -e 下会杀掉整个脚本 —— 必须 || true 且兜默认值
+    n=$(tail -c "+$((off + 1))" "$log_file" 2>/dev/null | grep -c -E "$pattern" 2>/dev/null || true)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+
+    [[ -n "$consume" ]] && echo "$cur_ino $size" > "$offset_file"
+    echo "$cur_ino $size $n"
+}
+
 # ---------------------------------------------------------------------------
 # 组件清单单一真相源 — monitor.sh / reboot.sh / healthcheck.sh 共享，避免命名漂移
 #   COMP_NAMES：组件名（下划线，对应 start_<name> 函数）
@@ -144,7 +191,10 @@ HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "event_wa
 
 # monitor 自身的运行时状态文件（reboot 清理时用）
 HARNESS_MONITOR_LOCK="${LOCK_FILE:-/tmp/agent-monitor.lock}"
-HARNESS_EXTRA_STATE_BASENAMES=(".next-check" ".serve.port" ".serve.pwd" ".opencode-connect-status.json")
+# .opencode-log.offset 必须在这张表里：stop/reboot 时删掉它，下次启动才会以当前日志大小
+# 重新建基线；否则重启后会把停机前积压的失败当成"刚刚新增的"，一起步就误判为大脑坏了。
+# .ext-sessions 同理 —— 探针崩溃留下的残留 sid 要能被清掉。
+HARNESS_EXTRA_STATE_BASENAMES=(".next-check" ".serve.port" ".serve.pwd" ".opencode-connect-status.json" ".opencode-log.offset" ".ext-sessions")
 
 # ---------------------------------------------------------------------------
 # 服务控制共享函数 — start.sh / stop.sh / reboot.sh 共享逻辑，避免重复

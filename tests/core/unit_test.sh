@@ -232,6 +232,60 @@ assert_eq "run_with_timeout 超时后子进程被真正杀死（无孤儿）" "1
     "$([[ -f "$TMO_MARK" ]] && echo 0 || echo 1)"
 rm -f "$TMO_MARK"
 
+# ---------------------------------------------------------------------------
+# 大脑真实自检：计数窗口语义 + 钩子存在性
+#
+# 窗口语义每一条都对应一种误报/漏报：倒算历史 → 一重启就误判；累计而非窗口 → 一旦
+# 坏过一次就永远超阈值；body 行被计数 → 模型输出能伪造健康状态。
+# ---------------------------------------------------------------------------
+echo ""
+echo "Testing 大脑自检计数窗口（count_new_matches）..."
+
+_BP='^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] transport=(http|cli) .* ok=False'
+CNT_LOG=$(mktemp); CNT_OFF="$CNT_LOG.off"; rm -f "$CNT_OFF"
+_cnt_fail() { printf '[2026-08-08 09:18:35] transport=http model=m elapsed=1s prompt_len=1 reply_len=0 ok=False err=x\n' >> "$CNT_LOG"; }
+_cnt() { count_new_matches "$CNT_LOG" "$CNT_OFF" "$_BP" "${1:-}" | awk '{print $3}'; }
+
+_cnt_fail; _cnt_fail; _cnt_fail
+assert_eq "首次运行不倒算历史失败" "0" "$(_cnt consume)"
+_cnt_fail; _cnt_fail
+assert_eq "统计新增 2 条" "2" "$(_cnt consume)"
+assert_eq "窗口非累计（无新增归零）" "0" "$(_cnt consume)"
+_cnt_fail
+assert_eq "peek 不消费窗口（第一次）" "1" "$(_cnt)"
+assert_eq "peek 不消费窗口（第二次仍可见）" "1" "$(_cnt)"
+_cnt consume >/dev/null
+printf '[2026-08-08 09:20:00] <<< RESP status=200 body={"t":"transport=http ok=False"}\n' >> "$CNT_LOG"
+assert_eq "RESP body 里的 ok=False 不被计数（锚定行首）" "0" "$(_cnt consume)"
+_cnt_fail; : > "$CNT_LOG"; _cnt_fail
+assert_eq "日志被截断后从头计数" "1" "$(_cnt consume)"
+CNT_LOG2=$(mktemp)
+printf '[2026-08-08 09:18:35] transport=cli model=m elapsed=1s prompt_len=1 reply_len=0 ok=False\n' >> "$CNT_LOG2"
+mv "$CNT_LOG2" "$CNT_LOG"
+assert_eq "日志轮转（inode 变）后从头计数" "1" "$(_cnt consume)"
+assert_eq "日志不存在时返回 0 且不报错" "0" \
+    "$(count_new_matches /nonexistent/nope.log "$CNT_OFF" "$_BP" | awk '{print $3}')"
+rm -f "$CNT_LOG" "$CNT_OFF"
+
+assert_eq "brain 检查已接进硬失败判定列表" "0" \
+    "$(grep -q '"brain|\$r_brain"' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
+assert_eq "healthcheck 支持 --consume" "0" \
+    "$(grep -q -- '--consume) consume=' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
+assert_eq "monitor 守护循环传 --consume" "0" \
+    "$(grep -q 'healthcheck.sh" --consume' "$SCRIPT_DIR/bin/core/monitor.sh" && echo 0 || echo 1)"
+assert_eq "offset 文件登记进可清理状态表" "0" \
+    "$(grep -q '.opencode-log.offset' "$SCRIPT_DIR/bin/core/lib.sh" && echo 0 || echo 1)"
+assert_eq "brain_probe.py 语法正确" "0" \
+    "$(python3 -m py_compile "$SCRIPT_DIR/bin/custom/brain_probe.py" 2>&1; echo $?)"
+
+# custom 钩子存在性（COMP_NAMES=() 见上文：未绑定数组在 set -u + bash 3.2 下是致命的）
+COMP_NAMES=()
+source "$SCRIPT_DIR/bin/custom/start_funcs.sh" >/dev/null 2>&1
+assert_eq "custom 定义 brain_probe 钩子" "0" \
+    "$(declare -F brain_probe >/dev/null 2>&1 && echo 0 || echo 1)"
+assert_eq "custom 定义 notify_alert_handler 钩子（熔断告警不再静默）" "0" \
+    "$(declare -F notify_alert_handler >/dev/null 2>&1 && echo 0 || echo 1)"
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

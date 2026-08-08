@@ -30,6 +30,15 @@ export WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-60}"             # warmup 超时
 # 的监督循环停摆——不重启也不告警。两个都是防御性上限，正常路径远远用不到。
 export HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-120}"  # monitor 包裹单次 healthcheck
 export HEALTHCHECK_HTTP_TIMEOUT="${HEALTHCHECK_HTTP_TIMEOUT:-8}"  # check_serve_http 的 curl
+
+# 大脑真实自检（检查7）。进程活着 + HTTP 200 **不等于**大脑活着——前两者都不碰模型。
+# 触发式：每次健康检查统计 $AGENT_OPENCODE_LOG 里「距上次检查以来」新增的 ok=False 条数，
+# ≥ 阈值才真发一次模型调用（"1+1"）。失败即硬失败 → monitor 重启 serve；
+# 连续 MAX_FAILURES 次 → 熔断告警。零失败时不发任何请求 → 稳态零 token 成本。
+# 注：一次失败的对话可能记两条（HTTP 一条 + CLI 回退一条），故阈值 3 约等于 2 轮失败。
+export HEALTHCHECK_BRAIN_CHECK_ENABLED="${HEALTHCHECK_BRAIN_CHECK_ENABLED:-1}"
+export HEALTHCHECK_BRAIN_FAIL_THRESHOLD="${HEALTHCHECK_BRAIN_FAIL_THRESHOLD:-3}"
+export HEALTHCHECK_BRAIN_PROBE_TIMEOUT="${HEALTHCHECK_BRAIN_PROBE_TIMEOUT:-60}"
 export KICKSTART_RETRY_INTERVAL="${KICKSTART_RETRY_INTERVAL:-10}"
 export LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.example.agent-connect}"
 # /reboot 重启机制: auto(默认,自动判定) | launchd(launchctl kickstart) | nohup(直接重启

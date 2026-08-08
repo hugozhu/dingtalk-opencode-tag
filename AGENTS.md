@@ -102,7 +102,7 @@ bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路�
 | 文件 | 层 | 关键函数 | 用途 |
 |------|----|---------|------|
 | `bin/core/monitor.sh` | @core | `cleanup_stale_state` / `start_all` / `run_forever` | 守护循环 + 熔断 |
-| `bin/core/healthcheck.sh` | @core | `check_connect` / `check_serve_http` | 6 项健康检查 |
+| `bin/core/healthcheck.sh` | @core | `check_connect` / `check_serve_http` / `check_brain` | 7 项健康检查 |
 | `bin/core/lib.sh` | @core | `verify_pid` / `acquire_lock` / `resolve_restart_mode` / `stop_components` | 共享 shell 工具 + 服务控制助手 |
 | `bin/core/start.sh` | @core | (脚本本身) | 启动服务（launchd/nohup） |
 | `bin/core/stop.sh` | @core | (脚本本身) | 停止服务（launchd/nohup） |
@@ -176,18 +176,19 @@ systemctl --user start dingtalk-agent.service     # 启动
 ## 常见坑
 
 1. **`_find_bot_session` 按 time.updated 倒序选最新**，不是按 id 字典序——多个 session 共享 directory 时，id 字典序最大不等于最新活跃
-2. **asked_ts buffer 设 5s**——依赖服务写日志时刻 vs serve POST 时刻有微小偏差
-3. **轮询 do-while 风格**（先调一次再判断）——保证至少调一次，避免常量 patch 为 0 时跳过整个循环
-4. **patch.object 第三参数是 `new` 不是 `return_value`**——指定 new 后不传 mock 给测试函数，测试函数不该有对应参数
-5. **reply 不要被 `_md` 的 `**...**` 包裹**——避免 agent 返回 `## 标题` 时变成 `**## 标题**`；直接把 reply 作为通知正文
-6. **空回复撤回受限**——依赖服务触发 abort 后返回空 finalizer 被发到通知渠道时，event-watcher 无法用机器人身份撤回（钉钉 API "仅消息发送者可撤回" + 缺 processQueryKey）。需要依赖服务端配合过滤空回复。
-7. **不要改 core 改 routes**——业务路由注册到 `src/custom/routes.py`，**绝不改 `src/core/event_watcher.py`**。core 的路径在 upstream 和 fork 里必须一致才能干净 merge。
-8. **dws 输出格式随版本会变，bridge 要兼容**——`dws event consume -f ndjson` 的事件格式有两种：旧版**嵌套**（外层 `type=="event"`，事件体在 `data`(二层 JSON 字符串)`.payload.body`）、新版**扁平**（字段直接在事件顶层，`type` 即事件类型名如 `user_im_message_receive_o2o`，无 `data` 包裹）。`dws_event_bridge.py` 两种都解析。**故障特征极隐蔽**：格式不匹配时 bridge 把每条事件都跳过（`处理 0 条`），进程/连接/healthcheck 全绿但数字员工完全不响应。诊断捷径：`dws event consume ... | cat` 能看到原始数据、`... | python3 dws_event_bridge.py` 却 `处理 0 条` → 就是格式不匹配。bridge 内置**格式健康检查**：收到 ≥3 条原始事件却解析 0 条时，在 connect-log + monitor.log 报 `⚠️ 格式健康告警`。
-9. **`for line in sys.stdin` 在管道下有 readahead 缓冲**——低频事件流会卡在缓冲里不实时 yield，bridge 用 `iter(sys.stdin.readline, "")` 逐行读避免。
-10. **杀 `dws event consume` 必须连子树一起杀**（#71）——consume 会派生 `dws event _bus` 子进程（真正持流连接的那个）。只 `kill <consumer>` 会把 _bus 甩成孤儿被 init 收养，它继续占着订阅消费消息；重启后新旧 _bus 抢投递，表象为「投递停滞/收不到消息」。约定：`dws-connect.sh` 收尾用 `_kill_subtree`（子在前）+ EXIT/TERM trap；`stop.sh` / `monitor.sh stop_all` 杀完组件后调 custom 钩子 `stop_extra_cleanup`（定义在 `bin/custom/start_funcs.sh`），按 `DWS_PROFILE` 精确清扫进程树已断裂、COMP_PATTERNS 够不着的残留 `dws event` 进程。
-11. **/reboot 必须用干净环境重启**（#71）——`reboot.sh` 由老 event_watcher 派生，继承老 monitor 启动时的全部 env。若直接透传，config 里 `export VAR="${VAR:-新值}"` 风格的赋值会被继承的旧值压住——改完 `config/constants.local.sh` 后 /reboot 不生效（新 monitor / serve 仍带旧 env）。`reboot.sh` 用 `env -i`（仅保留 HOME/USER/PATH 等基本量）跑 stop.sh + start.sh，让 config 成为 env 的唯一来源，行为与「开新终端手工全停全起」一致。PATH 依赖 `constants.local.sh` 里 `export PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin"` 补回 dws / opencode。
-12. **macOS keychain 锁定会让 `dws profile list` 返回空**（#71）——e2e 冒烟的发送方自动探测会因此 SKIP，容易误判为"没登录"。解锁：`security unlock-keychain ~/Library/Keychains/login.keychain-db`；或显式 `E2E_SENDER_PROFILE="<corpId>:<真人userId>"` 绕过探测。`start.sh` 启动时已做 keychain 预检并打印提示。
-13. **e2e 冒烟别依赖硬编码免费模型**（#71）——`opencode/deepseek-v4-flash-free` 等免费模型会失效/超时，未 source 配置时 e2e 会 HTTP 90s + CLI 90s = 180s 慢失败，易误判为链路问题。`e2e_text_http_test.sh` 约定：未显式设 `AGENT_OPENCODE_MODEL` 时先 source `config/constants.local.sh` 取真实可用模型，且起临时 serve 后**轮询 /session 就绪探测**（最多 30s）再发请求，不裸 sleep。
+2. **进程活着 + HTTP 200 ≠ 大脑活着**——`check_serve`/`check_serve_http` 都不碰模型。2026-08-08 大脑与模型网关失联 16 分钟，这两项全程 OK、healthcheck 每 5 分钟报「健康」，任何请求都答不出来，只能靠人在钉钉里发现。故新增检查7 `check_brain`：按 `opencode.log` 里「距上次检查以来」新增的 `ok=False` 条数触发一次**真实模型调用**自检（阈值 `HEALTHCHECK_BRAIN_FAIL_THRESHOLD`，默认 3），健康时零请求零成本
+3. **asked_ts buffer 设 5s**——依赖服务写日志时刻 vs serve POST 时刻有微小偏差
+4. **轮询 do-while 风格**（先调一次再判断）——保证至少调一次，避免常量 patch 为 0 时跳过整个循环
+5. **patch.object 第三参数是 `new` 不是 `return_value`**——指定 new 后不传 mock 给测试函数，测试函数不该有对应参数
+6. **reply 不要被 `_md` 的 `**...**` 包裹**——避免 agent 返回 `## 标题` 时变成 `**## 标题**`；直接把 reply 作为通知正文
+7. **空回复撤回受限**——依赖服务触发 abort 后返回空 finalizer 被发到通知渠道时，event-watcher 无法用机器人身份撤回（钉钉 API "仅消息发送者可撤回" + 缺 processQueryKey）。需要依赖服务端配合过滤空回复。
+8. **不要改 core 改 routes**——业务路由注册到 `src/custom/routes.py`，**绝不改 `src/core/event_watcher.py`**。core 的路径在 upstream 和 fork 里必须一致才能干净 merge。
+9. **dws 输出格式随版本会变，bridge 要兼容**——`dws event consume -f ndjson` 的事件格式有两种：旧版**嵌套**（外层 `type=="event"`，事件体在 `data`(二层 JSON 字符串)`.payload.body`）、新版**扁平**（字段直接在事件顶层，`type` 即事件类型名如 `user_im_message_receive_o2o`，无 `data` 包裹）。`dws_event_bridge.py` 两种都解析。**故障特征极隐蔽**：格式不匹配时 bridge 把每条事件都跳过（`处理 0 条`），进程/连接/healthcheck 全绿但数字员工完全不响应。诊断捷径：`dws event consume ... | cat` 能看到原始数据、`... | python3 dws_event_bridge.py` 却 `处理 0 条` → 就是格式不匹配。bridge 内置**格式健康检查**：收到 ≥3 条原始事件却解析 0 条时，在 connect-log + monitor.log 报 `⚠️ 格式健康告警`。
+10. **`for line in sys.stdin` 在管道下有 readahead 缓冲**——低频事件流会卡在缓冲里不实时 yield，bridge 用 `iter(sys.stdin.readline, "")` 逐行读避免。
+11. **杀 `dws event consume` 必须连子树一起杀**（#71）——consume 会派生 `dws event _bus` 子进程（真正持流连接的那个）。只 `kill <consumer>` 会把 _bus 甩成孤儿被 init 收养，它继续占着订阅消费消息；重启后新旧 _bus 抢投递，表象为「投递停滞/收不到消息」。约定：`dws-connect.sh` 收尾用 `_kill_subtree`（子在前）+ EXIT/TERM trap；`stop.sh` / `monitor.sh stop_all` 杀完组件后调 custom 钩子 `stop_extra_cleanup`（定义在 `bin/custom/start_funcs.sh`），按 `DWS_PROFILE` 精确清扫进程树已断裂、COMP_PATTERNS 够不着的残留 `dws event` 进程。
+12. **/reboot 必须用干净环境重启**（#71）——`reboot.sh` 由老 event_watcher 派生，继承老 monitor 启动时的全部 env。若直接透传，config 里 `export VAR="${VAR:-新值}"` 风格的赋值会被继承的旧值压住——改完 `config/constants.local.sh` 后 /reboot 不生效（新 monitor / serve 仍带旧 env）。`reboot.sh` 用 `env -i`（仅保留 HOME/USER/PATH 等基本量）跑 stop.sh + start.sh，让 config 成为 env 的唯一来源，行为与「开新终端手工全停全起」一致。PATH 依赖 `constants.local.sh` 里 `export PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin"` 补回 dws / opencode。
+13. **macOS keychain 锁定会让 `dws profile list` 返回空**（#71）——e2e 冒烟的发送方自动探测会因此 SKIP，容易误判为"没登录"。解锁：`security unlock-keychain ~/Library/Keychains/login.keychain-db`；或显式 `E2E_SENDER_PROFILE="<corpId>:<真人userId>"` 绕过探测。`start.sh` 启动时已做 keychain 预检并打印提示。
+14. **e2e 冒烟别依赖硬编码免费模型**（#71）——`opencode/deepseek-v4-flash-free` 等免费模型会失效/超时，未 source 配置时 e2e 会 HTTP 90s + CLI 90s = 180s 慢失败，易误判为链路问题。`e2e_text_http_test.sh` 约定：未显式设 `AGENT_OPENCODE_MODEL` 时先 source `config/constants.local.sh` 取真实可用模型，且起临时 serve 后**轮询 /session 就绪探测**（最多 30s）再发请求，不裸 sleep。
 
 ## 测试约定
 
