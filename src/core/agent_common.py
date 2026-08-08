@@ -401,16 +401,32 @@ def serve_request(method, path, body=None, timeout=8, *, port=None, pwd=None):
     return json.loads(raw) if raw.strip() else None
 
 
-def _find_bot_session():
-    """找数字员工当前会话（directory 含 _BOT_DIR_SUBSTR，time.updated 最新的）。
+def _clean_session_title(title, limit=60):
+    """把 session title 压成单行短文本，供通知/日志展示。
 
-    注意：按 time.updated 倒序选最新活跃 session，**不**按 id 字典序——
-    多个 session 共享同一 directory 时，id 字典序最大不等于最新活跃。
+    title 由 brain._session_title 生成（#89），形如「[群] 张三 · 帮我看下这个报错」，
+    理论上已单行限长；但它源自用户消息，这里再收一次口——折叠换行与连续空白、超长截断，
+    避免异常 title 把 markdown 通知撑坏。无 title 返回空串。
     """
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return None
+    s = " ".join(str(title or "").split())
+    if len(s) > limit:
+        s = s[:limit] + "…"
+    return s
+
+
+def _find_bot_session_info():
+    """找数字员工当前会话，返回 (id, title)；无会话 / serve 不可达时返回 None。
+
+    与 _find_bot_session 共用一套选取规则（见其 docstring），额外带回清洗过的 title，
+    供 /reboot 通知（#98）这类需要向人展示「当前在处理哪个会话」的场景使用。
+    title 缺失时返回空串而非 None，调用方按需跳过该字段。
+
+    best-effort：凭据发现与 HTTP 都在 try 内，任何异常都降级成 None，不向上抛。
+    """
     try:
+        pid, port, pwd = find_serve_credentials()
+        if not port:
+            return None
         data = serve_request("GET", "/session", timeout=8, port=port, pwd=pwd)
         sessions = data if isinstance(data, list) else data.get("data", [])
         bot = None
@@ -422,10 +438,22 @@ def _find_bot_session():
                 if updated > bot_updated:
                     bot = s
                     bot_updated = updated
-        return bot.get("id") if bot else None
+        if not bot or not bot.get("id"):
+            return None
+        return bot.get("id"), _clean_session_title(bot.get("title"))
     except Exception as e:
-        log(f"find_bot_session err: {e}")
+        log(f"find_bot_session_info err: {e}")
         return None
+
+
+def _find_bot_session():
+    """找数字员工当前会话 id（directory 含 _BOT_DIR_SUBSTR，time.updated 最新的）。
+
+    注意：按 time.updated 倒序选最新活跃 session，**不**按 id 字典序——
+    多个 session 共享同一 directory 时，id 字典序最大不等于最新活跃。
+    """
+    info = _find_bot_session_info()
+    return info[0] if info else None
 
 
 def _find_session_with_predicate(predicate, asked_ts_ms=None, max_candidates=8):

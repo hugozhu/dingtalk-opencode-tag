@@ -57,6 +57,7 @@ from core.agent_common import (
     PROFILE,
     _create_session,
     _find_bot_session,
+    _find_bot_session_info,
     _get_message_text,
     _md,
     _post_user_message,
@@ -275,6 +276,26 @@ def _reboot_ack(msg):
         log(f"reboot: 贴表情失败 {e}")
 
 
+def _reboot_body():
+    """拼重启通知正文：时间 + 恢复预期 + 当前 opencode session 的 id/title（#98）。
+
+    带上 session 是为了「重启后能回看重启前正在处理什么」——有进行中的长任务时，
+    可直接按 id 定位，或按 title 在 opencode 后台找到那次会话。
+
+    session 部分是 best-effort：serve 不可达 / 尚无 session 时静默省略这两行，
+    绝不让取信息的失败挡住重启本身。
+    """
+    body = (f"- 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"- 约 10s 后恢复")
+    info = _find_bot_session_info()
+    if info:
+        sid, title = info
+        body += f"\n- session: `{sid}`"
+        if title:
+            body += f"\n- title: {title}"
+    return body
+
+
 def handle_reboot(msg):
     """收到 /reboot 指令：已读+表情 → 发通知 → 派生 reboot.sh → os._exit(0)。"""
     global last_reboot_at
@@ -293,8 +314,7 @@ def handle_reboot(msg):
 
     log(f"reboot: 收到 {user} 的 /reboot 指令，派生 reboot.sh 并退出")
     send_notification("🔄 正在重启",
-                      _md("正在重启", "🔄 收到 /reboot 指令",
-                          f"- 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n- 约 10s 后恢复"))
+                      _md("正在重启", "🔄 收到 /reboot 指令", _reboot_body()))
 
     try:
         subprocess.Popen(["bash", os.path.join(PROJECT_ROOT, "bin", "core", "reboot.sh")],
