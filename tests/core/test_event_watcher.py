@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """test_event_watcher.py — core event_watcher.py 解析逻辑单测
 
-覆盖 parse_sse_events（SSE 流解析）——此前无测试，且最易因 serve 传输编码变化而崩。
-不依赖网络：用假响应对象喂 read1/read。
+覆盖：
+- parse_sse_events（SSE 流解析）——此前无测试，且最易因 serve 传输编码变化而崩
+- _reboot_body（/reboot 通知正文附带 session id/title，#98）
+
+不依赖网络：用假响应对象喂 read1/read；session 信息用 patch 注入。
 """
 
 import os
 import socket
 import sys
 import unittest
+from unittest.mock import patch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
@@ -70,6 +74,32 @@ class TestParseSSEEvents(unittest.TestCase):
         event_watcher.running = False
         resp = _FakeResp([b'data: never\n'])
         self.assertEqual(list(event_watcher.parse_sse_events(resp)), [])
+
+
+class TestRebootBody(unittest.TestCase):
+    """Test _reboot_body — /reboot 通知正文带 session id/title，取不到就降级 (#98)."""
+
+    @patch.object(event_watcher, "_find_bot_session_info",
+                  return_value=("ses_abc123", "[群] 张三 · 看下这个报错"))
+    def test_includes_session_id_and_title(self, _fbsi):
+        body = event_watcher._reboot_body()
+        self.assertIn("- session: `ses_abc123`", body)
+        self.assertIn("- title: [群] 张三 · 看下这个报错", body)
+        self.assertIn("约 10s 后恢复", body)
+
+    @patch.object(event_watcher, "_find_bot_session_info", return_value=None)
+    def test_omits_session_lines_when_unavailable(self, _fbsi):
+        # serve 不可达 / 无 session：正文只剩时间和恢复预期，不能出现空的 session 行
+        body = event_watcher._reboot_body()
+        self.assertNotIn("session:", body)
+        self.assertNotIn("title:", body)
+        self.assertIn("约 10s 后恢复", body)
+
+    @patch.object(event_watcher, "_find_bot_session_info", return_value=("ses_notitle", ""))
+    def test_omits_title_line_when_title_empty(self, _fbsi):
+        body = event_watcher._reboot_body()
+        self.assertIn("- session: `ses_notitle`", body)
+        self.assertNotIn("title:", body)
 
 
 if __name__ == "__main__":

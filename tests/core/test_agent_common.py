@@ -129,6 +129,65 @@ class TestInjectAndForward(unittest.TestCase):
         _cs.assert_called_once_with("fallback-title")
 
 
+class TestFindBotSessionInfo(unittest.TestCase):
+    """Test _find_bot_session_info — 带回 (id, title) + serve 不可用降级 (#98)."""
+
+    # 三个 session 里，id 字典序最大的是 ses_zzz，但最新活跃的是 ses_aaa。
+    # 断言取到 ses_aaa，锁住「按 time.updated 而非 id 排序」这条约定（常见坑 #3）。
+    _SESSIONS = [
+        {"id": "ses_zzz", "directory": "/x/bot-dir", "title": "旧会话",
+         "time": {"updated": 100}},
+        {"id": "ses_aaa", "directory": "/x/bot-dir", "title": "[群] 张三 · 看下这个报错",
+         "time": {"updated": 900}},
+        {"id": "ses_other", "directory": "/x/somewhere-else", "title": "别人的",
+         "time": {"updated": 999}},
+    ]
+
+    @patch.object(agent_common, "_BOT_DIR_SUBSTR", new="bot-dir")
+    @patch.object(agent_common, "serve_request", return_value=_SESSIONS)
+    @patch.object(agent_common, "find_serve_credentials", return_value=(1, 4096, "pw"))
+    def test_returns_latest_session_id_and_title(self, _fsc, _sr):
+        self.assertEqual(agent_common._find_bot_session_info(),
+                         ("ses_aaa", "[群] 张三 · 看下这个报错"))
+
+    @patch.object(agent_common, "_BOT_DIR_SUBSTR", new="bot-dir")
+    @patch.object(agent_common, "serve_request", return_value=_SESSIONS)
+    @patch.object(agent_common, "find_serve_credentials", return_value=(1, 4096, "pw"))
+    def test_find_bot_session_still_returns_id_only(self, _fsc, _sr):
+        # 老调用方（inject_and_forward 等）的契约不能变
+        self.assertEqual(agent_common._find_bot_session(), "ses_aaa")
+
+    @patch.object(agent_common, "find_serve_credentials", return_value=(None, None, None))
+    def test_no_port_returns_none(self, _fsc):
+        self.assertIsNone(agent_common._find_bot_session_info())
+
+    @patch.object(agent_common, "serve_request", side_effect=OSError("connection refused"))
+    @patch.object(agent_common, "find_serve_credentials", return_value=(1, 4096, "pw"))
+    def test_serve_unreachable_returns_none(self, _fsc, _sr):
+        # serve 不可达必须降级成 None（不抛），否则会挡住 /reboot
+        self.assertIsNone(agent_common._find_bot_session_info())
+
+    @patch.object(agent_common, "_BOT_DIR_SUBSTR", new="bot-dir")
+    @patch.object(agent_common, "serve_request", return_value=[])
+    @patch.object(agent_common, "find_serve_credentials", return_value=(1, 4096, "pw"))
+    def test_no_bot_session_returns_none(self, _fsc, _sr):
+        self.assertIsNone(agent_common._find_bot_session_info())
+
+    @patch.object(agent_common, "_BOT_DIR_SUBSTR", new="bot-dir")
+    @patch.object(agent_common, "find_serve_credentials", return_value=(1, 4096, "pw"))
+    def test_title_missing_yields_empty_string(self, _fsc):
+        sessions = [{"id": "ses_a", "directory": "/x/bot-dir", "time": {"updated": 1}}]
+        with patch.object(agent_common, "serve_request", return_value=sessions):
+            self.assertEqual(agent_common._find_bot_session_info(), ("ses_a", ""))
+
+    def test_clean_session_title_folds_newlines_and_truncates(self):
+        self.assertEqual(agent_common._clean_session_title("a\n\nb   c"), "a b c")
+        self.assertEqual(agent_common._clean_session_title(None), "")
+        long = agent_common._clean_session_title("x" * 100)
+        self.assertEqual(len(long), 61)  # 60 + 省略号
+        self.assertTrue(long.endswith("…"))
+
+
 class TestAbortAndCleanSession(unittest.TestCase):
     """Test _abort_and_clean_session — abort + DELETE asked_ts 之后的消息."""
 
@@ -178,6 +237,7 @@ class TestAbortAndCleanSession(unittest.TestCase):
 class TestFindSessionWithPredicate(unittest.TestCase):
     """Test _find_session_with_predicate."""
 
+    @patch.object(agent_common, "_BOT_DIR_SUBSTR", new="your-agent-workdir")
     @patch.object(agent_common, "_list_session_messages")
     @patch.object(agent_common, "find_serve_credentials", return_value=(1, 8080, "pwd"))
     def test_finds_session_matching_predicate(self, _creds, mock_get):
