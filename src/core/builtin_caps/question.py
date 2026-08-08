@@ -339,5 +339,7 @@ CAPABILITY = Capability(
     on_sse_event=on_sse_event,
     priority=20,                 # 最先看到用户回复（先于 image40/forward50/text100）
     default_enabled=True,
+    dedup=True,                  # 重连重投的同一条答复不再二次处理（#71）
+    loop_guard=True,             # 数字员工自己发的提问/回执不进答案匹配（#71）
 )
 register(CAPABILITY)

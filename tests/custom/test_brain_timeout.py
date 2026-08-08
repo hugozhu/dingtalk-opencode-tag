@@ -198,6 +198,32 @@ class TestCancelCapability(unittest.TestCase):
         from custom.capabilities import cancel
         self.assertFalse(cancel.on_inbound(self._inbound("你好呀")))
 
+    def test_cancel_cap_yields_to_pending_question(self):
+        """有待答提问时「取消」放行给 question，不去 abort 在跑任务（#71）。
+
+        「取消」同时是两个能力的关键词，cancel(5) 跑在 question(20) 前面。用户为撤掉提问
+        而回「取消」时，若恰好又有在跑任务，cancel 会抢先杀掉那个任务、还把消息吃掉——
+        提问依然挂着，用户取消了自己没打算取消的东西。
+        """
+        from custom.capabilities import cancel
+        from core.builtin_caps import question as Q
+        brain._mark_inflight("cidX", "ses_1", 4096, "pw")
+        with patch.object(Q, "_find_pending_for_conv", return_value=("req_1", {})), \
+             patch("custom.brain.cancel_inflight") as ci:
+            self.assertFalse(cancel.on_inbound(self._inbound("取消")))
+        ci.assert_not_called()          # 在跑任务没被误杀
+
+    def test_cancel_cap_acts_when_no_pending_question(self):
+        """无待答提问 → 维持原行为：正常 abort 在跑任务（放行逻辑不能过度生效）。"""
+        from custom.capabilities import cancel
+        from core.builtin_caps import question as Q
+        brain._mark_inflight("cidX", "ses_1", 4096, "pw")
+        with patch.object(Q, "_find_pending_for_conv", return_value=(None, None)), \
+             patch.object(cancel, "send_reply"), \
+             patch("custom.brain.cancel_inflight", return_value=True) as ci:
+            self.assertTrue(cancel.on_inbound(self._inbound("取消")))
+        ci.assert_called_once_with("cidX")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
