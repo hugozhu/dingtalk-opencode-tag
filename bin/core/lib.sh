@@ -105,6 +105,31 @@ kill_tree() {
     kill "-$sig" "$pid" 2>/dev/null || true
 }
 
+# run_with_timeout <secs> <cmd...>：带硬超时地跑一条命令。
+# 返回被包裹命令的退出码；超时则杀掉整棵进程树并返回 124（对齐 GNU timeout(1) 的约定）。
+#
+# 为什么自己写：macOS 没有 timeout(1)（那是 GNU coreutils），而本仓库的守护脚本必须
+# 在 stock macOS /bin/bash 3.2 下跑。故只用后台作业 + 轮询实现，不依赖任何外部工具。
+# 用 kill_tree 而非 kill：被包裹的命令可能自身是管道/脚本（如 healthcheck 里的 curl），
+# 只杀父进程会留下孤儿继续占着资源。
+run_with_timeout() {
+    local secs="$1"; shift
+    "$@" &
+    local cmd_pid=$!
+    local waited=0
+    while [[ "$waited" -lt "$secs" ]]; do
+        kill -0 "$cmd_pid" 2>/dev/null || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$cmd_pid" 2>/dev/null; then
+        kill_tree "$cmd_pid" KILL
+        wait "$cmd_pid" 2>/dev/null || true
+        return 124
+    fi
+    wait "$cmd_pid"
+}
+
 # ---------------------------------------------------------------------------
 # 组件清单单一真相源 — monitor.sh / reboot.sh / healthcheck.sh 共享，避免命名漂移
 #   COMP_NAMES：组件名（下划线，对应 start_<name> 函数）

@@ -196,6 +196,42 @@ assert_eq "stop_extra_cleanup 不误伤其他 profile" "1" \
 kill_tree "$OTHER_PID" KILL 2>/dev/null
 rm -rf "$FAKE_DIR"
 
+# ---------------------------------------------------------------------------
+# 监督器阻塞性 bug 的回归钉子
+#
+# 两个 bug 都属于「失效模式是静默」那一类，靠人看日志发现不了，所以钉死在测试里：
+#   1. check_serve_http 失败时曾返回 "HTTP_FAIL:$port"，而 main() 的判定是 glob `FAIL*`
+#      —— 匹配不上，serve HTTP 异常从来无法触发熔断
+#   2. 那个 curl 没有超时，serve 卡死时 healthcheck 永不返回，monitor 监督循环停摆
+# ---------------------------------------------------------------------------
+echo ""
+echo "Testing 健康检查判定 + 超时（监督器阻塞性 bug 回归）..."
+
+assert_eq "check_serve_http 失败返回值能匹配 FAIL* 判定" "0" \
+    "$(grep -q 'echo "FAIL: serve HTTP' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
+assert_eq "healthcheck.sh 不再 echo 匹配不上判定的 HTTP_FAIL token" "0" \
+    "$(grep -c 'echo "HTTP_FAIL' "$SCRIPT_DIR/bin/core/healthcheck.sh" || true)"
+assert_eq "check_serve_http 的 curl 带硬超时" "0" \
+    "$(grep -q -- '--max-time' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
+assert_eq "monitor 用 run_with_timeout 包裹 healthcheck" "0" \
+    "$(grep -q 'run_with_timeout .*healthcheck.sh' "$SCRIPT_DIR/bin/core/monitor.sh" && echo 0 || echo 1)"
+
+# run_with_timeout 的实际行为（不是 grep，是真跑）
+assert_eq "run_with_timeout 超时返回 124" "124" \
+    "$(run_with_timeout 2 sleep 10 >/dev/null 2>&1; echo $?)"
+assert_eq "run_with_timeout 正常完成时透传退出码 0" "0" \
+    "$(run_with_timeout 5 true >/dev/null 2>&1; echo $?)"
+assert_eq "run_with_timeout 正常完成时透传非零退出码" "3" \
+    "$(run_with_timeout 5 bash -c 'exit 3' >/dev/null 2>&1; echo $?)"
+# 超时那次必须真的把进程杀掉，不能留孤儿继续跑
+TMO_MARK="$(mktemp -t rwt_mark)"
+rm -f "$TMO_MARK"
+run_with_timeout 2 bash -c "sleep 6; echo leaked > '$TMO_MARK'" >/dev/null 2>&1 || true
+sleep 6
+assert_eq "run_with_timeout 超时后子进程被真正杀死（无孤儿）" "1" \
+    "$([[ -f "$TMO_MARK" ]] && echo 0 || echo 1)"
+rm -f "$TMO_MARK"
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

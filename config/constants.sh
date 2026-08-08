@@ -25,6 +25,10 @@ export PROJECT_DIR="${PROJECT_DIR:-/path/to/your/project}"
 export CHECK_INTERVAL="${CHECK_INTERVAL:-1800}"          # 健康检查间隔（秒）
 export MAX_FAILURES="${MAX_FAILURES:-3}"                  # 连续失败熔断阈值
 export WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-60}"             # warmup 超时
+# 健康检查自身的硬超时。serve 卡死（进程在但不应答）时，无超时的探测会让 monitor
+# 的监督循环停摆——不重启也不告警。两个都是防御性上限，正常路径远远用不到。
+export HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-120}"  # monitor 包裹单次 healthcheck
+export HEALTHCHECK_HTTP_TIMEOUT="${HEALTHCHECK_HTTP_TIMEOUT:-8}"  # check_serve_http 的 curl
 export KICKSTART_RETRY_INTERVAL="${KICKSTART_RETRY_INTERVAL:-10}"
 export LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.example.agent-connect}"
 # /reboot 重启机制: auto(默认,自动判定) | launchd(launchctl kickstart) | nohup(直接重启
