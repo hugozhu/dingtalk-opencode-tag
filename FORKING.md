@@ -49,9 +49,7 @@ cp config/constants.sh config/constants.local.sh
 
 4. **`render_prompt` 末句**：默认是 "请基于上述消息内容回应用户。"，改成符合你业务场景的 prompt。
 
-5. **`_predicate`**（在 `handle_message` 的 cleanup 轮询里）：替换 `'msgtype="business-special"'` 为你的业务消息特征字符串。
-
-6. **`make_reply_msgs`**（在 `inject_and_forward` 调用里）：构造自己的通知消息格式。注意：reply 不要被 `_md` 的 `**...**` 包裹。
+5. **回复生成不在 handler 里**：handler 只做「消息 → prompt」，生成交给能力调 `core.brain.generate_reply(user, prompt, raw=True, ctx={"conv_id": ...})`。**ctx 必须带 conv_id** —— 会话复用按 conv 粒度（`AGENT_SESSION_REUSE`），不带就退化成每次新建、丢多轮上下文。
 
 ### Step 4: 写一个能力插件（capability）
 

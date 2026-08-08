@@ -8,7 +8,6 @@
   },
   "paths": {
     "project_dir": "/path/to/your/project",
-    "agent_workdir_basename": "your-agent-workdir",
     "connect_log": "/path/to/your/project/agent-connect.log",
     "monitor_log": "/path/to/your/project/monitor.log"
   },

@@ -45,21 +45,21 @@ agent_common.py — 共享 Python 工具（被 event-watcher + handler 共用）
   ├── log / send_notification / _md
   ├── _run_cli (dws CLI 包装)
   ├── find_serve_credentials (进程表 + 环境变量提取)
-  ├── 会话操作: _find_bot_session / _create_session / _post_user_message /
-  │             _get_message_text / _list_session_messages / _delete_session_message /
-  │             _session_action (abort/revert) / _abort_and_clean_session /
-  │             _find_session_with_predicate
-  ├── _proxy_vision (多模态识别，逐字提取原文不总结)
-  └── inject_and_forward (公共注入模板)
+  ├── serve_request (opencode serve HTTP 唯一出口：凭据 + Basic auth + 调试日志)
+  ├── _clean_session_title (session title 归一：折行 + 限长)
+  └── _proxy_vision (多模态识别，逐字提取原文不总结)
+
+  注：会话的建/删/复用**不在这里**——那是后端策略，由 custom/brain.py 按 conv 维护
+      （见最佳实践 8）。core 只提供凭据发现与 HTTP 出口。
 
 handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在 src/templates/handler_template.py）
   ├── match_business_line (log-tail 调用，跨行检测 + 线程安全 dedup)
   ├── fetch_attachments (I/O 阶段：图片下载+vision / 文件下载+读正文)
   ├── render_prompt (纯函数零 I/O，单测无需 mock)
   ├── _lookup_senders_batch (一次 list-by-ids 批量反查 N 个 sender)
-  ├── _fetch_senders (补齐缺失 sender，DingTalk summary 不完整时兜底)
-  └── handle_message (编排：list-by-ids → fetch → render → cleanup → inject_and_forward)
-        └── cleanup 轮询等待依赖服务转发完成（POLL_MAX/INTERVAL 可配置）
+  └── _fetch_senders (补齐缺失 sender，DingTalk summary 不完整时兜底)
+
+  注：只管「消息 → prompt」；生成回复由能力调 core.brain.generate_reply
 ```
 
 ## 13 个最佳实践提炼
@@ -121,23 +121,28 @@ handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在
 - 多选/连发场景下累积删除 `expected_count` 条
 - idle 时不立即 pop：比较 `deleted_user` vs `expected_count`，未达标重置 awaiting_spurious
 
-### 8. 公共注入模板 inject_and_forward
-**文件**: `src/core/agent_common.py` 的 `inject_and_forward()`
+### 8. 会话复用：按 conversation，不按目录
+**文件**: `src/custom/brain.py` 的 `_conv_sessions` / `_http_reuse()`
 **关键设计**:
-- find/create session → post user message → get reply → send notification
-- 差异点用 callable 参数化：
-  - `make_reply_msgs(reply)` → 允许多条通知（如解析结果 + 总结回复）
-  - `make_no_session_msg()` / `make_no_reply_msg()` → 失败兜底
-- 被多个 handler 共用（handle_image / handle_forward 等）
+- **粒度是 conv_id**（DingTalk 的 openConversationId），不是工作目录——一个目录下会有
+  上百个 session，"最近活跃的那个"未必属于当前这场对话，按目录复用会串上下文
+- `_conv_sessions` 是 `OrderedDict`：TTL 过期（`AGENT_SESSION_TTL`）+ LRU 逐出
+  （`AGENT_SESSION_MAX`，被挤掉的会话连远端一起删）
+- `_conv_lock(conv_id)` 单会话串行，不同 conv 并行不受影响
+- 自愈两路：复用的 sid 404（serve 重启/GC）→ 重建一次重试；复用的 sid 回空
+  （疑似后端 stream-error 把回合 completed 成空）→ 丢弃 + 删远端 + 新建重试
+- 重置关键词（`AGENT_SESSION_RESET_KEYWORDS`）让用户主动开新话题
+- `_inflight` 登记在跑任务（conv_id → sid/title/started），供 `/cancel` 直接 abort
+  和 `/reboot` 通知展示"这一停会打断什么"；经 `core.brain.register_inflight` 注册给 core
+- **所有能力共用这一套**：文本回复、合并转发、图片、文件都调
+  `core.brain.generate_reply(ctx={"conv_id": ...})`，所以转发完再追问能接上上下文
 
-### 9. 会话操作工具集
+### 9. serve 访问收口
 **文件**: `src/core/agent_common.py`
 **关键设计**:
-- `find_serve_credentials` — 进程表定位 serve + 提取 --port + 环境变量 password
-- `_find_bot_session` — 按 directory 含子串 + **time.updated 倒序选最新**（不是 id 字典序！）
-- `_find_session_with_predicate` — 遍历候选 session 找含特定 content 的（依赖服务转发到的真正 session）
-- `_abort_and_clean_session` — abort + DELETE asked_ts 之后所有 user/assistant 消息
-- `_list_session_messages` / `_delete_session_message` — 单条消息管理
+- `find_serve_credentials` — 优先读 `.serve.port`/`.serve.pwd`，回退进程表扫描；带短 TTL 缓存
+- `serve_request` — opencode serve HTTP 的**唯一出口**：凭据、Basic auth、可开关的
+  REQ/RESP 调试日志集中一处，避免模板在各处被拷贝出漂移
 
 ### 10. 渲染/IO 分层
 **文件**: `src/templates/handler_template.py`（FDE 复制到 `src/custom/handler.py` 改造）
@@ -166,7 +171,7 @@ handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在
 - 测试 patch 轮询常量为 0 避免真实 sleep
 
 ### 13. 诊断日志（数量不匹配时记 raw 头 N 字符）
-**文件**: `src/custom/handler.py` 的 `handle_message()`（模板版在 `src/templates/handler_template.py`）
+**文件**: `src/custom/handler.py` 的 `_fetch_senders()`（模板版在 `src/templates/handler_template.py`）
 **关键设计**:
 - summary 行数 vs messages 数量不一致时，记 raw content 头 300 字符
 - 便于排查外部 API 格式变化（如 DingTalk summary 从 `sender:content` 格式改成 AI 总结性描述）

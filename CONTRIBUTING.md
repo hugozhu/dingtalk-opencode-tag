@@ -6,7 +6,7 @@
 
 | 改动位置 | 是否贡献 | 说明 |
 |---------|---------|------|
-| `src/core/agent_common.py` 的 bug fix | ✅ 贡献 | 如 `_find_session_with_predicate` 的过滤逻辑错误 |
+| `src/core/agent_common.py` 的 bug fix | ✅ 贡献 | 如 `serve_request` 的鉴权头拼装错误 |
 | `src/core/event_watcher.py` 的 bug fix | ✅ 贡献 | 如 SSE 重连退避逻辑错误 |
 | `bin/core/*.sh` 的 bug fix | ✅ 贡献 | 如 `verify_pid` 的 cmdline 签名匹配漏了边界 |
 | `tests/core/*.sh` / `test_agent_common.py` | ✅ 贡献 | 新增 core 行为的回归测试 |
@@ -24,7 +24,7 @@ cd /path/to/my-delivery/
 # 改 src/core/agent_common.py（或其他 core 文件）
 # 写回归测试到 tests/core/test_agent_common.py（或 unit_test.sh）
 git add src/core/agent_common.py tests/core/test_agent_common.py
-git commit -m "fix(agent_common): _find_session_with_predicate 时间过滤边界"
+git commit -m "fix(agent_common): serve_request 鉴权头拼装边界"
 ```
 
 ### 2. 跑 core 测试确认不破坏

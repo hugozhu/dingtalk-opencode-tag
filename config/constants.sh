@@ -20,7 +20,6 @@ export AGENT_PROFILE="${AGENT_PROFILE:-your-profile}"
 
 # --- 路径 ---
 export PROJECT_DIR="${PROJECT_DIR:-/path/to/your/project}"
-export AGENT_BOT_DIR_SUBSTR="${AGENT_BOT_DIR_SUBSTR:-your-agent-workdir}"
 
 # --- 守护进程参数 ---
 export CHECK_INTERVAL="${CHECK_INTERVAL:-1800}"          # 健康检查间隔（秒）
