@@ -40,6 +40,10 @@ COMPONENT_NAME="healthcheck"
 # 健康检查恒失败。默认值对应 harness 自带实现（dws dev connect / event_watcher.py）。
 : "${CONNECT_CHECK_PATTERN:=agent-connect.*--unified-app-id}"
 : "${EVENT_WATCHER_CHECK_PATTERN:=event_watcher.py}"
+# serve HTTP 探测的硬超时（秒）。**必须有**：serve 卡死（进程在、不再应答）时，
+# 无超时的 curl 会一直阻塞 → healthcheck 永不返回 → monitor 的 run_forever 停摆，
+# 失效模式变成「静默」而不是「重启」。
+: "${HEALTHCHECK_HTTP_TIMEOUT:=8}"
 
 # 检查1: connect 进程存活（硬失败）
 check_connect() {
@@ -111,12 +115,15 @@ check_serve_http() {
     local auth
     auth=$(echo -n "opencode:$pwd" | base64)
     if curl -s -o /dev/null -w "%{http_code}" \
+            --connect-timeout 3 --max-time "$HEALTHCHECK_HTTP_TIMEOUT" \
             -H "Authorization: Basic $auth" \
             "http://127.0.0.1:$port/session" 2>/dev/null | grep -q "200"; then
-        echo "HTTP_OK:$port"
+        echo "OK: HTTP $port"
     else
-        # 凭据失效时尝试从进程表 + 日志刷新
-        echo "HTTP_FAIL:$(cat "$SERVE_PORT_FILE" 2>/dev/null || echo '000')"
+        # 注意：这里必须以 "FAIL" 开头 —— main() 的判定用的是 glob `FAIL*`。
+        # 曾经这里返回 "HTTP_FAIL:$port"，匹配不上，导致 serve HTTP 异常
+        # **永远无法触发熔断**（2026-08-08 大脑死了 16 分钟仍报「健康」）。
+        echo "FAIL: serve HTTP 无响应 (port=$port)"
     fi
 }
 
