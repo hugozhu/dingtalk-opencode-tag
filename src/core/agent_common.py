@@ -3,17 +3,15 @@
 提炼自: dingtalk-opencode-agent/agent_common.py (v4.1)
 原作者: hugozhu
 
-提供 6 类共享工具，被 event_watcher.py 和 handler_*.py 共用：
+提供 5 类共享工具，被 event_watcher.py 和各能力共用：
 
 1. 常量（机器人身份 / profile / 超时）
 2. 日志 & 通知（log / send_notification / _md）
 3. dws/CLI 包装（_run_cli）
-4. opencode serve 访问（find_serve_credentials / _find_bot_session /
-   _create_session / _post_user_message / _get_message_text /
-   _list_session_messages / _delete_session_message / _abort_and_clean_session /
-   _find_session_with_predicate）
-5. 视觉/多模态识别（_proxy_vision）
-6. inject_and_forward 公共注入模板（find/create 会话 → post → get reply → send_notification）
+4. opencode serve 访问（find_serve_credentials / serve_request）——
+   凭据发现与 HTTP 出口集中一处；具体的**会话操作**（建/删/复用）属于后端策略，
+   由 custom/brain.py 按 conv 维护（见 AGENT_SESSION_REUSE），不在这里。
+5. 视觉/多模态识别（_proxy_vision）+ session title 归一（_clean_session_title）
 
 纯工具——无模块级可变状态，无全局副作用。
 """
@@ -110,14 +108,6 @@ PROFILE = _cfg("AGENT_PROFILE", "identity", "profile", default="default-profile"
 PROXY_URL = _cfg("PROXY_URL", "vision", "proxy_url", default="http://localhost:4000/v1")
 PROXY_KEY = _cfg("PROXY_KEY", "vision", "proxy_key", default="sk-1234")
 VISION_MODEL = _cfg("VISION_MODEL", "vision", "model", default="gemini-3.1-flash-image")
-
-# session.directory 含此子串的就是数字员工用的会话（按 --agent-workdir 设置）
-_BOT_DIR_SUBSTR = _cfg("AGENT_BOT_DIR_SUBSTR", "paths", "agent_workdir_basename",
-                       default="your-agent-workdir")
-
-# 注入模板轮询参数（测试 patch 为 0）
-_INJECT_POLL_MAX_SECONDS = 60
-_INJECT_POLL_INTERVAL = 5
 
 # serve 凭据发现缓存（避免每次访问都全表 ps 扫描）
 _CREDS_CACHE_TTL = float(os.environ.get("AGENT_CREDS_CACHE_TTL", "10"))
@@ -238,9 +228,9 @@ def find_serve_credentials():
 
     通用思路: ps -ax 找 "<serve-cmd>" 进程 → 提取 --port + OPENCODE_SERVER_PASSWORD 环境变量
 
-    带短 TTL 缓存（_CREDS_CACHE_TTL 秒）：agent_common 里 8 个函数各自调用本函数，
-    一次 inject_and_forward 会触发 ≥3 次全表 ps。缓存命中时跳过 subprocess，
-    大幅降低进程表扫描频率。缓存的是成功结果；失败不缓存（下次立即重试）。
+    带短 TTL 缓存（_CREDS_CACHE_TTL 秒）：多个调用方（brain / image / file / question
+    / healthcheck 探测）各自调用本函数，一次对话可触发多次全表 ps。缓存命中时跳过
+    subprocess，大幅降低进程表扫描频率。缓存的是成功结果；失败不缓存（下次立即重试）。
     """
     now = time.time()
     with _creds_lock:
@@ -401,208 +391,17 @@ def serve_request(method, path, body=None, timeout=8, *, port=None, pwd=None):
     return json.loads(raw) if raw.strip() else None
 
 
-def _find_bot_session():
-    """找数字员工当前会话（directory 含 _BOT_DIR_SUBSTR，time.updated 最新的）。
+def _clean_session_title(title, limit=60):
+    """把 session title 压成单行短文本，供通知/日志展示。
 
-    注意：按 time.updated 倒序选最新活跃 session，**不**按 id 字典序——
-    多个 session 共享同一 directory 时，id 字典序最大不等于最新活跃。
+    title 由 brain._session_title 生成（#89），形如「[群] 张三 · 帮我看下这个报错」，
+    理论上已单行限长；但它源自用户消息，这里再收一次口——折叠换行与连续空白、超长截断，
+    避免异常 title 把 markdown 通知撑坏。无 title 返回空串。
     """
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return None
-    try:
-        data = serve_request("GET", "/session", timeout=8, port=port, pwd=pwd)
-        sessions = data if isinstance(data, list) else data.get("data", [])
-        bot = None
-        bot_updated = 0
-        for s in sessions:
-            d = s.get("directory", "") or ""
-            if _BOT_DIR_SUBSTR in d:
-                updated = (s.get("time", {}) or {}).get("updated", 0) or 0
-                if updated > bot_updated:
-                    bot = s
-                    bot_updated = updated
-        return bot.get("id") if bot else None
-    except Exception as e:
-        log(f"find_bot_session err: {e}")
-        return None
-
-
-def _find_session_with_predicate(predicate, asked_ts_ms=None, max_candidates=8):
-    """遍历 directory 匹配的 session，找含 predicate 匹配消息的最近活跃 session。
-
-    通用版：predicate(message_dict) -> bool。用于找含特定 content 关键词的 session
-    （如 dws dev connect 转发的原始 JSON 含 'msgtype=chatRecord'）。
-
-    Args:
-        predicate: callable(msg_dict) -> bool，True 即匹配
-        asked_ts_ms: 可选时间戳（毫秒），匹配的消息 time.created >= asked_ts - 5s
-        max_candidates: 最多扫描多少个候选 session（避免大列表全扫太慢）
-    """
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return None
-    try:
-        data = serve_request("GET", "/session", timeout=8, port=port, pwd=pwd)
-        sessions = data if isinstance(data, list) else data.get("data", [])
-        candidates = [s for s in sessions if _BOT_DIR_SUBSTR in (s.get("directory", "") or "")]
-        candidates.sort(key=lambda s: (s.get("time", {}) or {}).get("updated", 0) or 0, reverse=True)
-
-        threshold = (asked_ts_ms - 5000) if asked_ts_ms else 0
-        for s in candidates[:max_candidates]:
-            sid = s.get("id")
-            if not sid:
-                continue
-            sess_msgs = _list_session_messages(sid)
-            for m in sess_msgs:
-                info = m.get("info", {}) or {}
-                if threshold > 0:
-                    created = (info.get("time", {}) or {}).get("created", 0) or 0
-                    if not isinstance(created, (int, float)) or created < threshold:
-                        continue
-                if predicate(m):
-                    return sid
-        return None
-    except Exception as e:
-        log(f"find_session_with_predicate err: {e}")
-        return None
-
-
-def _create_session(title="agent-default"):
-    """创建 opencode 会话，返回 full sid 或 None（兜底用）"""
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return None
-    try:
-        d = serve_request("POST", "/session", {"title": title}, timeout=10, port=port, pwd=pwd) or {}
-        sid = d.get("id")
-        if sid:
-            log(f"created session {sid} (title={title})")
-        return sid
-    except Exception as e:
-        log(f"create_session err: {e}")
-        return None
-
-
-def _post_user_message(full_sid, text):
-    """向会话发一条 user 消息（阻塞到该轮完成），返回 assistant 消息 id 或 None"""
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return None
-    try:
-        d = serve_request(
-            "POST", f"/session/{full_sid}/message",
-            {"input": text, "parts": [{"type": "text", "text": text}]},
-            timeout=300, port=port, pwd=pwd) or {}
-        return d.get("info", {}).get("id") or None
-    except Exception as e:
-        log(f"post_user_message err: {e}")
-        return None
-
-
-def _get_message_text(full_sid, msg_id):
-    """取某条 assistant 消息的文本（拼接所有 text part）"""
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return ""
-    try:
-        data = serve_request(
-            "GET", f"/session/{full_sid}/message", timeout=8, port=port, pwd=pwd)
-        msgs = data if isinstance(data, list) else data.get("data", [])
-        for m in msgs:
-            if m.get("info", {}).get("id") == msg_id:
-                return "".join(p.get("text", "") for p in m.get("parts", []) if p.get("type") == "text")
-        return ""
-    except Exception as e:
-        log(f"get_message_text err: {e}")
-        return ""
-
-
-def _list_session_messages(full_sid):
-    """GET /session/{id}/message — 返回会话所有消息列表"""
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return []
-    try:
-        data = serve_request(
-            "GET", f"/session/{full_sid}/message", timeout=8, port=port, pwd=pwd)
-        return data if isinstance(data, list) else data.get("data", [])
-    except Exception as e:
-        log(f"list_session_messages err: {e}")
-        return []
-
-
-def _delete_session_message(full_sid, msg_id):
-    """DELETE /session/{id}/message/{mid} — 删除单条消息"""
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return False
-    try:
-        # serve 对非 2xx 会抛 HTTPError；正常返回（无异常）即视为删除成功。
-        serve_request(
-            "DELETE", f"/session/{full_sid}/message/{msg_id}",
-            timeout=6, port=port, pwd=pwd)
-        return True
-    except urllib.error.HTTPError as e:
-        log(f"delete_session_message HTTP {e.code}")
-        return False
-    except Exception as e:
-        log(f"delete_session_message err: {e}")
-        return False
-
-
-def _session_action(full_sid, action, body=None):
-    """POST /session/{id}/{action} (abort/revert)。返回 True on HTTP 200。"""
-    pid, port, pwd = find_serve_credentials()
-    if not port:
-        return False
-    try:
-        # 非 2xx 抛 HTTPError；正常返回即视为成功。
-        serve_request(
-            "POST", f"/session/{full_sid}/{action}", body or {},
-            timeout=6, port=port, pwd=pwd)
-        return True
-    except urllib.error.HTTPError as e:
-        log(f"session_action {action} HTTP {e.code}")
-        return False
-    except Exception as e:
-        log(f"session_action {action} err: {e}")
-        return False
-
-
-def _abort_and_clean_session(full_sid, asked_ts_ms=None):
-    """abort 当前轮次 + DELETE asked_ts 之后到达的 user/assistant 消息。
-
-    用于：依赖服务（如 dws dev connect）转发的原始 JSON 给 agent 时，agent 会基于
-    JSON 生成无用回复。本函数清理这些"多余轮次"，避免污染后续注入的结构化 prompt。
-
-    Returns: (aborted: bool, deleted_count: int)
-    """
-    # 1. 先 abort（阻止 LLM 继续生成；abort 触发的 finalizer 会被下面的 DELETE 清掉）
-    aborted = _session_action(full_sid, "abort")
-    log(f"abort_and_clean: abort sid={full_sid[:12]} ok={aborted}")
-
-    # 2. DELETE 所有 asked_ts 之后的 user/assistant 消息
-    deleted = 0
-    msgs = _list_session_messages(full_sid)
-    for m in msgs:
-        info = m.get("info", {}) or {}
-        role = info.get("role")
-        msg_id = info.get("id")
-        if not msg_id or role not in ("user", "assistant"):
-            continue
-        if asked_ts_ms is not None:
-            created = (info.get("time", {}) or {}).get("created", 0) or 0
-            if not isinstance(created, (int, float)) or created < asked_ts_ms:
-                continue
-        if _delete_session_message(full_sid, msg_id):
-            deleted += 1
-            log(f"abort_and_clean: DELETE {role} msg sid={full_sid[:12]} mid={str(msg_id)[:16]}")
-        else:
-            log(f"abort_and_clean: DELETE {role} msg failed sid={full_sid[:12]} mid={str(msg_id)[:16]}")
-
-    log(f"abort_and_clean: sid={full_sid[:12]} aborted={aborted} deleted={deleted}")
-    return aborted, deleted
+    s = " ".join(str(title or "").split())
+    if len(s) > limit:
+        s = s[:limit] + "…"
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -638,48 +437,3 @@ def _proxy_vision(image_bytes):
         return ""
 
 
-# ---------------------------------------------------------------------------
-# inject_and_forward — 公共注入模板
-#
-# 两个 handler（如 handle_image / handle_forward）历史上重复：
-#   sid = _find_bot_session()
-#   if not sid: sid = _create_session(title)
-#   if not sid: send_notification(...); return
-#   aid = _post_user_message(sid, prompt)
-#   reply = _get_message_text(sid, aid) if aid else ""
-#   if reply: send_notification(reply_title, reply_md)
-#   else:     send_notification(no_reply_title, no_reply_md)
-#
-# 差异点：session_title / reply 通知消息（可能多条）/ no-session / no-reply 兜底
-# 解决方案：用 callable 参数化，handler 自己构造消息
-# ---------------------------------------------------------------------------
-
-def inject_and_forward(prompt, *, session_title, make_reply_msgs,
-                       make_no_session_msg, make_no_reply_msg):
-    """Find/create bot session → inject prompt → fetch reply → send notification.
-
-    Args:
-        prompt: text to inject into the agent session.
-        session_title: title passed to _create_session as fallback.
-        make_reply_msgs: callable(reply_text) -> list[(title, md_text)]   # 允许多条
-        make_no_session_msg: callable() -> (title, md_text)
-        make_no_reply_msg: callable() -> (title, md_text)
-
-    Returns reply text on success, or None on failure (no session or no reply).
-    """
-    sid = _find_bot_session()
-    if not sid:
-        sid = _create_session(session_title)
-    if not sid:
-        title, md = make_no_session_msg()
-        send_notification(title, md)
-        return None
-    aid = _post_user_message(sid, prompt)
-    reply = _get_message_text(sid, aid) if aid else ""
-    if not reply:
-        title, md = make_no_reply_msg()
-        send_notification(title, md)
-        return None
-    for title, md in make_reply_msgs(reply):
-        send_notification(title, md)
-    return reply

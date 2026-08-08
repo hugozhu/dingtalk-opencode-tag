@@ -259,7 +259,7 @@ Complete index in AGENTS.md "关键文件 / 函数索引". Key files:
 | `bin/core/lib.sh` | Shared utilities (verify_pid, acquire_lock, stop_components) |
 | `src/core/event_watcher.py` | Main event loop (SSE + log-tail + capability dispatch) |
 | `src/core/capabilities.py` | Plugin registry |
-| `src/core/agent_common.py` | Utilities (serve credentials, session ops, inject_and_forward) |
+| `src/core/agent_common.py` | Utilities (serve credentials, serve_request, notifications) |
 | `src/custom/capabilities/` | DingTalk capabilities (ack, forward, image, file, stats) |
 | `src/custom/brain.py` | OpenCode serve implementation |
 | `src/custom/replier.py` | DingTalk send via dws CLI |

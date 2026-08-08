@@ -776,18 +776,29 @@ def _start_watchdog(port, pwd, sid, done, aborted):
     return wd
 
 
-# 在跑任务登记（#75 用户取消）：conv_id -> {"sid","port","pwd"}。取消能力据此直接 abort，
-# **不走 brain / 不抢 _conv_lock**，从而解阻塞正卡在 message POST 的 worker 线程。
+# 在跑任务登记（#75 用户取消）：conv_id -> {"sid","port","pwd","title","started"}。
+# 取消能力据此直接 abort，**不走 brain / 不抢 _conv_lock**，从而解阻塞正卡在
+# message POST 的 worker 线程。title/started 供 /reboot 通知展示「这一停会打断什么」（#98）。
 _inflight = {}
 _inflight_lock = threading.Lock()
 
 
-def _mark_inflight(conv_id, sid, port, pwd):
-    """登记某 conv 正在跑的会话（POST 前调用）。conv_id/sid 为空则跳过。"""
+def _mark_inflight(conv_id, sid, port, pwd, title=""):
+    """登记某 conv 正在跑的会话（POST 前调用）。conv_id/sid 为空则跳过。
+
+    **started 跨轮内重建保留**：同一轮里 404 失效重建、回空重试都会再次 mark，
+    若每次都重置 started，「已跑 8 分钟」会显示成刚开始，正好在最该看清耗时的时候骗人。
+    title 同理：重试路径不重算 title，传空时沿用上一次的。
+    """
     if not conv_id or not sid:
         return
     with _inflight_lock:
-        _inflight[conv_id] = {"sid": sid, "port": port, "pwd": pwd}
+        prev = _inflight.get(conv_id)
+        _inflight[conv_id] = {
+            "sid": sid, "port": port, "pwd": pwd,
+            "title": title or (prev or {}).get("title", ""),
+            "started": (prev or {}).get("started") or time.time(),
+        }
 
 
 def _clear_inflight(conv_id, sid=None):
@@ -798,6 +809,17 @@ def _clear_inflight(conv_id, sid=None):
         rec = _inflight.get(conv_id)
         if rec and (sid is None or rec.get("sid") == sid):
             _inflight.pop(conv_id, None)
+
+
+def list_inflight():
+    """在跑任务快照（注册给 core.brain.list_inflight，供 /reboot 通知）。
+
+    只吐展示需要的字段——**port/pwd 不外泄**，那是 serve 凭据，不该流进通知渲染路径。
+    """
+    with _inflight_lock:
+        return [{"conv_id": cid, "sid": rec.get("sid", ""),
+                 "title": rec.get("title", ""), "started": rec.get("started", 0)}
+                for cid, rec in _inflight.items()]
 
 
 def cancel_inflight(conv_id):
@@ -908,10 +930,11 @@ def _http_oneshot(port, pwd, prompt, ctx):
     conv_id = (ctx or {}).get("conv_id", "")
     t0 = time.time()
     sid = None
+    title = _session_title(ctx, prompt)
     try:
-        sid = _create_session(port, pwd, _session_title(ctx, prompt))
+        sid = _create_session(port, pwd, title)
         _register_textreply_sid(sid, ctx)
-        _mark_inflight(conv_id, sid, port, pwd)
+        _mark_inflight(conv_id, sid, port, pwd, title)
         reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
         _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
         _stash_task_stats(conv_id, usage, time.time() - t0)
@@ -941,7 +964,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
             if sid is None:
                 sid = _create_session(port, pwd, title)
             _register_textreply_sid(sid, ctx)   # 刷新 conv ctx（回程路由用最新来源）
-            _mark_inflight(conv_id, sid, port, pwd)
+            _mark_inflight(conv_id, sid, port, pwd, title)
             try:
                 reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
             except urllib.error.HTTPError as he:
@@ -951,7 +974,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                     _forget_sid(conv_id)
                     sid = _create_session(port, pwd, title)
                     _register_textreply_sid(sid, ctx)
-                    _mark_inflight(conv_id, sid, port, pwd)
+                    _mark_inflight(conv_id, sid, port, pwd, title)
                     reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
                     reused = False  # 重建了，视为新会话
                 else:
@@ -964,7 +987,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                 _delete_session(port, pwd, sid)
                 sid = _create_session(port, pwd, title)
                 _register_textreply_sid(sid, ctx)
-                _mark_inflight(conv_id, sid, port, pwd)
+                _mark_inflight(conv_id, sid, port, pwd, title)
                 reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
                 reused = False  # 重建了，按新会话登记（下面 is_new=True）
             # 成功：登记/刷新 last，处理 LRU 逐出（删被挤掉会话的远端 session）
@@ -1057,8 +1080,9 @@ def _brain_proxy(user, text, ctx, raw=False):
 
 
 # 把 opencode/proxy/echo 生成实现注册给 core.brain，让能力经 core.brain.generate_reply 统一调用。
-# 把 opencode/proxy/echo 生成实现注册给 core.brain，让能力经 core.brain.generate_reply 统一调用。
 # 同时注册状态感知实现（#59）：text_reply 经 generate_reply_ex 拿 ok/empty/failed 区分。
-from core.brain import register_brain, register_brain_ex  # noqa: E402
+# 以及在跑任务快照（#98）：/reboot 据此告诉用户「这一停会打断什么」。
+from core.brain import register_brain, register_brain_ex, register_inflight  # noqa: E402
 register_brain(generate_reply)
 register_brain_ex(generate_reply_ex)
+register_inflight(list_inflight)

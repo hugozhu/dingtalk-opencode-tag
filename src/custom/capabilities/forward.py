@@ -14,7 +14,7 @@
   3. 反查不到 forwardMessages（疑似转发的假阳性）→ 回退普通文本回复，不丢消息。
 
 与生产版 forward_handler.py 的差异：event-consume **不自动把原始 JSON 转给 opencode**，
-故**不需要** spurious 轮次 cleanup（省掉 _find_session_with_predicate 轮询）。
+故**不需要** spurious 轮次 cleanup（省掉一轮轮询等待 + 删多余消息）。
 
 开关：CAP_FORWARD_ENABLED（默认开）。优先级 50（先于 catch-all 文本回复 100）。
 """

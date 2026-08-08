@@ -12,7 +12,7 @@
 # ---------------------------------------------------------------------------
 # serve 组件：托管 opencode serve
 #   - brain(opencode) 走 HTTP 生成回复（POST /session/{id}/message），省 CLI 冷启动
-#   - 合并转发业务路径也用它（agent_common.inject_and_forward）
+#   - 合并转发/图片/文件等能力同样走它，共享该会话的 per-conv session（复用多轮上下文）
 # healthcheck 对 serve 硬失败，必须写出 .serve.pid / .serve.port / .serve.pwd。
 # 端口可用 config/constants.local.sh 的 OPENCODE_SERVE_PORT 覆盖；密码优先复用已存在
 # 的 .serve.pwd（重启 serve 时保持凭据稳定，避免 in-flight 请求 401）。

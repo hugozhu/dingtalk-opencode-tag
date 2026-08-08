@@ -318,7 +318,7 @@ src/
 │   ├── inbound.py            ← 统一 InboundMessage（消息归一 + kind 分类）
 │   ├── brain.py / replier.py ← 生成/发送**协议** + 注册点（默认 echo/log；custom 注入实现）
 │   ├── builtin_caps/         ← 自带通用能力原语（text_reply / question / aggregation，0 平台耦合）
-│   └── agent_common.py       ← 共享工具（serve 访问 / 通知 / inject_and_forward）
+│   └── agent_common.py       ← 共享工具（serve 凭据+HTTP 出口 / 通知）
 ├── custom/                   ← FDE 改这里
 │   ├── capabilities/         ← 钉钉强耦合能力（ack / forward / image / file）+ 启用清单 __init__
 │   ├── brain.py              ← 注册 opencode serve 生成实现（免费模型）
