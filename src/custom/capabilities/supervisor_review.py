@@ -87,7 +87,8 @@ def _send_to_supervisor(text):
     if not sid:
         log("supervisor_review: AGENT_SUPERVISOR_USER_ID 未配置，无法转交主管")
         return False
-    rc, out = _run_cli(["chat", "message", "send", "--user", sid, "--text", text])
+    rc, out = _run_cli(["chat", "message", "send", "--user", sid,
+                        "--text", text, "--ai-tag=false"])
     if rc != 0:
         log(f"supervisor_review: 转交主管失败 rc={rc} out={out[:200]}")
         return False

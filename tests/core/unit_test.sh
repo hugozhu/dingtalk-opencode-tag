@@ -347,6 +347,51 @@ assert_eq "identity 模块存在" "0" \
 assert_eq "ack 不 import supervisor_review 能力" "0" \
     "$(grep -c 'import supervisor_review' "$SCRIPT_DIR/src/custom/capabilities/ack.py")"
 
+# 「AI」角标：dws chat message send 的 --ai-tag 默认 true，不显式关掉消息右上角会常驻
+# 一个 AI 标（拟人化的反面）。每个 send 调用点都必须带 --ai-tag=false。
+# 注：send-by-bot 无此参数，机器人身份本就不伪装成真人，不在范围内。
+echo ""
+echo "Testing ai-tag suppression on dws send call sites..."
+_ai_tag_missing=0
+# 只数**真实调用/真实参数**，不数注释：
+#   Python 调用 = 列表形式 `"message", "send"`（"send-by-bot" 不命中，模式含右引号）
+#   Python 参数 = 带引号的字符串字面量 `"--ai-tag=false"`
+# 两个坑都已用变异测试验证过：
+#   1) 若数裸 `ai-tag=false`，注释里那句说明会把计数顶上去 → 真漏传也检不出（假阴性）
+#   2) `grep -c` 零匹配时**自己就打印 0** 且退出码 1，再接 `|| echo 0` 会得到 "0\n0"
+#      多行值，令 -gt 数值比较失效 → 恒通过。故用 `|| true` + 数字校验（同 lib.sh 写法）
+_count() {
+    local n
+    n=$(grep -c "$1" "$2" 2>/dev/null || true)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    printf '%s' "$n"
+}
+_count_re() {
+    local n
+    n=$(grep -cE "$1" "$2" 2>/dev/null || true)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    printf '%s' "$n"
+}
+for f in "$SCRIPT_DIR/src/custom/replier.py" \
+         "$SCRIPT_DIR/src/custom/capabilities/supervisor_review.py" \
+         "$SCRIPT_DIR/src/custom/capabilities/startup_report.py"; do
+    sends=$(_count '"message", "send"' "$f")
+    tags=$(_count '"--ai-tag=false"' "$f")
+    if [[ "$sends" -gt "$tags" ]]; then
+        echo "    ${f##*/}: send=$sends ai-tag=$tags"
+        _ai_tag_missing=$((_ai_tag_missing + 1))
+    fi
+done
+for f in "$SCRIPT_DIR/bin/custom/start_funcs.sh"; do
+    sends=$(_count_re '^[[:space:]]*dws chat message send' "$f")
+    tags=$(_count_re '^[[:space:]]*--ai-tag=false' "$f")
+    if [[ "$sends" -gt "$tags" ]]; then
+        echo "    ${f##*/}: send=$sends ai-tag=$tags"
+        _ai_tag_missing=$((_ai_tag_missing + 1))
+    fi
+done
+assert_eq "所有 dws send 调用点都带 --ai-tag=false" "0" "$_ai_tag_missing"
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

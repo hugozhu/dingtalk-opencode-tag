@@ -138,6 +138,7 @@ notify_alert_handler() {
 - 主机: $(hostname)
 - 时间: $(date '+%Y-%m-%d %H:%M:%S')
 - 恢复: \`bash bin/core/start.sh\`" \
+        --ai-tag=false \
         --profile "$AGENT_PROFILE" -y >/dev/null 2>&1 || true
     return 0
 }

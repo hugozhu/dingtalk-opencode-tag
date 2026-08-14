@@ -119,9 +119,12 @@ def _reply_bot(conv_id, text, at_user_id):
 
 def _reply_user(conv_id, text):
     """当前用户身份 send 发到来源会话（群或单聊，均按 openConversationId 发）。"""
+    # --ai-tag=false：去掉消息右上角的「AI」角标（dws 默认 true）。拟人化——数字员工
+    # 以真人身份发言，角标会时刻提示对方"这是机器人"。注：send-by-bot 无此参数。
     cmd = ["dws", "chat", "message", "send",
            "--group", conv_id,
            "--text", text,
+           "--ai-tag=false",
            "--profile", PROFILE, "-y"]
     return _run(cmd, "user")
 

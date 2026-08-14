@@ -451,6 +451,20 @@ class TestReplierLogMode(unittest.TestCase):
             self.assertFalse(replier.send_reply("cid", 2, "hi"))
             mock_run.assert_not_called()
 
+    def test_user_mode_disables_ai_tag(self):
+        """回复必须带 --ai-tag=false 去掉「AI」角标（拟人化）。
+
+        dws chat message send 的 --ai-tag 默认 **true**，不显式关掉就会在消息右上角
+        常驻一个「AI」标，时刻提示对方"这是机器人"。
+        """
+        with patch.object(replier, "_REPLY_MODE", "user"), \
+             patch.object(replier, "PROFILE", "real-profile"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = type("R", (), {"returncode": 0, "stderr": ""})()
+            replier.send_reply("cid", 2, "hi")
+        cmd = mock_run.call_args[0][0]
+        self.assertIn("--ai-tag=false", cmd)
+
 
 class TestTextReplyCapability(unittest.TestCase):
     """text_reply 能力：InboundMessage(kind=text) → 提交大脑（防回环+去重由 core 声明式处理）。"""

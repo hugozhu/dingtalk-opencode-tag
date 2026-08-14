@@ -325,10 +325,12 @@ def _send_to_user(user_id, report_text):
     """向指定用户发送报告（单聊）"""
     try:
         # 使用 dws chat message send --user 直接发送单聊消息（Markdown 自动渲染）
+        # --ai-tag=false：去掉「AI」角标（dws 默认 true），与 replier 保持一致
         cmd = [
             "dws", "chat", "message", "send",
             "--user", user_id,
             "--text", report_text,
+            "--ai-tag=false",
             "--profile", PROFILE,
             "-y"
         ]
@@ -358,6 +360,7 @@ def _send_to_group_with_at(user_id, report_text):
             "dws", "chat", "message", "send",
             "--group", group_id,
             "--text", f"@{user_id} \n\n{report_text}",
+            "--ai-tag=false",
             "--profile", PROFILE,
             "-y"
         ]
