@@ -135,6 +135,32 @@ assert_eq "全开: 含 at consumer" "1" "$(echo "$ALL" | grep -c 'consumer: user
 OFF="$(_dwsplan DWS_PROFILE=p DWS_EVENT_GROUP=cidY== DWS_EVENT_AT=0)"
 assert_eq "AT=0 不起 at consumer" "0" "$(echo "$OFF" | grep -c 'consumer: user_im_message_receive_at')"
 
+# O2O_ALL：订阅所有单聊，起 o2o_all consumer（rule_type=all，无 --user）
+O2O_ALL="$(_dwsplan DWS_PROFILE=p DWS_EVENT_O2O_ALL=1)"
+assert_eq "O2O_ALL: plan o2o=1 mode=all" "1" \
+    "$(echo "$O2O_ALL" | grep -c 'plan: group=0 o2o=1 at=0 o2o_mode=all')"
+assert_eq "O2O_ALL: 起 o2o_all consumer" "1" \
+    "$(echo "$O2O_ALL" | grep -c 'consumer: user_im_message_receive_o2o_all')"
+
+# O2O_ALL 优先于 USERS：开了 ALL 就不再按对端逐个订阅
+O2O_BOTH="$(_dwsplan DWS_PROFILE=p DWS_EVENT_O2O_ALL=1 DWS_EVENT_O2O_USERS=u1,u2)"
+assert_eq "O2O_ALL 优先: 起 o2o_all" "1" \
+    "$(echo "$O2O_BOTH" | grep -c 'consumer: user_im_message_receive_o2o_all')"
+assert_eq "O2O_ALL 优先: 不起 per-user consumer" "0" \
+    "$(echo "$O2O_BOTH" | grep -c 'consumer: user_im_message_receive_o2o --user')"
+
+# O2O_ALL 关（0）时回退 per-user 列表
+O2O_FB="$(_dwsplan DWS_PROFILE=p DWS_EVENT_O2O_ALL=0 DWS_EVENT_O2O_USERS=u1,u2)"
+assert_eq "O2O_ALL=0: 回退 per-user 两个 consumer" "2" \
+    "$(echo "$O2O_FB" | grep -c 'consumer: user_im_message_receive_o2o --user')"
+assert_eq "O2O_ALL=0: 不起 o2o_all" "0" \
+    "$(echo "$O2O_FB" | grep -c 'consumer: user_im_message_receive_o2o_all')"
+
+# 仅开 O2O_ALL 也算"配了订阅"，不该走无订阅报错分支
+O2O_ONLY_RC="$(env DWS_CONNECT_SKIP_LOCAL=1 DWS_CONNECT_DRY_RUN=1 CONNECT_LOG=/dev/null \
+    DWS_PROFILE=p DWS_EVENT_O2O_ALL=1 bash "$DWS_CONNECT" >/dev/null 2>&1; echo $?)"
+assert_eq "仅 O2O_ALL → 退出 0" "0" "$O2O_ONLY_RC"
+
 # 什么都不配 → 报错退出非 0（at 也没开）
 NONE_RC="$(env DWS_CONNECT_SKIP_LOCAL=1 DWS_CONNECT_DRY_RUN=1 CONNECT_LOG=/dev/null \
     DWS_PROFILE=p bash "$DWS_CONNECT" >/dev/null 2>&1; echo $?)"

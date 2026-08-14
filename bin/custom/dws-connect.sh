@@ -10,9 +10,13 @@
 # config/constants.local.sh：
 #   DWS_EVENT_KEY        群消息事件类型（默认 user_im_message_receive_group）
 #   DWS_EVENT_GROUP      群 openConversationId（订阅群消息时必填）—— 敏感
+#   DWS_EVENT_O2O_ALL    订阅**所有单聊**：1/true/yes/on=开。事件类型
+#                        user_im_message_receive_o2o_all，rule_type=all 无需 --user
+#                        参数（个人级订阅），任何人私聊数字员工都会触发。
+#                        **优先级高于 DWS_EVENT_O2O_USERS**：开了它就忽略 USERS 列表。
 #   DWS_EVENT_O2O_USERS  订阅单聊时：对端 userId 列表（逗号分隔）。留空=不订阅单聊。
 #                        钉钉 o2o 事件只能按“对端 userId”订阅（每个对端一条订阅），
-#                        故这里为每个 userId 起一个 o2o consumer。
+#                        故这里为每个 userId 起一个 o2o consumer。仅在 O2O_ALL 关时生效。
 #   DWS_EVENT_AT         订阅“@我的消息”（当前数字员工账号被 @ 的消息，跨所有群）。
 #                        1/true/yes/on=开。事件类型 user_im_message_receive_at，
 #                        rule_type=at 无需 group/user 参数（个人级订阅）。用于只在被
@@ -41,6 +45,7 @@ fi
 
 : "${DWS_EVENT_KEY:=user_im_message_receive_group}"
 : "${DWS_EVENT_GROUP:=}"
+: "${DWS_EVENT_O2O_ALL:=}"
 : "${DWS_EVENT_O2O_USERS:=}"
 : "${DWS_EVENT_AT:=}"
 : "${DWS_PROFILE:=}"
@@ -63,7 +68,15 @@ _is_on() {
 _want_group=0
 [[ "$DWS_EVENT_KEY" == *group* && -n "$DWS_EVENT_GROUP" ]] && _want_group=1
 _want_o2o=0
-[[ -n "$DWS_EVENT_O2O_USERS" ]] && _want_o2o=1
+_o2o_mode=""
+# O2O_ALL 优先：开了就订阅所有单聊，忽略 USERS 列表（与 constants.sh 描述一致）。
+if _is_on "$DWS_EVENT_O2O_ALL"; then
+    _want_o2o=1
+    _o2o_mode="all"
+elif [[ -n "$DWS_EVENT_O2O_USERS" ]]; then
+    _want_o2o=1
+    _o2o_mode="users"
+fi
 _want_at=0
 _is_on "$DWS_EVENT_AT" && _want_at=1
 
@@ -116,8 +129,14 @@ _run_consumers() {
             --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
         _consumer_pids+=($!)
     fi
-    # 单聊 consumer：每个对端 userId 一个（o2o 只能按对端订阅）
-    if [[ "$_want_o2o" -eq 1 ]]; then
+    # 单聊 consumer：
+    #   all   —— 个人级订阅（rule_type=all，无需 --user），任何人私聊都触发，一个 consumer
+    #   users —— 每个对端 userId 一个（o2o 只能按对端订阅）
+    if [[ "$_o2o_mode" == "all" ]]; then
+        dws event consume user_im_message_receive_o2o_all \
+            --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
+        _consumer_pids+=($!)
+    elif [[ "$_o2o_mode" == "users" ]]; then
         local IFS=','
         local u
         for u in $DWS_EVENT_O2O_USERS; do
@@ -155,9 +174,11 @@ _run_consumers() {
 
 # DWS_CONNECT_DRY_RUN：只打印订阅计划（脱敏）并退出，不连 bus。供单测校验订阅选择逻辑。
 if _is_on "${DWS_CONNECT_DRY_RUN:-}"; then
-    echo "plan: group=$_want_group o2o=$_want_o2o at=$_want_at"
+    echo "plan: group=$_want_group o2o=$_want_o2o at=$_want_at${_o2o_mode:+ o2o_mode=$_o2o_mode}"
     [[ "$_want_group" -eq 1 ]] && echo "consumer: $DWS_EVENT_KEY --group <len:${#DWS_EVENT_GROUP}>"
-    if [[ "$_want_o2o" -eq 1 ]]; then
+    if [[ "$_o2o_mode" == "all" ]]; then
+        echo "consumer: user_im_message_receive_o2o_all"
+    elif [[ "$_o2o_mode" == "users" ]]; then
         IFS=',' read -ra _users <<< "$DWS_EVENT_O2O_USERS"
         for _u in "${_users[@]}"; do
             _u="${_u// /}"; [[ -z "$_u" ]] && continue

@@ -23,8 +23,11 @@ import sys
 import time
 
 # convType 约定：1=单聊 o2o，2=群聊 group（event_watcher REPLY_RE 提取 convType=\d+）
+# **新增 o2o 事件类型必须登记在此**：未知类型 .get 默认回 2(群聊)，单聊消息会被误判成
+# 群聊，路由/ack 全走错路且不报错——静默失效，比收不到消息更难查。
 _CONV_TYPE_BY_EVENT = {
     "user_im_message_receive_o2o": 1,
+    "user_im_message_receive_o2o_all": 1,   # rule_type=all 的全量单聊订阅
     "user_im_message_receive_at": 2,
     "user_im_message_receive_group": 2,
 }

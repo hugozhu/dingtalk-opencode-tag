@@ -82,6 +82,15 @@ class TestToConnectLine(unittest.TestCase):
         self.assertIn("convType=1", o)
         self.assertNotIn("atMention", o)   # 单聊不打标
 
+    def test_o2o_all_convtype(self):
+        """rule_type=all 的全量单聊订阅也必须判成单聊(convType=1)。
+
+        未登记时 .get 默认回 2(群聊)，单聊消息会被误判成群聊，路由/ack 走错路且不报错。
+        """
+        o = bridge._to_connect_line(_event("user_im_message_receive_o2o_all"))
+        self.assertIn("convType=1", o)
+        self.assertNotIn("atMention", o)   # 单聊不打标
+
     def test_unknown_event_defaults_group(self):
         line = bridge._to_connect_line(_event("some_future_event"))
         self.assertIn("convType=2", line)
