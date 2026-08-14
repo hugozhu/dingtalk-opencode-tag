@@ -312,6 +312,25 @@ assert_eq "custom 定义 brain_probe 钩子" "0" \
 assert_eq "custom 定义 notify_alert_handler 钩子（熔断告警不再静默）" "0" \
     "$(declare -F notify_alert_handler >/dev/null 2>&1 && echo 0 || echo 1)"
 
+# 主管审核回路：模板必须默认关（它改变默认回复行为——提问者不再立即拿到答案），
+# 且开关/超时/知识库三项齐全，否则 fork 的人升级后行为会被动改变。
+echo ""
+echo "Testing supervisor_review config contract..."
+CONST="$SCRIPT_DIR/config/constants.sh"
+assert_eq "constants.sh 定义 CAP_SUPERVISOR_REVIEW_ENABLED" "1" \
+    "$(grep -c 'CAP_SUPERVISOR_REVIEW_ENABLED' "$CONST")"
+assert_eq "模板默认关（:-0）" "1" \
+    "$(grep -c 'CAP_SUPERVISOR_REVIEW_ENABLED:-0' "$CONST")"
+assert_eq "constants.sh 定义 SUPERVISOR_REVIEW_TIMEOUT" "1" \
+    "$(grep -c 'SUPERVISOR_REVIEW_TIMEOUT' "$CONST")"
+assert_eq "constants.sh 定义 AGENT_KNOWLEDGE_FILE" "1" \
+    "$(grep -c 'AGENT_KNOWLEDGE_FILE' "$CONST")"
+assert_eq "能力已在 capabilities/__init__ 注册" "1" \
+    "$(grep -q 'from custom.capabilities import supervisor_review' "$SCRIPT_DIR/src/custom/capabilities/__init__.py" && echo 1 || echo 0)"
+# 知识库含真实对话内容，绝不能提交
+assert_eq "knowledge/ 已 gitignore" "1" \
+    "$(grep -c '^knowledge/' "$SCRIPT_DIR/.gitignore")"
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -137,6 +137,73 @@ _SYSTEM_PROMPT = os.environ.get(
 # 分片成多条钉钉消息发出（见 custom/replier.py _split_text），不再一刀切到千字。
 _MAX_REPLY_CHARS = int(os.environ.get("AGENT_MAX_REPLY_CHARS", "12000"))
 
+# --- 主管审核沉淀的知识注入（配合 capabilities/supervisor_review）---------------
+# 主管改写过的答案追加进 JSONL 知识库；这里读末 N 条拼到 system prompt 之后，
+# 让下次同类问题 AI 能自己答对。文件不存在/为空 → 与原 _SYSTEM_PROMPT 完全一致（零影响）。
+_KNOWLEDGE_FILE = os.environ.get("AGENT_KNOWLEDGE_FILE", "knowledge/supervisor_qa.jsonl")
+_KNOWLEDGE_MAX = int(os.environ.get("AGENT_KNOWLEDGE_MAX", "20"))
+# mtime 缓存：每条消息都读盘没必要，文件没变就复用上次拼好的字符串
+_knowledge_cache = {"mtime": None, "text": ""}
+_knowledge_lock = threading.Lock()
+
+
+def _knowledge_path():
+    base = os.environ.get("PROJECT_DIR", os.getcwd())
+    p = _KNOWLEDGE_FILE
+    return p if os.path.isabs(p) else os.path.join(base, p)
+
+
+def _load_knowledge():
+    """读知识库末 _KNOWLEDGE_MAX 条，渲染成 prompt 片段；无知识返回 ""。
+
+    读盘/解析失败一律返回 ""（知识注入是增强，绝不能拖垮正常回复链路）。
+    """
+    if _KNOWLEDGE_MAX <= 0:
+        return ""
+    path = _knowledge_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return ""   # 没有知识库文件 = 还没学到东西
+    with _knowledge_lock:
+        if _knowledge_cache["mtime"] == mtime:
+            return _knowledge_cache["text"]
+    items = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue          # 跳过坏行，不因一行脏数据丢掉整个知识库
+                q = (rec.get("question") or "").strip()
+                a = (rec.get("answer") or "").strip()
+                if q and a:
+                    items.append((q, a))
+    except OSError as e:
+        log(f"brain: 读知识库失败 {e}")
+        return ""
+    items = items[-_KNOWLEDGE_MAX:]
+    if not items:
+        text = ""
+    else:
+        lines = ["", "---", "以下是主管此前审核确认过的问答，遇到同类问题请优先参考其口径回答："]
+        for i, (q, a) in enumerate(items, 1):
+            lines.append(f"{i}. 问：{q}\n   答：{a}")
+        text = "\n".join(lines)
+    with _knowledge_lock:
+        _knowledge_cache["mtime"] = mtime
+        _knowledge_cache["text"] = text
+    return text
+
+
+def _effective_system_prompt():
+    """system prompt = 基础人设 + 主管沉淀的知识。无知识时等于 _SYSTEM_PROMPT。"""
+    return _SYSTEM_PROMPT + _load_knowledge()
+
 
 def _oc_log(transport, model, elapsed, prompt, reply, ok, err=""):
     """把一次 opencode 调用记到独立 opencode.log。
@@ -855,7 +922,7 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
             "POST", port, pwd, f"/session/{sid}/message",
             {
                 "model": {"providerID": provider, "modelID": model_id},
-                "system": _SYSTEM_PROMPT,
+                "system": _effective_system_prompt(),
                 "parts": [{"type": "text", "text": prompt}],
             },
             timeout=_OPENCODE_SOCK_TIMEOUT,
@@ -1028,7 +1095,7 @@ def _brain_opencode_cli(prompt):
     失败（超时 / rc!=0 / opencode 不存在）**抛异常**，由调用方判为 failed（#59）——不再
     把失败伪装成空字符串，以便上层给用户兜底提示。
     """
-    full_prompt = f"{_SYSTEM_PROMPT}\n\n{prompt}"
+    full_prompt = f"{_effective_system_prompt()}\n\n{prompt}"
     cmd = [_OPENCODE_BIN, "run", full_prompt,
            "--model", _OPENCODE_MODEL, "--format", "json"]
     t0 = time.time()
@@ -1064,7 +1131,7 @@ def _brain_proxy(user, text, ctx, raw=False):
     body = json.dumps({
         "model": _CHAT_MODEL,
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": _effective_system_prompt()},
             {"role": "user", "content": user_content},
         ],
     }).encode()

@@ -146,6 +146,20 @@ export CAP_STARTUP_REPORT_ENABLED="${CAP_STARTUP_REPORT_ENABLED:-1}"
 export AGENT_SUPERVISOR_USER_ID="${AGENT_SUPERVISOR_USER_ID:-}"
 export AGENT_SUPERVISOR_NAME="${AGENT_SUPERVISOR_NAME:-}"
 
+# 主管审核回路（capabilities/supervisor_review）：非主管的单聊不直接回复提问者，改为
+# AI 先出草稿 → 转交主管审核 → 主管回「#N 同意」放行 / 「#N <答案>」改写 / 「#N 忽略」
+# 不回。主管改写过的答案存入知识库并注入后续 system prompt（AI 下次能自己答对）。
+# **默认关**：它改变默认回复行为（提问者不再立即拿到答案），必须显式开。
+# 依赖 AGENT_SUPERVISOR_USER_ID（发卡片）+ AGENT_SUPERVISOR_NAME（认主管入站消息）。
+export CAP_SUPERVISOR_REVIEW_ENABLED="${CAP_SUPERVISOR_REVIEW_ENABLED:-0}"
+export SUPERVISOR_REVIEW_TIMEOUT="${SUPERVISOR_REVIEW_TIMEOUT:-600}"   # 超时放行草稿(秒)，0=不超时
+export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-1}"   # 仅拦单聊（群聊不拦）
+# 主管显示名别名（逗号分隔）。bridge 只传显示名不传 userId，同一人可能显示为
+# "hugozhu"/"朱鸿"，都列上避免认不出主管。
+export AGENT_SUPERVISOR_ALIASES="${AGENT_SUPERVISOR_ALIASES:-}"
+# 知识库（JSONL，相对 PROJECT_DIR）。AGENT_KNOWLEDGE_MAX=0 可关闭知识注入。
+export AGENT_KNOWLEDGE_FILE="${AGENT_KNOWLEDGE_FILE:-knowledge/supervisor_qa.jsonl}"
+export AGENT_KNOWLEDGE_MAX="${AGENT_KNOWLEDGE_MAX:-20}"
 # opencode serve 端口（start_serve 用；密码自动生成写 .serve.pwd）。brain(opencode) 走
 # 此 serve 的 HTTP 接口生成回复。
 export OPENCODE_SERVE_PORT="${OPENCODE_SERVE_PORT:-4096}"
