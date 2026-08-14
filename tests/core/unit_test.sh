@@ -317,19 +317,35 @@ assert_eq "custom 定义 notify_alert_handler 钩子（熔断告警不再静默�
 echo ""
 echo "Testing supervisor_review config contract..."
 CONST="$SCRIPT_DIR/config/constants.sh"
+# 断言锚定 `^export VAR=` 而不是裸变量名：注释里提到同名变量（如 ACK_SUPERVISOR_ONLY
+# 的说明引用了 CAP_SUPERVISOR_REVIEW_ENABLED）会让计数漂移，与定义本身无关。
 assert_eq "constants.sh 定义 CAP_SUPERVISOR_REVIEW_ENABLED" "1" \
-    "$(grep -c 'CAP_SUPERVISOR_REVIEW_ENABLED' "$CONST")"
+    "$(grep -c '^export CAP_SUPERVISOR_REVIEW_ENABLED=' "$CONST")"
 assert_eq "模板默认关（:-0）" "1" \
-    "$(grep -c 'CAP_SUPERVISOR_REVIEW_ENABLED:-0' "$CONST")"
+    "$(grep -c '^export CAP_SUPERVISOR_REVIEW_ENABLED="${CAP_SUPERVISOR_REVIEW_ENABLED:-0}"' "$CONST")"
 assert_eq "constants.sh 定义 SUPERVISOR_REVIEW_TIMEOUT" "1" \
-    "$(grep -c 'SUPERVISOR_REVIEW_TIMEOUT' "$CONST")"
+    "$(grep -c '^export SUPERVISOR_REVIEW_TIMEOUT=' "$CONST")"
 assert_eq "constants.sh 定义 AGENT_KNOWLEDGE_FILE" "1" \
-    "$(grep -c 'AGENT_KNOWLEDGE_FILE' "$CONST")"
+    "$(grep -c '^export AGENT_KNOWLEDGE_FILE=' "$CONST")"
 assert_eq "能力已在 capabilities/__init__ 注册" "1" \
     "$(grep -q 'from custom.capabilities import supervisor_review' "$SCRIPT_DIR/src/custom/capabilities/__init__.py" && echo 1 || echo 0)"
 # 知识库含真实对话内容，绝不能提交
 assert_eq "knowledge/ 已 gitignore" "1" \
     "$(grep -c '^knowledge/' "$SCRIPT_DIR/.gitignore")"
+
+# ack 主管闸门（#106）：只给主管贴状态表情。默认开，但必须有 has_supervisor() 兜底——
+# 否则未配主管的部署会一个表情都不贴（CAP_ACK_ENABLED 默认开，属无声行为回退）。
+assert_eq "constants.sh 定义 ACK_SUPERVISOR_ONLY" "1" \
+    "$(grep -c '^export ACK_SUPERVISOR_ONLY=' "$CONST")"
+assert_eq "ACK_SUPERVISOR_ONLY 默认开（:-1）" "1" \
+    "$(grep -c '^export ACK_SUPERVISOR_ONLY="${ACK_SUPERVISOR_ONLY:-1}"' "$CONST")"
+assert_eq "ack 主管闸门带 has_supervisor 兜底" "1" \
+    "$(grep -c 'has_supervisor() and not is_supervisor' "$SCRIPT_DIR/src/custom/capabilities/ack.py")"
+# 身份判定收敛到 custom/identity.py，能力之间不互相 import（ack 常开 / supervisor_review 默认关）
+assert_eq "identity 模块存在" "0" \
+    "$([ -f "$SCRIPT_DIR/src/custom/identity.py" ] && echo 0 || echo 1)"
+assert_eq "ack 不 import supervisor_review 能力" "0" \
+    "$(grep -c 'import supervisor_review' "$SCRIPT_DIR/src/custom/capabilities/ack.py")"
 
 # 报告
 echo ""

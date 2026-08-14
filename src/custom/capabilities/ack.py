@@ -27,6 +27,9 @@ DingTalk 约定（实测）：
 设计要点：
 - **非消费型**：on_inbound 只做回执副作用后返回 False，让 text_reply 等照常回复
   （priority=1 最先跑；dispatch_inbound 遇 True 才短路，False 继续分发）。
+- **只给主管贴状态表情**（#106，ACK_SUPERVISOR_ONLY 默认开）：真人同事不会在每条消息上
+  贴状态标签；且主管审核回路开启后非主管的消息实际由主管处理，给提问者贴「正在处理中」
+  是语义错误。已读不受影响——所有人照常 mark-read。未配主管时退化为原行为（都贴）。
 - **生命周期靠 reply-sent 信号**：core 的 `on_reply_sent(conv_id, conv_type, ok)` hook
   （replier.send_reply 后广播）驱动"进度→完成/失败"切换。每条消息一个后台 worker：
   mark-read + 走时间线（按 elapsed 逐级升级），收到信号或整体超时即收尾。
@@ -49,11 +52,17 @@ from collections import OrderedDict
 
 from core.agent_common import _run_cli, env_flag, log
 from core.capabilities import Capability, register
+from custom.identity import has_supervisor, is_supervisor
 
 # --- 配置（constants.local.sh 覆盖）---
 _O2O_ONLY = env_flag("ACK_O2O_ONLY", default=True)       # 默认只单聊（群里逐条贴噪音大）
 _AT_MENTION = env_flag("ACK_AT_MENTION", default=True)   # 群里被 @ 数字员工时也回执（#46）
 _MARK_READ = env_flag("ACK_MARK_READ", default=True)      # 是否同时标记已读
+# 只对**主管**的消息贴状态表情（#106，拟人化）。真人同事不会在每条消息上贴状态标签；
+# 且主管审核回路开启后，非主管的消息实际由主管处理，给提问者贴「正在处理中」是语义错误。
+# 已读(mark-read)不受本项影响——所有人照常标已读（真人也会已读）。
+# **未配主管时退化为原行为（都贴）**：否则没配主管的部署会一个表情都不贴（无声回退）。
+_SUPERVISOR_ONLY = env_flag("ACK_SUPERVISOR_ONLY", default=True)
 
 # ack 动作轨迹（收到/升级/收尾/仅已读）AGENT_DEBUG 时记到 monitor.log —— 和 ack 失败日志
 # 同一文件、同一 "ack:" 前缀，一处看全某条消息的回执经过（按 msgId 与 agent-connect.log 对齐）。
@@ -210,12 +219,17 @@ def _should_ack(msg):
     """纯判定：这条消息是否要**完整回执**（已读 + 状态文字表情）。
 
     需要 conv_id + msg_id（回执 API 必填）。完整回执范围：
+      - 非主管的消息（ACK_SUPERVISOR_ONLY 开且已配主管）→ 不贴状态表情（#106）
       - 单聊(conv_type=1) → 回执（#45 原行为）
       - 群(conv_type=2) 且本条被 @ 数字员工（extra['at_mention']）且 ACK_AT_MENTION 开 → 回执（#46）
       - ACK_O2O_ONLY=0 → 群里所有消息也完整回执（原逃生口，噪音大，默认关）
       - 其它群消息（未被 @）→ 不做完整回执（但可能只标记已读，见 _should_mark_read）
     """
     if not msg.conv_id or not msg.msg_id:
+        return False
+    # 主管闸门（#106）：只给主管贴状态表情。has_supervisor() 前置——没配主管时
+    # is_supervisor() 对谁都是 False，少了这层判断会导致**谁都不贴**（无声回退）。
+    if _SUPERVISOR_ONLY and has_supervisor() and not is_supervisor(msg.user):
         return False
     if msg.conv_type == _CONV_TYPE_O2O:
         return True

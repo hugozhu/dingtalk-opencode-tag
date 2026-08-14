@@ -35,6 +35,7 @@ from core.brain import generate_reply_ex
 from core.capabilities import Capability, register
 from core.inbound import KIND_TEXT
 from core.replier import send_reply
+from custom.identity import is_supervisor, supervisor_id, supervisor_names
 
 # 超时未裁决 → 放行 AI 草稿（秒）。0=永不超时（提问者可能被无限期挂着，慎用）。
 _TIMEOUT = int(os.environ.get("SUPERVISOR_REVIEW_TIMEOUT", "600"))
@@ -59,7 +60,7 @@ _seq_counter = 0
 
 def _supervisor_id():
     """主管 userId（发卡片用）。取不到返回 ""。"""
-    return os.environ.get("AGENT_SUPERVISOR_USER_ID", "").strip()
+    return supervisor_id()
 
 
 def _supervisor_names():
@@ -68,18 +69,12 @@ def _supervisor_names():
     bridge 只传显示名，故必须靠名字比对。同一人可能显示为 "hugozhu"/"朱鸿"，
     用 AGENT_SUPERVISOR_ALIASES 补别名。
     """
-    names = set()
-    for key in ("AGENT_SUPERVISOR_NAME", "AGENT_SUPERVISOR_ALIASES"):
-        for n in os.environ.get(key, "").split(","):
-            n = n.strip()
-            if n:
-                names.add(n)
-    return names
+    return supervisor_names()
 
 
 def _is_supervisor(user):
     """该发送人是主管吗？"""
-    return bool(user) and user in _supervisor_names()
+    return is_supervisor(user)
 
 
 def _send_to_supervisor(text):

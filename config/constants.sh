@@ -228,6 +228,14 @@ export ACK_AT_MENTION="${ACK_AT_MENTION:-1}"
 # 群被@ / 群普通消息）都会 mark-read；只有单聊和群被@ 才额外贴状态表情（群普通消息只已读、
 # 不贴表情，避免逐条噪音）。设 0 则完全不标已读。
 export ACK_MARK_READ="${ACK_MARK_READ:-1}"
+# 只对**主管**的消息贴状态表情（#106，拟人化）。真人同事不会在每条收到的消息上贴一个
+# 状态标签；且主管审核回路（CAP_SUPERVISOR_REVIEW_ENABLED）开启后，非主管的消息实际是
+# 转交主管处理的，给提问者贴「正在处理中」与事实不符。
+# 主管身份按显示名判定（AGENT_SUPERVISOR_NAME + AGENT_SUPERVISOR_ALIASES）。
+# **已读不受本项影响**：所有人的消息照常 mark-read（真人也会已读）。
+# **未配主管时自动退化为原行为（都贴）**，故默认 1 对未配主管的部署零影响。
+# 设 0 = 回到「所有人都贴」。
+export ACK_SUPERVISOR_ONLY="${ACK_SUPERVISOR_ONLY:-1}"
 # 文字表情时间线：`delay秒:表情名:文字`，多阶段用 `|` 分隔，按 delay 升序。delay=消息到达后
 # 多少秒切到该状态（首个应为 0=收到即贴；文字里可含 : 和 ,，只按前两个 : 切分）。任一时刻
 # 只显示一个文字表情（升级=移除旧+贴新）。表情名为 DingTalk **具名表情**（实测 收到/稍等/

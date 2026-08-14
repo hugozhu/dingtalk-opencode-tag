@@ -100,6 +100,76 @@ class TestShouldAck(unittest.TestCase):
         self.assertTrue(ack._should_ack(_msg(kind=KIND_IMAGE)))
 
 
+class TestShouldAckSupervisorOnly(unittest.TestCase):
+    """只给主管贴状态表情（#106）。
+
+    注意：上面 TestShouldAck 的用例跑在「未配主管」环境下（裸测试环境无
+    AGENT_SUPERVISOR_* env），走的正是兜底那条路 —— 那些用例继续全绿本身就验证了
+    「没配主管 → 保持原行为」。本类显式设置 env 覆盖新行为。
+    """
+
+    _KEYS = ("AGENT_SUPERVISOR_NAME", "AGENT_SUPERVISOR_ALIASES", "AGENT_SUPERVISOR_USER_ID")
+
+    def setUp(self):
+        self._orig = {k: os.environ.get(k) for k in self._KEYS}
+        os.environ["AGENT_SUPERVISOR_NAME"] = "hugozhu"
+        os.environ["AGENT_SUPERVISOR_ALIASES"] = "朱鸿"
+        os.environ["AGENT_SUPERVISOR_USER_ID"] = "024083"
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_supervisor_gets_status_emoji(self):
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertTrue(ack._should_ack(_msg(user="hugozhu")))
+
+    def test_supervisor_alias_gets_status_emoji(self):
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertTrue(ack._should_ack(_msg(user="朱鸿")))
+
+    def test_other_user_gets_no_status_emoji(self):
+        """本 issue 的核心诉求：非主管的单聊不贴状态表情。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertFalse(ack._should_ack(_msg(user="张三")))
+
+    def test_other_user_in_group_at_mention_also_gated(self):
+        """群里被 @ 的那一路（#46）同样只限主管。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", True), \
+             patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True):
+            self.assertFalse(ack._should_ack(
+                _msg(user="张三", conv_type="2", extra={"at_mention": True})))
+            self.assertTrue(ack._should_ack(
+                _msg(user="hugozhu", conv_type="2", extra={"at_mention": True})))
+
+    def test_switch_off_restores_ack_for_all(self):
+        """ACK_SUPERVISOR_ONLY=0 → 逃生口，回到所有人都贴。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", False):
+            self.assertTrue(ack._should_ack(_msg(user="张三")))
+
+    def test_unconfigured_supervisor_falls_back_to_ack_all(self):
+        """未配主管 + 开关开 → 退化为原行为（都贴）。
+
+        这条守着一个无声回退：若少了 has_supervisor() 前置，没配主管的部署会
+        **谁都不贴表情**，而 CAP_ACK_ENABLED 默认是开的。
+        """
+        for k in self._KEYS:
+            os.environ.pop(k, None)
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertTrue(ack._should_ack(_msg(user="张三")))
+            self.assertTrue(ack._should_ack(_msg(user="hugozhu")))
+
+    def test_mark_read_unaffected_by_supervisor_gate(self):
+        """已读不受主管闸门影响：非主管的消息照常标已读（真人也会已读）。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", True), \
+             patch.object(ack, "_MARK_READ", True):
+            self.assertTrue(ack._should_mark_read(_msg(user="张三")))
+            self.assertTrue(ack._should_mark_read(_msg(user="张三", conv_type="2")))
+
+
 class TestOnInbound(unittest.TestCase):
     def setUp(self):
         ack._seen.clear()
