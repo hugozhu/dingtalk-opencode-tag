@@ -133,9 +133,12 @@ class TestBrainOpencodeHttp(unittest.TestCase):
 
     def test_http_body_has_nested_model_and_system(self):
         calls = []
+        # _KNOWLEDGE_MAX=0 关掉主管知识注入：否则本用例会读到仓库里真实的
+        # knowledge/supervisor_qa.jsonl，断言随线上沉淀的内容漂移。
         with patch.object(brain, "_BRAIN", "opencode"), \
              patch.object(brain, "_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free"), \
              patch.object(brain, "_SYSTEM_PROMPT", "SYS"), \
+             patch.object(brain, "_KNOWLEDGE_MAX", 0), \
              patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
              patch.object(brain, "_serve_request", side_effect=self._serve_side_effect(calls)):
             brain.generate_reply("hugozhu", "1+1")
