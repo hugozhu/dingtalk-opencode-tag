@@ -140,6 +140,12 @@ export AGENT_FALLBACK_REPLY="${AGENT_FALLBACK_REPLY:-⚠️ 暂时无法处理�
 # 启动报告：服务启动后向订阅单聊用户的主管发送详细服务状态报告（默认开）。
 # 报告包含数字员工身份、订阅配置、组件状态、健康检查、配置概要等。设 0 关闭。
 export CAP_STARTUP_REPORT_ENABLED="${CAP_STARTUP_REPORT_ENABLED:-1}"
+# 主管兜底：报告收件人优先取通讯录 orgMasterUserId/orgMasterDisplayName；数字员工账号
+# 常常没挂组织汇报线（两个字段都是 null），此时报告会整份发不出去。配上这两项即可兜底，
+# 通讯录查得到时以通讯录为准。留空 = 保持原行为（查不到就不发）。
+export AGENT_SUPERVISOR_USER_ID="${AGENT_SUPERVISOR_USER_ID:-}"
+export AGENT_SUPERVISOR_NAME="${AGENT_SUPERVISOR_NAME:-}"
+
 # opencode serve 端口（start_serve 用；密码自动生成写 .serve.pwd）。brain(opencode) 走
 # 此 serve 的 HTTP 接口生成回复。
 export OPENCODE_SERVE_PORT="${OPENCODE_SERVE_PORT:-4096}"
