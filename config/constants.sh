@@ -70,17 +70,22 @@ export AGENT_VISION_MODEL="${AGENT_VISION_MODEL:-}"
 # --- dws event connect（bin/custom/dws-connect.sh）---
 # 敏感值：真实的群 conversationId / profile 填在 config/constants.local.sh（gitignored），
 # 不要写进本模板文件。群订阅 + 单聊(o2o)订阅 + @我(at)订阅可任意组合，至少开一种。
-export DWS_EVENT_KEY=”${DWS_EVENT_KEY:-user_im_message_receive_group}”
-export DWS_EVENT_GROUP=”${DWS_EVENT_GROUP:-}”   # 群 openConversationId（订阅群消息必填，敏感）
-export DWS_EVENT_GROUP_NAME=”${DWS_EVENT_GROUP_NAME:-}”  # 群聊名称（可选，用于启动报告显示）
+export DWS_EVENT_KEY="${DWS_EVENT_KEY:-user_im_message_receive_group}"
+export DWS_EVENT_GROUP="${DWS_EVENT_GROUP:-}"   # 群 openConversationId（订阅群消息必填，敏感）
+export DWS_EVENT_GROUP_NAME="${DWS_EVENT_GROUP_NAME:-}"  # 群聊名称（可选，用于启动报告显示）
 # 单聊(o2o)订阅：对端 userId 列表（逗号分隔）。钉钉 o2o 事件只能按”对端 userId”订阅，
 # 每个对端起一个 consumer。留空=不订阅单聊。例：给数字员工发单聊的真人 userId。
-export DWS_EVENT_O2O_USERS=”${DWS_EVENT_O2O_USERS:-}”  # 敏感，勿提交
+export DWS_EVENT_O2O_USERS="${DWS_EVENT_O2O_USERS:-}"  # 敏感，勿提交
 # @我订阅：数字员工账号在**任意群**被 @ 时收到消息（事件 user_im_message_receive_at，
 # rule_type=at 个人级订阅，无需 group/user 参数）。1/true/yes/on=开，留空/0=不订阅。
-# 适合“只在被 @ 时才响应、又不想逐个配置群 conversationId”的场景。与群/单聊订阅可并存，
-# 同一条消息即便被多个订阅命中，能力层按 msgId 去重不会重复处理。
+# 适合“只在被 @ 时才响应、又不想逐个配置群 conversationId”的场景。与群/单聊订阅可并存 ——
+# 但群里被 @ 的消息会被**投递两次**（群流一份、@ 流一份，且只有 @ 流那份带 atMention 标记），
+# 由 capabilities/group_gate 合并成一份（core 的“按能力”dedup 挡不住，见该模块头注释）。
 export DWS_EVENT_AT="${DWS_EVENT_AT:-}"
+# 群消息闸门（capabilities/group_gate，默认开）：订阅整群时，群里**没 @ 数字员工**的消息
+# 只记账/标已读，不进大脑、不回复（真人同事也不会插嘴每条群聊）；同时合并上面说的双流
+# 重复投递。设 0 = 群里每条都回，且失去双流去重（订阅整群 + DWS_EVENT_AT 时会重复回复）。
+export CAP_GROUP_GATE_ENABLED="${CAP_GROUP_GATE_ENABLED:-1}"
 export DWS_PROFILE="${DWS_PROFILE:-}"           # 组织 profile（敏感，勿提交）
 
 # --- 数字员工大脑 / 回复（src/custom/brain.py + replier.py）---
@@ -146,14 +151,18 @@ export CAP_STARTUP_REPORT_ENABLED="${CAP_STARTUP_REPORT_ENABLED:-1}"
 export AGENT_SUPERVISOR_USER_ID="${AGENT_SUPERVISOR_USER_ID:-}"
 export AGENT_SUPERVISOR_NAME="${AGENT_SUPERVISOR_NAME:-}"
 
-# 主管审核回路（capabilities/supervisor_review）：非主管的单聊不直接回复提问者，改为
+# 主管审核回路（capabilities/supervisor_review）：数字员工不直接回复提问者，改为
 # AI 先出草稿 → 转交主管审核 → 主管回「#N 同意」放行 / 「#N <答案>」改写 / 「#N 忽略」
 # 不回。主管改写过的答案存入知识库并注入后续 system prompt（AI 下次能自己答对）。
+# 单聊和群聊都审（群里是公开发言，更该先过一遍）；连主管自己在群里的提问也审 —— 闸门管的
+# 是"数字员工说什么"而不是"谁在问"。**裁决只认主管单聊**，群里主管的话一律当新提问。
 # **默认关**：它改变默认回复行为（提问者不再立即拿到答案），必须显式开。
 # 依赖 AGENT_SUPERVISOR_USER_ID（发卡片）+ AGENT_SUPERVISOR_NAME（认主管入站消息）。
 export CAP_SUPERVISOR_REVIEW_ENABLED="${CAP_SUPERVISOR_REVIEW_ENABLED:-0}"
 export SUPERVISOR_REVIEW_TIMEOUT="${SUPERVISOR_REVIEW_TIMEOUT:-600}"   # 超时放行草稿(秒)，0=不超时
-export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-1}"   # 仅拦单聊（群聊不拦）
+# 1=只审单聊（群聊直接回，不经主管）。默认 0=群聊也审。群里被审的范围与 text_reply 一致：
+# 数字员工本来会回的那些（整群订阅=每条；只订阅 DWS_EVENT_AT=只有被 @ 的）。
+export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-0}"
 # 主管显示名别名（逗号分隔）。bridge 只传显示名不传 userId，同一人可能显示为
 # "hugozhu"/"朱鸿"，都列上避免认不出主管。
 export AGENT_SUPERVISOR_ALIASES="${AGENT_SUPERVISOR_ALIASES:-}"

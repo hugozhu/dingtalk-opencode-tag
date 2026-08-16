@@ -601,6 +601,31 @@ class TestLifecycleWorker(unittest.TestCase):
         remove_calls = [c for c in cli_calls if "remove-text-emotion" in c[1]]
         self.assertEqual(len(remove_calls), 1, "超时收尾应调用 remove")
 
+    def test_reply_sent_none_closes_silently(self):
+        """ok=None → 静默收尾：移除「处理中」但不贴完成/失败（#108 忽略场景）。
+
+        贴「完成」= 骗提问者（他并没收到回复），贴「未完成」= 看着像故障。
+        """
+        calls, m = self._record()
+        with patch.object(ack, "_mark_read", m["_mark_read"]), \
+             patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
+             patch.object(ack, "_emotion_id", m["_emotion_id"]), \
+             patch.object(ack, "_update_text_emotion", m["_update_text_emotion"]), \
+             patch.object(ack, "_run_cli", m["_run_cli"]), \
+             patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
+             patch.object(ack, "_DONE_TIMEOUT", 30), \
+             patch.object(ack, "_DONE", ("OK", "done")), \
+             patch.object(ack, "_ERROR", ("疑问", "fail")):
+            ack._begin(_msg(conv_id="cN==", msg_id="mN=="))
+            time.sleep(0.05)
+            ack.on_reply_sent("cN==", "1", None)
+            self.assertTrue(_wait_gone("cN=="), "None 必须唤醒 worker，不能等到 DONE_TIMEOUT")
+        shown = self._shown(calls)
+        self.assertNotIn(("OK", "done"), shown)
+        self.assertNotIn(("疑问", "fail"), shown)
+        remove_calls = [c for c in calls if c[0] == "cli" and "remove-text-emotion" in c[1]]
+        self.assertEqual(len(remove_calls), 1, "静默收尾应只移除进度表情")
+
     def test_best_effort_no_raise(self):
         def boom(*a, **k):
             raise RuntimeError("cli down")

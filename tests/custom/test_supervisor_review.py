@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """supervisor_review — 主管审核回路单测。
 
-覆盖：拦截非主管单聊 / 主管消息放行 / 三种裁决（同意·改写·忽略）/ 编号对应 /
-并发不串 / 超时兜底 / 群聊不拦 / 学习只在改写时发生。
+覆盖：拦截非主管单聊 / 主管单聊放行 / 三种裁决（同意·改写·忽略）/ 编号对应 /
+并发不串 / 超时兜底 / 群聊同样送审（#107，含主管自己在群里提问）/ 学习只在改写时发生。
 """
 import json
 import os
@@ -32,7 +32,7 @@ class _Base(unittest.TestCase):
         self.patches = [
             patch.object(sr, "_KNOWLEDGE_FILE", self.kf),
             patch.object(sr, "_TIMEOUT", 0),        # 0=不起定时器，超时单独测
-            patch.object(sr, "_O2O_ONLY", True),
+            patch.object(sr, "_O2O_ONLY", False),   # 默认：单聊 + 群聊都审（#107）
         ]
         for p in self.patches:
             p.start()
@@ -50,12 +50,12 @@ class _Base(unittest.TestCase):
             os.environ.pop(k, None)
 
     def _escalate(self, user="张三", text="问题", conv_id="cidZhang", msg_id="m1",
-                  draft="AI草稿"):
+                  draft="AI草稿", conv_type="1"):
         """走一遍拦截 → 草稿 → 转交，返回 (send_to_sup mock, send_reply mock)。"""
         with patch.object(sr, "generate_reply_ex", return_value=(draft, "ok")), \
              patch.object(sr, "_send_to_supervisor", return_value=True) as sup, \
              patch.object(sr, "send_reply") as rep:
-            sr._draft_and_forward(user, text, "1", conv_id, msg_id)
+            sr._draft_and_forward(user, text, conv_type, conv_id, msg_id)
         return sup, rep
 
 
@@ -66,11 +66,42 @@ class TestInterception(_Base):
             self.assertTrue(sr.on_inbound(_msg("张三", "你好")))
             sub.assert_called_once()
 
-    def test_group_message_passes_through(self):
-        """群聊不拦（O2O_ONLY）。"""
+    def test_group_message_intercepted(self):
+        """群聊同样送审（#107）：群里的回答是公开发言，比单聊更该先过主管。"""
         with patch.object(sr, "submit_reply") as sub:
+            self.assertTrue(sr.on_inbound(_msg("张三", "你好", conv_type="2")))
+            sub.assert_called_once()
+
+    def test_group_message_from_supervisor_intercepted(self):
+        """主管在群里提问也送审（#107）—— 闸门管的是"数字员工说什么"，不是"谁在问"。"""
+        with patch.object(sr, "submit_reply") as sub:
+            self.assertTrue(sr.on_inbound(_msg("boss", "季度目标是啥", conv_type="2")))
+            sub.assert_called_once()
+
+    def test_group_message_from_supervisor_is_not_a_verdict(self):
+        """裁决只认主管单聊：主管在群里说「同意」是新提问，不能放行别人的待审。"""
+        self._escalate(user="张三", conv_id="cidZhang")
+        with patch.object(sr, "submit_reply") as sub, \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(_msg("boss", "同意", conv_type="2",
+                                               conv_id="cidGroup", msg_id="m9")))
+        sub.assert_called_once()          # 当成新提问送审
+        rep.assert_not_called()           # 张三的待审没被放行
+        self.assertEqual(len(sr._pending), 1)
+
+    def test_group_passes_through_when_o2o_only(self):
+        """SUPERVISOR_REVIEW_O2O_ONLY=1 → 回到只审单聊的老行为。"""
+        with patch.object(sr, "_O2O_ONLY", True), \
+             patch.object(sr, "submit_reply") as sub:
             self.assertFalse(sr.on_inbound(_msg("张三", "你好", conv_type="2")))
             sub.assert_not_called()
+
+    def test_group_card_marks_public_scene(self):
+        """卡片必须标出群聊 —— 主管得知道这条答案会公开发出去。"""
+        sup, _ = self._escalate(conv_type="2", conv_id="cidGroup")
+        self.assertIn("群聊", sup.call_args[0][0])
+        sup2, _ = self._escalate(conv_type="1", msg_id="m2")
+        self.assertIn("单聊", sup2.call_args[0][0])
 
     def test_supervisor_without_pending_passes_through(self):
         """主管没有待审时正常对话 —— 必须放行给 text_reply，否则主管没法用数字员工。"""
@@ -135,6 +166,16 @@ class TestVerdict(_Base):
         self.assertEqual(rep.call_args[0][0], "cidZhang")   # 发给提问者
         self.assertEqual(rep.call_args[0][2], "AI草稿")
         self.assertEqual(len(sr._pending), 0)
+
+    def test_approve_group_pending_replies_to_group(self):
+        """群里提的问题，主管在单聊放行后答案要发回**那个群**（#107）。"""
+        self._escalate(conv_id="cidGroup", conv_type="2", draft="AI草稿")
+        with patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss")))
+        self.assertEqual(rep.call_args[0][0], "cidGroup")
+        self.assertEqual(rep.call_args[0][1], "2")     # 按群聊发，不是单聊
+        self.assertEqual(rep.call_args[0][2], "AI草稿")
 
     def test_approve_does_not_learn(self):
         """同意 = AI 本来就对，没有新知识，不该写知识库。"""
@@ -237,6 +278,72 @@ class TestTimeout(_Base):
              patch.object(sr, "send_reply") as rep:
             sr._timeout(seq)
         rep.assert_not_called()
+
+
+class TestAckClosure(_Base):
+    """不发消息的出口必须显式收尾 ack（#108）。
+
+    ack 的「处理中→完成」只由 send_reply 广播的 reply-sent 驱动。本能力有几条路径
+    压根不产生 send_reply，不收尾 → 那条消息的 ack worker 每 5 分钟往会话播一条
+    「仍在处理中」直到 65 分钟超时（群聊里尤其刺眼：主管都决定忽略了还在报进度）。
+    """
+
+    def test_ignore_closes_asker_ack_silently(self):
+        """忽略 → 提问者那条静默收尾（ok=None）：没答就别贴「完成」。"""
+        self._escalate(conv_id="cidGroup", conv_type="2")
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"), \
+             patch.object(sr, "dispatch_reply_sent") as disp:
+            sr.on_inbound(_msg("boss", "#1 忽略", conv_id="cidBoss"))
+        self.assertIn(("cidGroup", "2", None), [c[0] for c in disp.call_args_list])
+
+    def test_verdict_message_closes_its_own_ack(self):
+        """主管的裁决消息自己也挂着 worker：回执裸发不经 send_reply，必须显式收尾。"""
+        self._escalate()
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"), \
+             patch.object(sr, "dispatch_reply_sent") as disp:
+            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))
+        self.assertIn(("cidBoss", "1", True), [c[0] for c in disp.call_args_list])
+
+    def test_approve_does_not_double_close_asker(self):
+        """同意 → 提问者那条由 send_reply 自带的 reply-sent 收尾，不该再手动发一次。"""
+        self._escalate(conv_id="cidZhang")
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"), \
+             patch.object(sr, "dispatch_reply_sent") as disp:
+            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))
+        self.assertEqual([c[0][0] for c in disp.call_args_list], ["cidBoss"])
+
+    def test_supervisor_passthrough_does_not_close_ack(self):
+        """主管无待审时是普通对话 → 交给 text_reply 回，提前收尾会把「处理中」掐掉。"""
+        with patch.object(sr, "submit_reply"), patch.object(sr, "dispatch_reply_sent") as disp:
+            self.assertFalse(sr.on_inbound(_msg("boss", "今天天气如何", conv_id="cidBoss")))
+        disp.assert_not_called()
+
+    def test_forward_failure_without_draft_closes_ack_failed(self):
+        """草稿也没有、主管也没转成 → 什么都发不出去，落失败终态而非挂死。"""
+        with patch.object(sr, "generate_reply_ex", return_value=("", "failed")), \
+             patch.object(sr, "_send_to_supervisor", return_value=False), \
+             patch.object(sr, "send_reply") as rep, \
+             patch.object(sr, "dispatch_reply_sent") as disp:
+            sr._draft_and_forward("张三", "问题", "1", "cidZhang", "m1")
+        rep.assert_not_called()
+        disp.assert_called_once_with("cidZhang", "1", False)
+
+    def test_timeout_without_draft_closes_ack_failed(self):
+        """超时且无草稿可放行 → 提问者什么也收不到，同样要收尾。"""
+        self._escalate(draft="")
+        seq = max(sr._pending)
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply") as rep, \
+             patch.object(sr, "dispatch_reply_sent") as disp:
+            sr._timeout(seq)
+        rep.assert_not_called()
+        disp.assert_called_once_with("cidZhang", "1", False)
+
+    def test_close_ack_survives_dispatch_failure(self):
+        """收尾是 best-effort —— 广播抛错不能拖垮审核主流程。"""
+        def boom(*a):
+            raise RuntimeError("dispatch down")
+        with patch.object(sr, "dispatch_reply_sent", boom):
+            sr._close_ack("cidZhang", "1", True)   # 不应抛
 
 
 class TestCapabilityWiring(_Base):

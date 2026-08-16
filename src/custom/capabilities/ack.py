@@ -425,16 +425,21 @@ def _do_processing(rec):
 
 
 def _finalize(rec, ok):
-    """收尾：移除当前进度文字表情，按结果贴完成/失败文字表情。ok=None → 只移除进度。"""
+    """收尾：移除当前进度文字表情，按结果贴完成/失败文字表情。ok=None → 只移除进度。
+
+    ok=None 有两种来路，日志要分得清（#108）：event 已置位 = 能力**显式静默收尾**
+    （如主管审核选择忽略）；未置位 = 等信号等到超时兜底。两者都只移除进度表情，但
+    前者是正常终态、后者是异常，混成一个「超时」会让排查看不出区别。
+    """
     final = None
     if ok is True:
         final = _DONE
     elif ok is False:
         final = _ERROR
+    why = {True: "成功", False: "失败"}.get(
+        ok, "静默收尾" if rec.event.is_set() else "超时")
     _dlog("收尾 msgId=%s 结果=%s → %s" % (
-        rec.msg_id or "-",
-        {True: "成功", False: "失败", None: "超时"}.get(ok),
-        ("%s｜%s" % final) if final else "移除进度"))
+        rec.msg_id or "-", why, ("%s｜%s" % final) if final else "移除进度"))
     _set_status(rec, final)
 
 
@@ -547,11 +552,18 @@ def on_inbound(msg):
 
 
 def on_reply_sent(conv_id, conv_type, ok):
-    """收到"回复已发出"信号：唤醒对应 worker 切换完成/失败文字表情。"""
+    """收到"回复已发出"信号：唤醒对应 worker 切换完成/失败文字表情。
+
+    ok=None → **静默收尾**：只移除「处理中」，不贴完成/失败终态。给"这条已经处理完了，
+    但数字员工有意不出声"的场景用（如主管审核选择忽略，#108）——贴「完成」会让提问者
+    看到 ✅ 却永远等不到回复，贴「未完成」又像是系统故障，两个终态都在说谎。
+    注意 send_reply 的 outcome_ok=None 是另一个意思（"用投递结果"），那条路径永远不会
+    把 None 传到这里；只有能力直接调 dispatch_reply_sent 时才用得上。
+    """
     with _pending_lock:
         rec = _pending.get(conv_id)
     if rec is not None and not rec.event.is_set():
-        rec.ok = bool(ok)
+        rec.ok = None if ok is None else bool(ok)
         rec.event.set()
 
 

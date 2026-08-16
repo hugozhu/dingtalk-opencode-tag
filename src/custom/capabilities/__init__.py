@@ -27,6 +27,7 @@ from core.builtin_caps import aggregation   # noqa: F401  群消息聚合（默�
 from custom.capabilities import trace       # noqa: F401  入站埋点：记 msgId/kind 到 monitor.log
 from custom.capabilities import cancel       # noqa: F401  用户主动取消长程任务（#75）
 from custom.capabilities import ack         # noqa: F401  回执：已读+状态表情（默认开）
+from custom.capabilities import group_gate  # noqa: F401  群里只回被 @ 的 + 双流去重
 from custom.capabilities import forward     # noqa: F401  合并转发（chatRecord）
 from custom.capabilities import image       # noqa: F401  图片识别（vision 兜底）
 from custom.capabilities import audio       # noqa: F401  语音消息识别（Whisper ASR）
@@ -36,4 +37,4 @@ from custom.capabilities import task_stats  # noqa: F401  任务完成后推送�
 from custom.capabilities import startup_report  # noqa: F401  服务启动报告
 from custom.capabilities import supervisor_review  # noqa: F401  主管审核回路（默认关）
 
-__all__ = ["trace", "cancel", "ack", "text_reply", "forward", "image", "audio", "file", "question", "permission", "aggregation", "stats", "task_stats", "startup_report", "supervisor_review"]
+__all__ = ["trace", "cancel", "ack", "group_gate", "text_reply", "forward", "image", "audio", "file", "question", "permission", "aggregation", "stats", "task_stats", "startup_report", "supervisor_review"]

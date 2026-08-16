@@ -523,11 +523,17 @@ class TestTextReplyCapability(unittest.TestCase):
             s.assert_not_called()
 
     def test_route_reply_shim_still_works(self):
-        """兼容垫片 routes.route_reply 仍能派发（走 InboundMessage → 能力）。"""
+        """兼容垫片 routes.route_reply 仍能派发（走 InboundMessage → 能力）。
+
+        用**被 @ 的**群消息：group_gate(priority=2) 会把群里没 @ 数字员工的消息截住，
+        走整条注册表的用例必须带 atMention，否则测的是"被闸门吞掉"而不是派发。
+        """
         calls = []
+        line = ("[connect] 收到 @张三: 你好 "
+                "(convType=2 convId=cidXYZ== msgId=msg1== atMention=1)")
         with patch.object(text_reply, "submit_reply",
                           side_effect=lambda fn, *a: calls.append(a)):
-            routes.route_reply("张三", "你好", "2", self._msg("张三", "你好").raw_line)
+            routes.route_reply("张三", "你好", "2", line)
         self.assertEqual(len(calls), 1)
 
 

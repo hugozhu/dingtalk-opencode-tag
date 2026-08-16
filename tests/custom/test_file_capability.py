@@ -8,6 +8,7 @@ mock _run_cli + 文件系统 + vision 识别。
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -176,9 +177,15 @@ class TestHandleFile(unittest.TestCase):
         snd.assert_called_once()
 
     def test_unknown_type_notifies(self):
-        """未知类型：不下载，明确告知用户。"""
+        """未知类型：不下载，明确告知用户。
+
+        路径用 _fake_download 的私有临时目录，**别用 "/tmp/archive.zip"** —— handle_file
+        收尾会清 os.path.dirname(path)，那样等于让测试去删整个 /tmp（见
+        test_cleanup_tmp_refuses_shared_dir）。
+        """
         content = "[文件] archive.zip fileId: ZIP111 注意：如需下载"
-        with patch.object(F, "_download_file", return_value="/tmp/archive.zip"), \
+        path = self._fake_download("PK\x03\x04", "archive.zip")
+        with patch.object(F, "_download_file", return_value=path), \
              patch.object(F, "generate_reply") as gen, \
              patch.object(F, "send_reply") as snd:
             F.handle_file("u", content, "m==", "c==", "2")
@@ -215,6 +222,29 @@ class TestHandleFile(unittest.TestCase):
             F.handle_file("u", "[文件] noid.txt 注意：如需下载", "m==", "c==", "2")
         dl.assert_not_called()
         snd.assert_not_called()
+
+
+class TestCleanupTmp(unittest.TestCase):
+    """收尾清理只能删自己建的下载目录 —— 删错一次代价是整个 /tmp。"""
+
+    def test_cleanup_tmp_removes_own_dir(self):
+        d = tempfile.mkdtemp(prefix=F._TMP_PREFIX)
+        self.assertTrue(F._cleanup_tmp(d))
+        self.assertFalse(os.path.exists(d))
+
+    def test_cleanup_tmp_refuses_shared_dir(self):
+        """dirname 落到 /tmp（下载替身返回裸路径时会这样）→ 拒绝，且一个字节都不能删。"""
+        probe = tempfile.mkdtemp(prefix="not_ours_")
+        try:
+            with patch.object(F.shutil, "rmtree") as rm:
+                self.assertFalse(F._cleanup_tmp(tempfile.gettempdir()))
+                self.assertFalse(F._cleanup_tmp("/tmp/"))
+                self.assertFalse(F._cleanup_tmp(""))
+                self.assertFalse(F._cleanup_tmp(probe))
+            rm.assert_not_called()
+            self.assertTrue(os.path.exists(probe))
+        finally:
+            shutil.rmtree(probe, ignore_errors=True)
 
 
 class TestParsers(unittest.TestCase):

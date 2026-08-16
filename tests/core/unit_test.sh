@@ -327,6 +327,9 @@ assert_eq "constants.sh 定义 SUPERVISOR_REVIEW_TIMEOUT" "1" \
     "$(grep -c '^export SUPERVISOR_REVIEW_TIMEOUT=' "$CONST")"
 assert_eq "constants.sh 定义 AGENT_KNOWLEDGE_FILE" "1" \
     "$(grep -c '^export AGENT_KNOWLEDGE_FILE=' "$CONST")"
+# #107：群聊也送审 —— 群里的回答是公开发言，比单聊更该先过主管。O2O_ONLY=1 是退回老行为的逃生门。
+assert_eq "SUPERVISOR_REVIEW_O2O_ONLY 默认 0（群聊也审）" "1" \
+    "$(grep -c '^export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-0}"' "$CONST")"
 assert_eq "能力已在 capabilities/__init__ 注册" "1" \
     "$(grep -q 'from custom.capabilities import supervisor_review' "$SCRIPT_DIR/src/custom/capabilities/__init__.py" && echo 1 || echo 0)"
 # 知识库含真实对话内容，绝不能提交
@@ -335,6 +338,18 @@ assert_eq "knowledge/ 已 gitignore" "1" \
 
 # ack 主管闸门（#106）：只给主管贴状态表情。默认开，但必须有 has_supervisor() 兜底——
 # 否则未配主管的部署会一个表情都不贴（CAP_ACK_ENABLED 默认开，属无声行为回退）。
+# 群消息闸门（group_gate）：订阅整群后，没 @ 我的群消息不进大脑；并合并"群流+@流"双投递。
+assert_eq "constants.sh 定义 CAP_GROUP_GATE_ENABLED" "1" \
+    "$(grep -c '^export CAP_GROUP_GATE_ENABLED=' "$CONST")"
+assert_eq "group_gate 默认开（:-1）" "1" \
+    "$(grep -c '^export CAP_GROUP_GATE_ENABLED="${CAP_GROUP_GATE_ENABLED:-1}"' "$CONST")"
+assert_eq "group_gate 已在 capabilities/__init__ 注册" "1" \
+    "$(grep -q 'from custom.capabilities import group_gate' "$SCRIPT_DIR/src/custom/capabilities/__init__.py" && echo 1 || echo 0)"
+# 订阅相关的 export 必须用直引号：曾把 " 写成中文引号 ”，DWS_EVENT_GROUP 会得到字面值
+# ”” —— 非空，于是 dws-connect 误判"要订阅群"并拿垃圾 conversationId 去 consume。
+assert_eq "constants.sh 无中文引号赋值" "0" \
+    "$(grep -c '^export [A-Z_]*=”' "$CONST")"
+
 assert_eq "constants.sh 定义 ACK_SUPERVISOR_ONLY" "1" \
     "$(grep -c '^export ACK_SUPERVISOR_ONLY=' "$CONST")"
 assert_eq "ACK_SUPERVISOR_ONLY 默认开（:-1）" "1" \
