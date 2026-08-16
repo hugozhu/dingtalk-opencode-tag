@@ -68,6 +68,24 @@ def _should_warn_format(raw_count, parsed_count, already_warned):
             and parsed_count == 0)
 
 
+def _quoted_msg_id(src):
+    """引用回复所引用的那条原消息 id；不是引用回复返回 ""。
+
+    扁平格式的字段名来自 `dws event schema user_im_message_receive_o2o --flatten`：
+    `quoted_message.message_id`（"引用回复所引用的原消息；非引用回复时不输出"）。
+    嵌套格式里对应字段名未文档化，故把几种可能的写法都试一遍——取不到就当没有，
+    调用方只是少一个可选标记，不影响正常消息解析。
+    用途：主管引用待审卡片直接回答案，不用敲 #N（见 capabilities/supervisor_review）。
+    """
+    for key in ("quoted_message", "quotedMessage", "quoteMessage"):
+        q = src.get(key)
+        if isinstance(q, dict):
+            mid = q.get("message_id") or q.get("openMessageId") or q.get("messageId")
+            if mid:
+                return str(mid)
+    return ""
+
+
 def _to_connect_line(evt):
     """把一个 dws 事件对象转成 connect-log 行；无法解析返回 None。
 
@@ -93,6 +111,7 @@ def _to_connect_line(evt):
         content = (body.get("content", "") or "").replace("\n", " ").strip()
         conv_id = body.get("openConversationId", "")
         msg_id = body.get("openMessageId", "")
+        quoted_msg_id = _quoted_msg_id(body)
     else:
         # 新版扁平格式：字段直接在事件顶层（dws CLI 升级后的输出）
         etype = etype or evt.get("type") or ""
@@ -100,6 +119,7 @@ def _to_connect_line(evt):
         content = (evt.get("content", "") or "").replace("\n", " ").strip()
         conv_id = evt.get("conversation_id", "")
         msg_id = evt.get("message_id", "")
+        quoted_msg_id = _quoted_msg_id(evt)
     conv_type = _CONV_TYPE_BY_EVENT.get(etype, 2)
     # @我(at) 事件天然是“被 @ 的消息”（payload 无显式 atUsers 字段，唯一可靠信号是事件类型）。
     # 打标 atMention=1 让 core.inbound.parse_line 解析进 extra['at_mention']，供 ack 回执判定
@@ -112,6 +132,10 @@ def _to_connect_line(evt):
     tail = f"convType={conv_type} convId={conv_id} msgId={msg_id}"
     if at_mention:
         tail += " atMention=1"
+    if quoted_msg_id:
+        # 同样追加在尾部（理由同 atMention）。由 supervisor_review.classify_line 解析进
+        # extra['quoted_msg_id'] —— core 的 parse_line 只认 atMention，不动它。
+        tail += f" quotedMsgId={quoted_msg_id}"
     return f"[connect] 收到 @{sender}: {content} ({tail})"
 
 

@@ -215,5 +215,58 @@ class TestFormatHealthCheck(unittest.TestCase):
             bridge._FORMAT_WARN_THRESHOLD, 0, True))
 
 
+class TestQuotedMessage(unittest.TestCase):
+    """引用回复：把被引用的原消息 id 透传到行尾，供主管审核按卡片定位（#107 B）。"""
+
+    def test_flat_quoted_message_appended(self):
+        evt = {
+            "type": "user_im_message_receive_o2o",
+            "sender": "hugozhu", "content": "改：这样答",
+            "conversation_id": "cidQ==", "message_id": "msgQ==",
+            # 字段名来自 dws event schema ... --flatten
+            "quoted_message": {"message_id": "msgCARD==", "sender": "一粟"},
+        }
+        line = bridge._to_connect_line(evt)
+        self.assertIn("quotedMsgId=msgCARD==", line)
+        self.assertTrue(line.rstrip().endswith(")"))
+
+    def test_nested_quoted_message_appended(self):
+        """嵌套格式的字段名未文档化 —— 几种写法都试，取到就透传。"""
+        body = {
+            "sender": "hugozhu", "content": "改：这样答",
+            "openConversationId": "cidQ==", "openMessageId": "msgQ==",
+            "quotedMessage": {"openMessageId": "msgCARD=="},
+        }
+        line = bridge._to_connect_line({
+            "type": "event", "event_type": "user_im_message_receive_o2o",
+            "event_id": "ev-q", "data": json.dumps({"payload": {"body": body}}),
+        })
+        self.assertIn("quotedMsgId=msgCARD==", line)
+
+    def test_no_quote_no_marker(self):
+        """普通消息不该多出这个尾巴。"""
+        line = bridge._to_connect_line(_event("user_im_message_receive_o2o"))
+        self.assertNotIn("quotedMsgId", line)
+
+    def test_quoted_line_still_parseable_by_core(self):
+        """加了尾巴不能破坏 core.inbound 的解析（尾部追加的老规矩）。"""
+        import sys
+        src = os.path.join(PROJECT_ROOT, "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from core.inbound import parse_line
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o",
+            "sender": "hugozhu", "content": "改：这样答",
+            "conversation_id": "cidQ==", "message_id": "msgQ==",
+            "quoted_message": {"message_id": "msgCARD=="},
+        })
+        msg = parse_line(line)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.conv_id, "cidQ==")
+        self.assertEqual(msg.msg_id, "msgQ==")
+        self.assertEqual(msg.text, "改：这样答")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

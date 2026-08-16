@@ -166,6 +166,27 @@ export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-0}"
 # 主管显示名别名（逗号分隔）。bridge 只传显示名不传 userId，同一人可能显示为
 # "hugozhu"/"朱鸿"，都列上避免认不出主管。
 export AGENT_SUPERVISOR_ALIASES="${AGENT_SUPERVISOR_ALIASES:-}"
+
+# --- 裁决交互（#107）：让主管少打字 ---
+# 贴表情裁决：主管直接给待审卡片贴个表情就完成裁决，最高频的「同意」降到一次点击。
+# 实现是轮询卡片上的表情回应（list-emotion-replies），不是订阅 reaction 事件 —— 后者的
+# msgId 是被贴表情那条原消息的 id，会和 ack/group_gate 的 msgId 表撞车。
+# 秒=轮询间隔；0=关闭（退回纯文字裁决）。没有待审时不发任何请求。
+export SUPERVISOR_REACTION_POLL="${SUPERVISOR_REACTION_POLL:-5}"
+# 表情名 → 裁决。注意钉钉返回的是**表情名**而非 unicode 码点，各客户端叫法可能不同：
+# 认不出的表情不会被当成裁决，数字员工会问一句并把真实名字记进 monitor.log，按需补进这里。
+export SUPERVISOR_APPROVE_EMOJIS="${SUPERVISOR_APPROVE_EMOJIS:-赞,好的,OK,👍,✅}"
+export SUPERVISOR_IGNORE_EMOJIS="${SUPERVISOR_IGNORE_EMOJIS:-不行,取消,❌,🚫}"
+# 草稿超过多少行就在卡片里折叠（全文紧跟着单独发一条）。0=不折叠。
+# 几十行的草稿会把「问题」和操作提示挤出一屏，手机上要滚半天才找得到怎么裁决。
+export SUPERVISOR_CARD_DRAFT_MAX_LINES="${SUPERVISOR_CARD_DRAFT_MAX_LINES:-12}"
+# 短于此长度、又不在裁决关键词里的回复 → **问一句而不是当答案发出去**。
+# 老行为是「不在白名单=改写」，主管随口回「可以发」就会把这三个字发给提问者（群聊里
+# 直接公开）。要写短答案就用无歧义前缀：「#N 改：<答案>」。
+# 注意这个阈值只挡短句：长的随口评论（如「这个回答我觉得不太对，你再想想」）仍会被
+# 当成答案发出去。**要彻底堵死就把它调得很大**（如 9999）—— 那等于「改写一律要带
+# 改：/答： 前缀」，没有任何猜测；代价是每次改写多敲两个字。
+export SUPERVISOR_UNCLEAR_MAX_LEN="${SUPERVISOR_UNCLEAR_MAX_LEN:-8}"
 # 知识库（JSONL，相对 PROJECT_DIR）。AGENT_KNOWLEDGE_MAX=0 可关闭知识注入。
 export AGENT_KNOWLEDGE_FILE="${AGENT_KNOWLEDGE_FILE:-knowledge/supervisor_qa.jsonl}"
 export AGENT_KNOWLEDGE_MAX="${AGENT_KNOWLEDGE_MAX:-20}"
