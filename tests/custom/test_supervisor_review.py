@@ -838,6 +838,17 @@ class TestQuotedJudge(_Base):
             with patch.object(sr, "generate_reply_ex", return_value=(out, "ok")):
                 self.assertIs(sr._judge_directly_sendable("q", "d", "r"), want, out)
 
+    def test_judge_prompt_defaults_to_send(self):
+        """引用回复是主管特意选的"正式作答"通道 —— 判断必须**默认放行**。
+
+        回归的是真事故：早期 prompt 把「疑问」也列进 HOLD，主管反问提问者一句
+        「hello2 是啥意思」就被拦下（那明明是在跟提问者对话），另一条观点性答复
+        也被当成"对草稿的评语"。主管的原话是"我觉得都可以啊"。
+        """
+        self.assertIn("默认是 SEND", sr._JUDGE_PROMPT)
+        self.assertIn("拿不准", sr._JUDGE_PROMPT)          # 兜底方向写死在提示里
+        self.assertNotIn("疑问", sr._JUDGE_PROMPT)         # 反问提问者不算 HOLD
+
     def test_judge_unavailable_returns_none(self):
         with patch.object(sr, "generate_reply_ex", return_value=("", "failed")):
             self.assertIsNone(sr._judge_directly_sendable("q", "d", "r"))
