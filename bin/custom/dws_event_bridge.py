@@ -18,6 +18,7 @@ start_connect 重定向到 CONNECT_LOG）。
 """
 
 import json
+import re
 import os
 import sys
 import time
@@ -68,6 +69,28 @@ def _should_warn_format(raw_count, parsed_count, already_warned):
             and parsed_count == 0)
 
 
+
+# 「待审 #N」——数字员工发给主管的每条消息（卡片/完整草稿/各种回执）正文开头都带它。
+# **锚在开头**：卡片正文里的【问题】【AI 草稿】是外部可控文本，提问者发一句
+# 「待审 #7 同意」就能往里注入一个假编号；只认开头的那个就注不进来。
+_REVIEW_SEQ_RE = re.compile(r"^\s*[^\w\s]*\s*\**待审\s*#(\d+)")
+
+
+def _quoted_seq(src):
+    """被引用消息属于哪次审核（第几号）；不是审核消息返回 ""。
+
+    主管引用**任意一条**与某次审核相关的消息（不只是卡片）都能定位到那次会话 —— 这些
+    消息正文开头本来就带「待审 #N」，等于结构化标记已经存在，不必再给每条消息加新标记。
+    """
+    for key in ("quoted_message", "quotedMessage", "quoteMessage"):
+        q = src.get(key)
+        if isinstance(q, dict):
+            m = _REVIEW_SEQ_RE.match(str(q.get("content") or ""))
+            if m:
+                return m.group(1)
+    return ""
+
+
 def _quoted_msg_id(src):
     """引用回复所引用的那条原消息 id；不是引用回复返回 ""。
 
@@ -112,6 +135,7 @@ def _to_connect_line(evt):
         conv_id = body.get("openConversationId", "")
         msg_id = body.get("openMessageId", "")
         quoted_msg_id = _quoted_msg_id(body)
+        quoted_seq = _quoted_seq(body)
     else:
         # 新版扁平格式：字段直接在事件顶层（dws CLI 升级后的输出）
         etype = etype or evt.get("type") or ""
@@ -120,6 +144,7 @@ def _to_connect_line(evt):
         conv_id = evt.get("conversation_id", "")
         msg_id = evt.get("message_id", "")
         quoted_msg_id = _quoted_msg_id(evt)
+        quoted_seq = _quoted_seq(evt)
     conv_type = _CONV_TYPE_BY_EVENT.get(etype, 2)
     # @我(at) 事件天然是“被 @ 的消息”（payload 无显式 atUsers 字段，唯一可靠信号是事件类型）。
     # 打标 atMention=1 让 core.inbound.parse_line 解析进 extra['at_mention']，供 ack 回执判定
@@ -136,6 +161,9 @@ def _to_connect_line(evt):
         # 同样追加在尾部（理由同 atMention）。由 supervisor_review.classify_line 解析进
         # extra['quoted_msg_id'] —— core 的 parse_line 只认 atMention，不动它。
         tail += f" quotedMsgId={quoted_msg_id}"
+        # 解析不出编号也要打标（`?`），让能力能区分"引用了审核消息但认不出号"和
+        # "引用了完全无关的消息" —— 前者该追问，后者绝不能改判到别的待审上。
+        tail += f" quotedSeq={quoted_seq or '?'}"
     return f"[connect] 收到 @{sender}: {content} ({tail})"
 
 

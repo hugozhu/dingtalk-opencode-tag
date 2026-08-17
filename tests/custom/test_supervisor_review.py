@@ -283,26 +283,26 @@ class TestTimeout(_Base):
         self.assertIn("不回复", sup.call_args[0][0])
 
     def test_timeout_archives_for_later(self):
-        """超时的问题没被丢掉 —— 归档，主管事后引用卡片还能补裁。"""
+        """超时的问题没被丢掉 —— 流水里记为 expired，主管事后引用任意相关消息都能补裁。"""
         self._escalate(draft="AI草稿")
         seq = max(sr._pending)
         with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
             sr._timeout(seq)
-        self.assertIn("cardMsg1", sr._archive)
+        self.assertEqual(sr._history[seq]["state"], "expired")
 
-    def test_quoting_archived_card_still_works(self):
-        """核心：超时之后引用那张卡片回「同意」，草稿照样发给提问者。"""
+    def test_quoting_expired_review_still_works(self):
+        """核心：超时之后引用那次审核的消息回「同意」，草稿照样发给提问者。"""
         self._escalate(user="张三", conv_id="cidZhang", draft="AI草稿")
         with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
             sr._timeout(1)
         msg = _msg("boss", "同意", conv_id="cidBoss", msg_id="m9")
-        msg.extra["quoted_msg_id"] = "cardMsg1"
+        msg.extra.update({"quoted": True, "quoted_seq": 1})
         with patch.object(sr, "_send_to_supervisor"), \
              patch.object(sr, "send_reply") as rep:
             self.assertTrue(sr.on_inbound(msg))
         self.assertEqual(rep.call_args[0][0], "cidZhang")
         self.assertEqual(rep.call_args[0][2], "AI草稿")
-        self.assertNotIn("cardMsg1", sr._archive)      # 补裁完就不该再被翻出来
+        self.assertEqual(sr._history[1]["state"], "answered")
 
     def test_archived_rewrite_is_learned(self):
         """事后补写的答案同样进知识库。"""
@@ -310,7 +310,7 @@ class TestTimeout(_Base):
         with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
             sr._timeout(1)
         msg = _msg("boss", "改：找财务小王", conv_id="cidBoss", msg_id="m9")
-        msg.extra["quoted_msg_id"] = "cardMsg1"
+        msg.extra.update({"quoted": True, "quoted_seq": 1})
         with patch.object(sr, "_send_to_supervisor"), \
              patch.object(sr, "send_reply") as rep:
             sr.on_inbound(msg)
@@ -319,13 +319,13 @@ class TestTimeout(_Base):
             recs = [json.loads(x) for x in f if x.strip()]
         self.assertEqual(recs[0]["answer"], "找财务小王")
 
-    def test_archive_is_bounded(self):
-        """归档有界，长跑不涨内存。"""
+    def test_history_is_bounded(self):
+        """历史有界，长跑不涨内存。"""
         with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
-            for i in range(sr._ARCHIVE_MAX + 10):
+            for i in range(sr._HISTORY_MAX + 10):
                 self._escalate(conv_id=f"cid{i}", msg_id=f"m{i}")
                 sr._timeout(max(sr._pending))
-        self.assertLessEqual(len(sr._archive), sr._ARCHIVE_MAX)
+        self.assertLessEqual(len(sr._history), sr._HISTORY_MAX)
 
     def test_timeout_after_verdict_is_noop(self):
         """已裁决后定时器才触发 → 不能重复发第二条。"""
@@ -620,6 +620,31 @@ class TestQuotedVerdict(_Base):
         self.assertEqual(msg.text, "改：这样答")
         self.assertEqual(msg.conv_id, "cidBoss")
 
+    def test_classify_line_ignores_forged_body_markers(self):
+        """正文里打 quotedSeq=9 不能伪造出引用 —— 字段只从行尾段抽。
+
+        提问者的正文同样会原样进 connect 行，这不只是主管能触发。
+        """
+        line = ("[connect] 收到 @hugozhu: 我打个 quotedMsgId=x quotedSeq=9 试试 "
+                "(convType=1 convId=cidBoss msgId=m5)")
+        msg = sr.classify_line(line)
+        self.assertIsNone(msg, "正文里的假标记被当真了")
+
+    def test_classify_line_reads_quoted_seq(self):
+        line = ("[connect] 收到 @hugozhu: 同意 (convType=1 convId=cidBoss "
+                "msgId=m5 quotedMsgId=q1 quotedSeq=12)")
+        msg = sr.classify_line(line)
+        self.assertEqual(msg.extra.get("quoted_seq"), 12)
+        self.assertTrue(msg.extra.get("quoted"))
+
+    def test_classify_line_marks_unresolvable_quote(self):
+        """引用了无关消息：quoted=True 但 quoted_seq=None —— 两者必须能区分。"""
+        line = ("[connect] 收到 @hugozhu: 同意 (convType=1 convId=cidBoss "
+                "msgId=m5 quotedMsgId=q1 quotedSeq=?)")
+        msg = sr.classify_line(line)
+        self.assertTrue(msg.extra.get("quoted"))
+        self.assertIsNone(msg.extra.get("quoted_seq"))
+
     def test_classify_line_ignores_normal_lines(self):
         """没有引用信息的行交回 core 标准解析。"""
         line = "[connect] 收到 @hugozhu: 同意 (convType=1 convId=cidBoss msgId=m5)"
@@ -637,33 +662,64 @@ class TestQuotedVerdict(_Base):
         self.assertEqual(rep.call_args[0][0], "cidZhang")   # 不是最近的李四
         self.assertEqual(rep.call_args[0][2], "草稿1")
 
-    def test_quoted_unknown_card_falls_back(self):
-        """引用的不是待审卡片（比如引用了别的消息）→ 退回 #N/最近一条。"""
+    def test_quoted_unrelated_message_never_retargets(self):
+        """**最高危的一条**：引用了无关消息，绝不能改判到"最近一条"。
+
+        那会把裁决落到另一个提问者头上，而引用恰恰是主管指向性最明确的动作。
+        """
         self._escalate(user="张三", conv_id="cidZhang")
         msg = _msg("boss", "同意", conv_id="cidBoss")
-        msg.extra["quoted_msg_id"] = "msg-不相干"
-        with patch.object(sr, "_send_to_supervisor"), \
+        msg.extra["quoted_msg_id"] = "msg-不相干"      # 有引用但无 quotedSeq
+        with patch.object(sr, "_send_to_supervisor") as sup, \
              patch.object(sr, "send_reply") as rep:
             self.assertTrue(sr.on_inbound(msg))
-        self.assertEqual(rep.call_args[0][0], "cidZhang")
+        rep.assert_not_called()                        # 张三没有被误答
+        self.assertEqual(len(sr._pending), 1)
+        self.assertIn("对不上号", sup.call_args[0][0])
 
-    def test_quoting_a_retired_card_does_not_retarget(self):
-        """引用一张**已处理**的旧卡片 → 告知，绝不改判到另一个提问者头上。
+    def test_quoting_an_answered_review_refuses_by_default(self):
+        """答案已经发出去了，再引用回来改口 → 默认拒绝（数字员工不能自己推翻自己）。
 
-        主管在这里的指向性最明确，猜错的代价是把裁决落到无关的人身上。
+        群聊场景更要紧：两条互相矛盾的公开发言比不改口糟得多。
         """
         self._escalate(user="张三", conv_id="cidZhang", msg_id="m1")
         with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
-            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))   # #1 处理掉
+            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))   # #1 已答复
         self._escalate(user="李四", conv_id="cidLi", msg_id="m2")       # #2 成为最近一条
         msg = _msg("boss", "忽略", conv_id="cidBoss", msg_id="m9")
-        msg.extra["quoted_msg_id"] = "cardMsg1"                        # 引用已处理的 #1
+        msg.extra.update({"quoted": True, "quoted_seq": 1})
         with patch.object(sr, "_send_to_supervisor") as sup, \
              patch.object(sr, "send_reply") as rep:
             self.assertTrue(sr.on_inbound(msg))
         rep.assert_not_called()
         self.assertEqual(len(sr._pending), 1)          # 李四的待审没被误判
-        self.assertIn("裁决过", sup.call_args[0][0])
+        self.assertIn("已经答复过", sup.call_args[0][0])
+
+    def test_amend_prefix_overrides_answered_guard(self):
+        """主管明说「更正：」就放行改口 —— 默认保守，但要有逃生口。"""
+        self._escalate(user="张三", conv_id="cidZhang", msg_id="m1")
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))
+        msg = _msg("boss", "更正：应该找财务小王", conv_id="cidBoss", msg_id="m9")
+        msg.extra.update({"quoted": True, "quoted_seq": 1})
+        with patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(msg))
+        self.assertEqual(rep.call_args[0][0], "cidZhang")
+        self.assertEqual(rep.call_args[0][2], "应该找财务小王")
+
+    def test_quoting_any_related_message_locates_the_review(self):
+        """核心诉求：引用那次审核的**任意一条**消息（不只是卡片）都能定位。
+
+        bridge 从被引用消息的正文开头抽「待审 #N」，8 种消息正文里全都带它。
+        """
+        self._escalate(user="张三", conv_id="cidZhang", draft="AI草稿")
+        msg = _msg("boss", "同意", conv_id="cidBoss", msg_id="m9")
+        msg.extra.update({"quoted": True, "quoted_seq": 1})   # 引用的是「完整草稿」那条
+        with patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(msg))
+        self.assertEqual(rep.call_args[0][2], "AI草稿")
 
 
 class TestJournal(_Base):

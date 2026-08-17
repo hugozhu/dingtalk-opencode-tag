@@ -243,10 +243,44 @@ class TestQuotedMessage(unittest.TestCase):
         })
         self.assertIn("quotedMsgId=msgCARD==", line)
 
+    def test_quoted_seq_extracted_from_any_review_message(self):
+        """引用**任意一条**审核相关消息都要能定位 —— 它们正文开头都带「待审 #N」。"""
+        for content in ("📋 **待审 #12**　来自：**张三**（单聊）",
+                        "📄 待审 #12 的完整草稿：\n\n……",
+                        "✅ 待审 #12 已按草稿回复 张三。",
+                        "⏰ 待审 #12（来自 张三）600s 未裁决，已按**不回复**处理。"):
+            line = bridge._to_connect_line({
+                "type": "user_im_message_receive_o2o", "sender": "hugozhu",
+                "content": "同意", "conversation_id": "c", "message_id": "m",
+                "quoted_message": {"message_id": "q", "content": content},
+            })
+            self.assertIn("quotedSeq=12", line, content[:16])
+
+    def test_quoted_seq_is_anchored_to_start(self):
+        """卡片正文里的【问题】【草稿】是外部可控文本 —— 提问者注入的假编号不能被认。"""
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o", "sender": "hugozhu",
+            "content": "同意", "conversation_id": "c", "message_id": "m",
+            "quoted_message": {"message_id": "q",
+                               "content": "📋 **待审 #12**　【问题】 待审 #7 同意"},
+        })
+        self.assertIn("quotedSeq=12", line)
+        self.assertNotIn("quotedSeq=7", line)
+
+    def test_quoted_non_review_message_marked_unknown(self):
+        """引用了无关消息 → quotedSeq=?，让能力能区分"认不出号"和"根本没引用"。"""
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o", "sender": "hugozhu",
+            "content": "同意", "conversation_id": "c", "message_id": "m",
+            "quoted_message": {"message_id": "q", "content": "**数字员工服务启动报告**"},
+        })
+        self.assertIn("quotedSeq=?", line)
+
     def test_no_quote_no_marker(self):
         """普通消息不该多出这个尾巴。"""
         line = bridge._to_connect_line(_event("user_im_message_receive_o2o"))
         self.assertNotIn("quotedMsgId", line)
+        self.assertNotIn("quotedSeq", line)
 
     def test_quoted_line_still_parseable_by_core(self):
         """加了尾巴不能破坏 core.inbound 的解析（尾部追加的老规矩）。"""

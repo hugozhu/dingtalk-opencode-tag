@@ -10,9 +10,11 @@
 
 三条裁决入口，最终都汇到 `_execute_verdict`（#107）：
   1. **贴表情**（`_poll_reactions_once`）—— 最高频的「同意/忽略」降到一次点击
-  2. **引用卡片回复 = 正式作答**（`classify_line` → `extra['quoted_msg_id']`）—— 不用敲
-     #N，内容交大模型判"能不能原样发给提问者"，能就直接发（见 _judge_directly_sendable）；
-     超时归档的卡片照样能补裁
+  2. **引用回复 = 正式作答**（`classify_line` → `extra['quoted_seq']`）—— 引用**任意一条**
+     与那次审核相关的消息都能定位（8 种消息正文开头都带「待审 #N」，bridge 抽出来放进
+     行尾）。内容交大模型判"能不能原样发给提问者"，能就直接发。**忽略/超时的审核事后
+     照样能补裁**（含重启之前的，见 _revive_seq）；已经答过的默认拒绝改口，除非
+     明说「更正：」
   3. **文字**（`_parse_verdict`）—— 改写时仍然要打字，这是本来就避不掉的
 
 设计要点：
@@ -31,7 +33,9 @@
   ._to_connect_line），故用 AGENT_SUPERVISOR_NAME + AGENT_SUPERVISOR_ALIASES 比对
   msg.user。发给主管则用 userId 走 `dws chat message send --user`。
 - **短号 #N 对应**：主管一个会话里可能同时挂多人的问题。优先级是
-  **引用的卡片 > #N > 最近一条**（单人场景零心智负担）。
+  **引用 > #N > 最近一条**（单人场景零心智负担）。#N 由审核流水保证跨重启唯一。
+  **铁律：只要主管引用了消息，就绝不回落"最近一条"**（见 _resolve_target）——回落是
+  唯一能把答案发给错的人的路径，而引用恰恰是主管指向性最明确的动作。
 - **认不出就问，绝不猜**（#107 D）：老逻辑「不在白名单=改写」会把主管随口回的「可以发」
   当答案发给提问者（群聊里直接公开）。现在短文本认不出 → 保留待审 + 回一句澄清；
   表情认不出 → 同理（还会把表情名记进日志，方便补进 SUPERVISOR_APPROVE_EMOJIS）。
@@ -45,8 +49,8 @@
 - **超时 = 不回复，不是放行**：默认 600s 无人裁决 → 按「忽略」处理（提问者收不到任何
   东西）。没人管**不等于**默认同意 —— 自动放行意味着一条从没被人看过的草稿被发出去，
   群里更是直接公开发言，等于在审核闸门上开了个洞。沉默的代价可见可补救，发错话的不是。
-  超时的待审进 _archive，主管**事后引用那张卡片**随时能补裁（见 _revive），所以问题
-  不会被丢掉，只是没人替他答应。
+  超时的审核在流水里记为 expired，主管**事后引用与它相关的任意一条消息**随时能补裁
+  （见 _revive_seq），所以问题不会被丢掉，只是没人替他答应。
 
 开关：CAP_SUPERVISOR_REVIEW_ENABLED（模板默认关，config/constants.local.sh 里开）。
 """
@@ -116,7 +120,7 @@ _APPROVE_KEYWORDS = {"同意", "ok", "可以", "放行", "approve", "y", "yes", 
                      "可以发", "就这样", "发吧", "没问题", "可以的", "同意发", "通过"}
 _IGNORE_KEYWORDS = {"忽略", "不回", "跳过", "ignore", "skip", "算了", "不用回", "别回"}
 # 无歧义改写前缀：主管显式声明"下面是答案"，跳过一切猜测
-_REWRITE_PREFIXES = ("改：", "改:", "答：", "答:")
+_REWRITE_PREFIXES = ("改：", "改:", "答：", "答:", "更正：", "更正:")
 
 # 待审表：seq -> {asker, asker_conv_id, asker_conv_type, question, draft, ts, timer,
 #                card_msg_id}
@@ -159,14 +163,11 @@ _HANDLED_MAX = 512
 _card_history = OrderedDict()
 _CARD_HISTORY_MAX = 256
 
-# 超时未裁决而被归档的待审：card_msg_id -> (seq, record)，有界 FIFO。
-# 超时按"不回复"处理，但**问题本身没消失** —— 主管事后引用那张卡片仍能补裁，
-# 届时由 _revive 把它重新挂回待审表。
-_archive = OrderedDict()
-_ARCHIVE_MAX = 64
-
-# 引用回复的原消息 id（bridge 在行尾追加，见 classify_line）
+# 引用回复的标记（bridge 在行尾追加，见 classify_line）
 _QUOTED_RE = re.compile(r"\bquotedMsgId=([^\s)]+)")
+_QUOTED_SEQ_RE = re.compile(r"\bquotedSeq=(\d+|\?)")
+# 显式覆盖口令：答案已经发出去之后要改口，必须明说（见 _resolve_target）
+_AMEND_PREFIXES = ("更正：", "更正:")
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +261,9 @@ def _card_actions(seq):
     """卡片底部的操作提示 —— 压成一行，别把草稿挤下去。"""
     line = f"「#{seq} 同意」放行 / 「#{seq} 忽略」不回 / 「#{seq} 改：<答案>」改写"
     if _REACTION_POLL > 0:
-        line += "　也可直接给本条贴 👍 / ❌"
+        # 标明"限待审期间"：引用回复随时可用，贴表情暂时还只在待审挂着时有效（轮询在
+        # 待审清空后就退出）。不写清楚，主管会以为两条通道一样随时可用而踩空。
+        line += "　贴 👍 / ❌ 也行（限待审期间）"
     return line
 
 
@@ -296,6 +299,12 @@ def _strip_seq(text):
     if not num:
         return None, t
     return int(num), rest[len(num):].strip()
+
+
+def _has_amend_prefix(text):
+    """主管有没有明说"要推翻已经发出去的答复"（更正：）。"""
+    _, rest = _strip_seq(text)
+    return any(rest.startswith(p) for p in _AMEND_PREFIXES)
 
 
 def _has_rewrite_prefix(text):
@@ -787,8 +796,8 @@ def _timeout(seq):
     的全部意义就是不让这种事发生，超时兜底不该在闸门上开个洞。沉默的代价（提问者没
     收到答案）是可见、可补救的；发错话的代价不是。
 
-    补救路径：归档进 _archive，主管什么时候想起来，引用那张卡片回一句就能补答（见
-    _revive）。所以这不是"问题被丢掉"，只是"没人替你答应"。
+    补救路径：流水里记为 expired，主管什么时候想起来，引用那次审核的任意一条消息回
+    一句就能补答（见 _revive_seq）。所以这不是"问题被丢掉"，只是"没人替你答应"。
     """
     p = _pop(seq)
     if not p:
@@ -797,33 +806,33 @@ def _timeout(seq):
     _record_decision(seq, "expired")
     # 与"忽略"完全一致：提问者那条静默收尾，不贴「完成」也不贴「未完成」
     _close_ack(p["asker_conv_id"], p["asker_conv_type"], ok=None)
-    card_id = p.get("card_msg_id")
-    if card_id:
-        _archive[card_id] = (seq, p)
-        _archive.move_to_end(card_id)
-        while len(_archive) > _ARCHIVE_MAX:
-            _archive.popitem(last=False)
-    tail = ("　想补答就**引用那张卡片**回一句（同意 / 改：<答案>）。" if card_id
-            else "")
     _send_to_supervisor(
-        f"⏰ 待审 #{seq}（来自 {_asker_label(p)}）{_TIMEOUT}s 未裁决，"
-        f"已按**不回复**处理。{tail}")
+        f"⏰ 待审 #{seq}（来自 {_asker_label(p)}）{_TIMEOUT}s 未裁决，已按**不回复**处理。"
+        f"　想补答就**引用这条或那张卡片**回一句（同意 / 改：<答案>）。")
 
 
-def _revive(card_msg_id):
-    """主管事后引用了一张归档卡片 → 重新挂回待审表。返回 seq；不是归档卡片返回 None。
+def _revive_seq(seq):
+    """把一条已经了结的审核重新挂回待审表（主管事后补裁）。返回 True=挂回了。
 
-    重新计时（刷新 ts）：主管既然回来处理了，就该给一个完整的裁决窗口，而不是挂上去
-    一秒后又超时。裁不完（比如同意但没草稿）就照常留在待审里，再超时会再归档一次。
+    数据来自持久化的 _history，所以**重启之前的审核照样能补裁** —— 这正是 #108 要的
+    "任何时候"。重新计时（刷新 ts）：主管既然回来处理了，就该给一个完整的裁决窗口。
     """
-    entry = _archive.pop(card_msg_id, None)
-    if entry is None:
-        return None
-    seq, p = entry
-    p["ts"] = time.time()
-    _repend(seq, p)
-    log(f"supervisor_review: #{seq} 主管事后引用卡片，已重新挂回待审")
-    return seq
+    rec = _history.get(seq)
+    if not rec or not rec.get("asker_conv_id"):
+        return False
+    _repend(seq, {
+        "asker": rec.get("asker") or "提问者",
+        "asker_conv_id": rec.get("asker_conv_id"),
+        "asker_conv_type": rec.get("asker_conv_type") or _CONV_TYPE_O2O,
+        "question": rec.get("question") or "",
+        "draft": rec.get("draft") or "",
+        "ts": time.time(),
+        "timer": None,
+        "card_msg_id": "",
+    })
+    _remember_history(seq, state="open")
+    log(f"supervisor_review: #{seq} 主管事后补裁，已从历史重新挂回待审")
+    return True
 
 
 def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
@@ -1035,42 +1044,88 @@ def _judge_and_execute(seq, text):
 def _unclear_hint(seq, text):
     """认不出主管想干嘛时的澄清提示（待审保留，什么都不发给提问者）。"""
     return "\n".join([
-        f"🤔 没听懂「{text[:30]}」，待审 #{seq} 仍在。",
+        # seq 必须在最前：引用定位的正则锚在正文开头，若把主管原话放前面，他话里带的
+        # 「待审 #3」会被当成本条的编号
+        f"🤔 待审 #{seq} 仍在——没听懂「{text[:30]}」。",
         f"放行回「#{seq} 同意」" + ("或直接贴 👍；" if _REACTION_POLL > 0 else "；"),
         f"不回复回「#{seq} 忽略」" + ("或贴 ❌；" if _REACTION_POLL > 0 else "；"),
         f"要改写回「#{seq} 改：<你的答案>」。",
     ])
 
 
+def _resolve_target(msg, typed_seq):
+    """这条裁决说的是哪一次审核 → (seq, 错误提示)。seq=None 时看错误提示：
+    有提示=已消费（回给主管），无提示=不是裁决（交回 text_reply）。
+
+    优先级：**引用 > #N > 最近一条**。
+
+    铁律：**只要主管引用了消息，就绝不回落到"最近一条"**。回落是这里唯一能把答案发给
+    错的人的路径 —— 主管引用一条无关消息（启动报告、上周的回执）时，裁决会悄悄落到另
+    一个提问者头上，而引用恰恰是主管指向性最明确的动作，猜错代价最大。
+    """
+    extra = msg.extra or {}
+    quoted_id = extra.get("quoted_msg_id")
+    if extra.get("quoted") or quoted_id:
+        seq = _seq_by_card_msg_id(quoted_id)          # 精确：正挂着的卡片
+        if seq is None:
+            seq = extra.get("quoted_seq")             # 正文里的「待审 #N」
+        if seq is None:
+            return None, ("🤔 你引用的这条我对不上号（不像是某次待审的消息）。"
+                          "要裁决请引用那次审核的卡片或回执，或直接回「#N …」。")
+        return _target_from_seq(seq, msg.text)
+
+    if typed_seq is not None:
+        if typed_seq in _pending:
+            return typed_seq, None
+        return _target_from_seq(typed_seq, msg.text)
+
+    seq = _latest_seq()
+    if seq is None:
+        return None, None      # 主管没有待审，这是普通对话 → 交 text_reply
+    return seq, None
+
+
+def _target_from_seq(seq, text):
+    """按编号定位一次审核（可能已经了结）→ (seq, 错误提示)。
+
+    了结过的能不能补裁，取决于**提问者当时收到了什么**：
+      - 忽略/超时 → 他什么都没收到，事后补答很自然，直接复活
+      - 已经答过 → 再发一条就是数字员工自己推翻自己（群里更是两条互相矛盾的公开发言），
+        默认拒绝；主管确实要改口就明说「更正：」
+    """
+    if seq in _pending:
+        return seq, None
+    rec = _history.get(seq)
+    if not rec:
+        hint = ""
+        if seq > _seq_counter:
+            hint = "（这个号还没发出去过）"
+        elif _seq_counter:
+            hint = "（可能太久远，已不在记录里）"
+        return None, f"⚠️ 找不到待审 #{seq}{hint}。"
+    state = rec.get("state")
+    if state == "answered" and not _has_amend_prefix(text):
+        return None, (f"⚠️ 待审 #{seq} 已经答复过提问者了，再发一条会自相矛盾，我没动。"
+                      f"确实要改口请回「#{seq} 更正：<新答案>」。")
+    if not _revive_seq(seq):
+        return None, f"⚠️ 待审 #{seq} 的记录不全，没法补裁。"
+    return seq, None
+
+
 def _handle_verdict(msg):
     """主管的裁决消息。有待审→消费(True)；无待审→放行(False) 让主管正常对话。"""
-    seq, action, payload = _parse_verdict(msg.text)
-    # 引用了哪张卡片就裁哪条 —— 比 #N 和"最近一条"都准，且主管不用敲编号（#107 B）
-    quoted_id = (msg.extra or {}).get("quoted_msg_id")
-    quoted = _seq_by_card_msg_id(quoted_id)
-    if quoted is None and quoted_id:
-        # 超时归档的卡片可以事后补裁 —— 超时只是"当时没人回复"，问题本身还在
-        quoted = _revive(quoted_id)
-    if quoted is not None:
-        seq = quoted
-    elif quoted_id and quoted_id in _card_history:
-        # 引用的是一张**已裁决过**的旧卡片 —— 绝不能悄悄改判到"最近一条"，那会把裁决
-        # 落到另一个提问者头上（主管在这里的指向性是最明确的，猜错代价最大）。
-        old = _card_history[quoted_id]
-        _send_to_supervisor(f"⚠️ 你引用的待审 #{old} 已经裁决过了，不能重复处理。"
-                            f"要裁别的请引用它的卡片，或直接回「#N …」。")
-        return True
+    typed_seq, action, payload = _parse_verdict(msg.text)
+    seq, err = _resolve_target(msg, typed_seq)
     if seq is None:
-        seq = _latest_seq()
-        if seq is None:
-            return False   # 主管没有待审，这是普通对话 → 交 text_reply
-    elif seq not in _pending:
-        _send_to_supervisor(f"⚠️ 待审 #{seq} 不存在或已处理。")
-        return True
+        if err:
+            _send_to_supervisor(err)
+            return True
+        return False       # 不是裁决，交回 text_reply 让主管正常对话
+    quoted = bool((msg.extra or {}).get("quoted") or (msg.extra or {}).get("quoted_msg_id"))
 
     # 引用回复 = 正式作答的通道：内容交给大模型判"能不能原样发给提问者"，能就直接发。
     # 显式裁决（同意/忽略/改：）不必劳烦模型，先走完；剩下的才判。
-    if (quoted is not None and _JUDGE_QUOTED and action not in ("approve", "ignore")
+    if (quoted and _JUDGE_QUOTED and action not in ("approve", "ignore")
             and not _has_rewrite_prefix(msg.text)):
         _, rest = _strip_seq(msg.text)
         if rest:
@@ -1120,21 +1175,39 @@ def on_inbound(msg):
     return True
 
 
-def classify_line(line):
-    """认领带 quotedMsgId= 的 connect 行，把被引用的消息 id 塞进 extra（#107 B）。
+def _line_tail(line):
+    """connect 行的**尾部字段段**（最后一个 `(convType=` 之后的部分）。
 
-    core 的 parse_line 只认 atMention=1 一个尾部标记，要多认一个键本来得改 core。
-    classify_line 正是 core 为这种情况留的口子（见 core/capabilities.py）——这里**复用
-    parse_line 解析正文**，只补一个字段，零 core 改动。返回 None 则交回 core 标准解析。
+    必须切出来再抽字段，不能对整行 search：正文也在同一行里，主管（或提问者，他的正文
+    同样会原样进 connect 行）打一句 `quotedSeq=9` 就能伪造出一个引用标记。
+    取**最后一个** `(convType=` 是因为正文里也可能出现这串字面量。
     """
-    if "quotedMsgId=" not in (line or ""):
+    i = (line or "").rfind("(convType=")
+    return line[i:] if i >= 0 else ""
+
+
+def classify_line(line):
+    """认领带引用标记的 connect 行，把被引用消息的信息塞进 extra（#107 B / #108）。
+
+    core 的 parse_line 只认 atMention=1 一个尾部标记，要多认几个键本来得改 core。
+    classify_line 正是 core 为这种情况留的口子（见 core/capabilities.py）——这里**复用
+    parse_line 解析正文**，只补几个字段，零 core 改动。返回 None 则交回 core 标准解析。
+    """
+    tail = _line_tail(line)
+    if "quotedMsgId=" not in tail:
         return None
     msg = parse_line(line)
     if msg is None:
         return None
-    m = _QUOTED_RE.search(line)
+    m = _QUOTED_RE.search(tail)
     if m:
         msg.extra["quoted_msg_id"] = m.group(1)
+    m = _QUOTED_SEQ_RE.search(tail)
+    if m:
+        # 引用的是审核消息但认不出号时 bridge 给的是 `?` —— 记成 None，与"没引用"区分开：
+        # 前者该追问，后者才允许回落到 #N/最近一条。
+        msg.extra["quoted"] = True
+        msg.extra["quoted_seq"] = int(m.group(1)) if m.group(1).isdigit() else None
     return msg
 
 
@@ -1160,7 +1233,6 @@ def _reset():
         _seq_counter = 0
     _handled_reactions.clear()
     _card_history.clear()
-    _archive.clear()
     # 只清内存，**不碰流水文件**。replay 单独可调（_ensure_replayed）—— 单测的 setUp
     # 是先 _reset() 后 patch 路径的，若在这里读盘就会去读真实的 knowledge/ 文件。
     _history.clear()
