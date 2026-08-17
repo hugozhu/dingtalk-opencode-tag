@@ -190,6 +190,13 @@ export SUPERVISOR_CARD_DRAFT_MAX_LINES="${SUPERVISOR_CARD_DRAFT_MAX_LINES:-12}"
 # 当成答案发出去。**要彻底堵死就把它调得很大**（如 9999）—— 那等于「改写一律要带
 # 改：/答： 前缀」，没有任何猜测；代价是每次改写多敲两个字。
 export SUPERVISOR_UNCLEAR_MAX_LEN="${SUPERVISOR_UNCLEAR_MAX_LEN:-8}"
+# 主管**引用**待审卡片回复时，把内容交大模型判"能不能原样发给提问者"：
+#   能   → 直接发（不用敲「改：」前缀，主管想怎么写就怎么写）
+#   不能 → 一个字都不发，回主管一句（比如「这个不太对，你再想想」是说给 AI 听的）
+# 这是上面那个字数阈值的升级版——长度分不开「这个回答我觉得不太对，你再想想」（评语）
+# 和「找财务小王签字」（答案）。判不了（模型不可用/答非所问）自动回落字数阈值。
+# 分工：贴表情 = 采纳/忽略，引用回复 = 正式作答。0=关掉判断，退回纯字数启发式。
+export SUPERVISOR_JUDGE_QUOTED="${SUPERVISOR_JUDGE_QUOTED:-1}"
 # 知识库（JSONL，相对 PROJECT_DIR）。AGENT_KNOWLEDGE_MAX=0 可关闭知识注入。
 export AGENT_KNOWLEDGE_FILE="${AGENT_KNOWLEDGE_FILE:-knowledge/supervisor_qa.jsonl}"
 export AGENT_KNOWLEDGE_MAX="${AGENT_KNOWLEDGE_MAX:-20}"

@@ -10,8 +10,9 @@
 
 三条裁决入口，最终都汇到 `_execute_verdict`（#107）：
   1. **贴表情**（`_poll_reactions_once`）—— 最高频的「同意/忽略」降到一次点击
-  2. **引用卡片回复**（`classify_line` → `extra['quoted_msg_id']`）—— 不用敲 #N，
-     且**超时归档的卡片照样能补裁**
+  2. **引用卡片回复 = 正式作答**（`classify_line` → `extra['quoted_msg_id']`）—— 不用敲
+     #N，内容交大模型判"能不能原样发给提问者"，能就直接发（见 _judge_directly_sendable）；
+     超时归档的卡片照样能补裁
   3. **文字**（`_parse_verdict`）—— 改写时仍然要打字，这是本来就避不掉的
 
 设计要点：
@@ -99,8 +100,11 @@ def _env_int(key, default):
 
 # 草稿超过多少行就在卡片里折叠（全文另发一条）。0=不折叠
 _CARD_DRAFT_MAX_LINES = _env_int("SUPERVISOR_CARD_DRAFT_MAX_LINES", 12)
-# 短于此长度且认不出的裁决 → 问一句而不是当答案发出去（#107 D）
+# 短于此长度且认不出的裁决 → 问一句而不是当答案发出去（#107 D）。
+# 注意这只兜"没引用卡片"的路径；引用回复走大模型判意图（见 _judge_directly_sendable）。
 _UNCLEAR_MAX_LEN = _env_int("SUPERVISOR_UNCLEAR_MAX_LEN", 8)
+# 引用回复的内容是否交大模型判"能不能原样发给提问者"。0=关（退回长度启发式）
+_JUDGE_QUOTED = env_flag("SUPERVISOR_JUDGE_QUOTED", default=True)
 # 数字员工自己的显示名（反查自己发的卡片用）。默认值与 ack/forward 对齐 —— 留空会让
 # _locate_card_msg_id 里的发送人校验静默失效（那正是防止匹配到主管引用回显的那道闸）。
 _SELF_NAMES = {n.strip() for n in os.environ.get(
@@ -259,6 +263,29 @@ def _render_card(seq, asker, question, draft, conv_type=_CONV_TYPE_O2O):
     ])
 
 
+def _strip_seq(text):
+    """把开头的「#N」剥掉 → (seq|None, 余下正文)。"""
+    t = (text or "").strip()
+    if not t.startswith("#"):
+        return None, t
+    rest = t[1:].lstrip()
+    num = ""
+    for ch in rest:
+        if ch.isdigit():
+            num += ch
+        else:
+            break
+    if not num:
+        return None, t
+    return int(num), rest[len(num):].strip()
+
+
+def _has_rewrite_prefix(text):
+    """主管有没有显式声明"下面是答案"（改：/答：）—— 有就不必再劳烦大模型判意图。"""
+    _, rest = _strip_seq(text)
+    return any(rest.startswith(p) for p in _REWRITE_PREFIXES)
+
+
 def _parse_verdict(text):
     """解析主管回复 → (seq|None, action, payload)。
 
@@ -270,19 +297,7 @@ def _parse_verdict(text):
     公开发出去。宁可多问一句，也不能替主管发一句他没打算发的话。长文本仍按改写处理
     —— 真答案通常不短，且这条路径是主管明确在写东西。
     """
-    t = (text or "").strip()
-    seq = None
-    if t.startswith("#"):
-        rest = t[1:].lstrip()
-        num = ""
-        for ch in rest:
-            if ch.isdigit():
-                num += ch
-            else:
-                break
-        if num:
-            seq = int(num)
-            t = rest[len(num):].strip()
+    seq, t = _strip_seq(text)
     for pre in _REWRITE_PREFIXES:
         if t.startswith(pre):
             return seq, "rewrite", t[len(pre):].strip()
@@ -744,6 +759,86 @@ def _execute_verdict(seq, action, payload="", source=""):
     return True
 
 
+_JUDGE_PROMPT = """你在帮一个数字员工做一次判断，只判断、不作答。
+
+它的主管刚刚**引用**了一条待审问题，并回了一句话。请判断：主管这句话是不是可以
+**原样转发给提问者**的正式答复？
+
+- SEND：这句话本身就是对问题的答复，提问者读了能直接理解、能用。
+- HOLD：这是说给数字员工/AI 听的评语、指令、疑问或闲聊（例如「这个不太对」「再想想」
+  「太啰嗦了」「稍等我问问」），原样发给提问者会让对方莫名其妙。
+
+【提问者的问题】
+{question}
+
+【AI 原本的草稿】
+{draft}
+
+【主管引用回复的内容】
+{reply}
+
+只回一个词：SEND 或 HOLD。"""
+
+
+def _judge_directly_sendable(question, draft, reply):
+    """主管引用回复的内容能不能原样发给提问者？True=能 / False=不能 / None=判不了。
+
+    这是"用字数猜意图"（_UNCLEAR_MAX_LEN）的升级版：主管引用卡片就是在正式作答，
+    但他也可能只是丢一句评语。长度分不开这两者（「这个回答我觉得不太对，你再想想」
+    比「找财务小王签字」还长），交给大模型判才是对的抽象层次。
+
+    判不了（模型不可用/答非所问）返回 None，调用方回落到原来的长度启发式 —— 大模型
+    挂了不该让"引用回复"这条正式通道整个失灵。
+    """
+    prompt = _JUDGE_PROMPT.format(
+        question=(question or "（无）")[:800],
+        draft=(draft or "（无）")[:800],
+        reply=(reply or "")[:800])
+    # conv_id 留空 = 无状态一次性会话，不污染任何人的多轮上下文，也不被别人的上下文影响
+    out, status = generate_reply_ex("supervisor-judge", prompt, raw=True,
+                                    ctx={"conv_id": "", "conv_type": _CONV_TYPE_O2O})
+    if status != "ok" or not out:
+        log(f"supervisor_review: 意图判断不可用(status={status})，回落长度启发式")
+        return None
+    up = out.strip().upper()
+    if "SEND" in up and "HOLD" not in up:
+        return True
+    if "HOLD" in up and "SEND" not in up:
+        return False
+    log(f"supervisor_review: 意图判断结果无法解析 {out[:60]!r}，回落长度启发式")
+    return None
+
+
+def _judge_and_execute(seq, text):
+    """后台：判主管这句引用回复能不能直接发，能就发（并学习），不能就问一句。
+
+    放后台跑是因为这要等一次模型往返 —— 卡在 on_inbound 里会把整个入站事件循环堵住。
+    """
+    with _pending_lock:
+        p = _pending.get(seq)
+        question, draft = (p.get("question", ""), p.get("draft", "")) if p else ("", "")
+    if not p:
+        return
+    verdict = _judge_directly_sendable(question, draft, text)
+    if verdict is True:
+        log(f"supervisor_review: #{seq} 引用回复判为可直接发出")
+        _execute_verdict(seq, "rewrite", text, source="引用回复")
+        return
+    if verdict is False:
+        log(f"supervisor_review: #{seq} 引用回复判为不宜直发 text={text[:40]!r}")
+        _send_to_supervisor(
+            f"🤔 「{text[:30]}」看着像是说给我听的，不像能直接发给{_asker_label(p)}的答复，"
+            f"我没发。要原样发出请回「#{seq} 改：{text[:20]}…」，"
+            f"要放行草稿贴 👍 或回「#{seq} 同意」。")
+        return
+    # 判不了 → 回落到原来的长度启发式（大模型挂了不该让正式通道失灵）
+    _, action, payload = _parse_verdict(text)
+    if action == "rewrite" and payload:
+        _execute_verdict(seq, "rewrite", payload, source="引用回复")
+    else:
+        _send_to_supervisor(_unclear_hint(seq, text))
+
+
 def _unclear_hint(seq, text):
     """认不出主管想干嘛时的澄清提示（待审保留，什么都不发给提问者）。"""
     return "\n".join([
@@ -779,6 +874,16 @@ def _handle_verdict(msg):
     elif seq not in _pending:
         _send_to_supervisor(f"⚠️ 待审 #{seq} 不存在或已处理。")
         return True
+
+    # 引用回复 = 正式作答的通道：内容交给大模型判"能不能原样发给提问者"，能就直接发。
+    # 显式裁决（同意/忽略/改：）不必劳烦模型，先走完；剩下的才判。
+    if (quoted is not None and _JUDGE_QUOTED and action not in ("approve", "ignore")
+            and not _has_rewrite_prefix(msg.text)):
+        _, rest = _strip_seq(msg.text)
+        if rest:
+            log(f"supervisor_review: #{seq} 引用回复，交大模型判是否可直发")
+            submit_reply(_judge_and_execute, seq, rest)   # 模型往返放后台，别堵事件循环
+            return True
 
     if action == "unclear":
         # 关键：**不 _pop**。认不出就把待审留着，绝不拿这句话当答案发出去（#107 D）

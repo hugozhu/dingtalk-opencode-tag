@@ -662,6 +662,85 @@ class TestQuotedVerdict(_Base):
         self.assertIn("裁决过", sup.call_args[0][0])
 
 
+class TestQuotedJudge(_Base):
+    """引用回复 = 正式作答：内容交大模型判能不能原样发给提问者（#107）。
+
+    这是"用字数猜意图"的升级 —— 长度分不开「这个回答我觉得不太对，你再想想」（15 字，
+    是评语）和「找财务小王签字」（7 字，是答案）。
+    """
+
+    def _quoted(self, text, card="cardMsg1"):
+        msg = _msg("boss", text, conv_id="cidBoss", msg_id="m9")
+        msg.extra["quoted_msg_id"] = card
+        return msg
+
+    def test_sendable_reply_goes_straight_to_asker(self):
+        """判为可直发 → 原样发给提问者，不用敲「改：」。"""
+        self._escalate(user="张三", conv_id="cidZhang")
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
+             patch.object(sr, "_judge_directly_sendable", return_value=True), \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(self._quoted("找财务小王签字")))
+        self.assertEqual(rep.call_args[0][0], "cidZhang")
+        self.assertEqual(rep.call_args[0][2], "找财务小王签字")
+        self.assertEqual(len(sr._pending), 0)
+
+    def test_comment_is_held_back(self):
+        """判为评语 → 一个字都不发给提问者，待审保留，回主管一句。"""
+        self._escalate()
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
+             patch.object(sr, "_judge_directly_sendable", return_value=False), \
+             patch.object(sr, "_send_to_supervisor") as sup, \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(self._quoted("这个回答我觉得不太对，你再想想")))
+        rep.assert_not_called()
+        self.assertEqual(len(sr._pending), 1)
+        self.assertIn("没发", sup.call_args[0][0])
+
+    def test_explicit_verdicts_skip_the_judge(self):
+        """「同意」「忽略」「改：」是明示，不该白花一次模型往返。"""
+        for text in ("同意", "忽略", "改：这样答"):
+            self._escalate(msg_id=f"m-{text}")
+            with patch.object(sr, "_judge_directly_sendable") as judge, \
+                 patch.object(sr, "_send_to_supervisor"), \
+                 patch.object(sr, "send_reply"):
+                sr.on_inbound(self._quoted(text, card=f"cardMsg{max(sr._pending)}"))
+            judge.assert_not_called()
+
+    def test_judge_failure_falls_back_to_heuristic(self):
+        """模型判不了时回落长度启发式 —— 大模型挂了不该让正式通道整个失灵。"""
+        self._escalate()
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
+             patch.object(sr, "_judge_directly_sendable", return_value=None), \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            sr.on_inbound(self._quoted("需要部门经理先签字再交财务室，三个工作日到账"))
+        self.assertEqual(rep.call_args[0][2], "需要部门经理先签字再交财务室，三个工作日到账")
+
+    def test_judge_parses_model_output(self):
+        """SEND/HOLD 解析：含糊或答非所问一律当"判不了"。"""
+        cases = [("SEND", True), ("hold", False), ("SEND\n", True),
+                 ("我觉得可以 SEND", True), ("SEND 还是 HOLD？", None), ("不知道", None)]
+        for out, want in cases:
+            with patch.object(sr, "generate_reply_ex", return_value=(out, "ok")):
+                self.assertIs(sr._judge_directly_sendable("q", "d", "r"), want, out)
+
+    def test_judge_unavailable_returns_none(self):
+        with patch.object(sr, "generate_reply_ex", return_value=("", "failed")):
+            self.assertIsNone(sr._judge_directly_sendable("q", "d", "r"))
+
+    def test_judge_can_be_disabled(self):
+        """SUPERVISOR_JUDGE_QUOTED=0 → 退回纯启发式，不打模型。"""
+        self._escalate()
+        with patch.object(sr, "_JUDGE_QUOTED", False), \
+             patch.object(sr, "_judge_directly_sendable") as judge, \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply"):
+            sr.on_inbound(self._quoted("这个不太对"))
+        judge.assert_not_called()
+
+
 class TestPendingNotLost(_Base):
     """裁决没能真正完成时，待审必须留着 —— 否则提问者永久挂起（并触发 #108 心跳）。"""
 
