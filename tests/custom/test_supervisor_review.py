@@ -29,9 +29,13 @@ class _Base(unittest.TestCase):
         sr._reset()
         self.tmpdir = tempfile.mkdtemp()
         self.kf = os.path.join(self.tmpdir, "qa.jsonl")
+        self.journal = os.path.join(self.tmpdir, "reviews.jsonl")
         # 模块属性在 import 时定型，测试直接 patch 属性（同 brain 知识注入测试）
         self.patches = [
             patch.object(sr, "_KNOWLEDGE_FILE", self.kf),
+            # 审核流水必须指到 tmpdir —— 否则测试会写进真实的 knowledge/ 并且短号
+            # 从上一次跑测试的高水位续起，用例之间互相串味
+            patch.object(sr, "_JOURNAL_FILE", self.journal),
             patch.object(sr, "_TIMEOUT", 0),        # 0=不起定时器，超时单独测
             patch.object(sr, "_O2O_ONLY", False),   # 默认：单聊 + 群聊都审（#107）
             # 反查卡片 msgId 会真的 shell 出去调 dws —— 单测里替换成确定值
@@ -660,6 +664,91 @@ class TestQuotedVerdict(_Base):
         rep.assert_not_called()
         self.assertEqual(len(sr._pending), 1)          # 李四的待审没被误判
         self.assertIn("裁决过", sup.call_args[0][0])
+
+
+class TestJournal(_Base):
+    """审核流水：短号 #N 必须跨重启唯一（#108）。
+
+    以前 _seq_counter 是纯内存的，重启归零 → 主管会话里同时存在多张「待审 #3」，
+    已经造成过一次静默事故（反查卡片匹配到上一轮的同号卡片，贴表情从此无效）。
+    """
+
+    def _write(self, *lines):
+        with open(self.journal, "w", encoding="utf-8") as f:
+            f.write("".join(ln + "\n" for ln in lines))
+
+    def test_seq_continues_after_restart(self):
+        """核心：重启（=重新 replay）后短号从高水位续起，不回到 #1。"""
+        self._escalate(msg_id="m1")
+        self._escalate(msg_id="m2")
+        self.assertEqual(max(sr._pending), 2)
+        sr._reset()                       # 模拟进程重启：内存全丢，流水还在
+        self.assertEqual(sr._seq_counter, 0)
+        sup, _ = self._escalate(msg_id="m3")
+        self.assertEqual(max(sr._pending), 3, "重启后短号撞号了")
+        self.assertIn("待审 #3", sup.call_args[0][0])
+
+    def test_open_and_decision_are_journaled(self):
+        self._escalate(text="报销怎么走")
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))
+        recs, bad = sr._journal_tail(self.journal)
+        self.assertEqual(bad, 0)
+        kinds = [r.get("t") for r in recs]
+        self.assertEqual(kinds, ["seq", "open", "done"])
+        self.assertEqual(recs[1]["q"], "报销怎么走")
+        self.assertEqual(recs[2]["action"], "answered")
+
+    def test_history_records_state(self):
+        """裁决后历史里留下状态，供事后引用旧消息时分辨"答过"与"没人理"。"""
+        self._escalate()
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr.on_inbound(_msg("boss", "#1 忽略", conv_id="cidBoss"))
+        self.assertEqual(sr._history[1]["state"], "ignored")
+
+    def test_replay_survives_garbage(self):
+        """坏行/半行/空行都不能让 replay 抛异常 —— 它跑在能力注册链上。"""
+        self._write('{"t":"seq","n":7}', "这不是 JSON", '{"t":"seq","n":9}',
+                    '{"t":"open","n":8,', "", "[1,2,3]")
+        recs, bad = sr._journal_tail(self.journal)
+        self.assertEqual(bad, 3)          # 坏行被计数而不是静默吞掉
+        sr._ensure_replayed()
+        self.assertEqual(sr._seq_counter, 9)
+
+    def test_replay_on_missing_file_is_noop(self):
+        sr._ensure_replayed()             # journal 尚不存在
+        self.assertEqual(sr._seq_counter, 0)
+
+    def test_replay_on_empty_file(self):
+        self._write()
+        sr._ensure_replayed()
+        self.assertEqual(sr._seq_counter, 0)
+
+    def test_tail_reads_only_last_bytes(self):
+        """只读尾部：流水跑几个月会有几十 MB，全量解析不可接受。"""
+        self._write(*[f'{{"t":"seq","n":{i}}}' for i in range(1, 501)])
+        recs, _ = sr._journal_tail(self.journal, max_bytes=200)
+        self.assertLess(len(recs), 500)
+        self.assertEqual(recs[-1]["n"], 500)      # 尾部一定读到
+
+    def test_tail_drops_partial_first_line(self):
+        """从中间切进去时，被切半的那行必须丢掉而不是当坏行。"""
+        self._write(*[f'{{"t":"seq","n":{i}}}' for i in range(1, 51)])
+        recs, bad = sr._journal_tail(self.journal, max_bytes=64)
+        self.assertEqual(bad, 0)
+
+    def test_unwritable_journal_does_not_block_escalation(self):
+        """落盘失败要告警但**不能丢掉提问者的问题**（丢问题比重号更糟）。"""
+        with patch.object(sr, "_JOURNAL_FILE", "/proc/nonexistent/x.jsonl"):
+            sup, rep = self._escalate()
+        sup.assert_called_once()                  # 卡片照发
+        self.assertEqual(len(sr._pending), 1)
+
+    def test_reset_does_not_touch_journal_file(self):
+        """_reset 只清内存 —— 单测 setUp 先 _reset 后 patch 路径，读盘会读到真实文件。"""
+        self._escalate()
+        sr._reset()
+        self.assertTrue(os.path.exists(self.journal))
 
 
 class TestLocateCard(_Base):

@@ -124,6 +124,24 @@ _pending = {}
 _pending_lock = threading.Lock()
 _seq_counter = 0
 
+# 审核流水（#108）：短号 #N 必须**跨重启唯一**。以前 _seq_counter 是纯内存的，重启归零，
+# 主管会话里于是同时存在多张「待审 #3」—— 已经造成过一次静默事故（反查卡片时匹配到上一
+# 轮的同号卡片，贴表情从此无效，commit 531d039）。
+# 放 knowledge/ 下而不是根目录点文件：那些会被 bin/core/lib.sh clean_runtime_state()
+# 在 stop/reboot 时删掉，而这份要跨重启活着。knowledge/ 已整目录 gitignore（含真实对话）。
+_JOURNAL_FILE = os.environ.get("SUPERVISOR_REVIEW_JOURNAL",
+                               "knowledge/supervisor_reviews.jsonl")
+# 只读末尾这么多字节重建状态：本模块在 custom.capabilities 的 import 链上，跑几个月的
+# 流水会有几十 MB，每次重启全量 json.loads 不可接受。seq 单调递增，尾部就够拿高水位。
+_JOURNAL_TAIL_BYTES = _env_int("SUPERVISOR_REVIEW_JOURNAL_TAIL", 262144)
+_journal_lock = threading.Lock()
+_replay_lock = threading.Lock()
+_replayed = False
+# 历史 review：seq -> {state, asker, asker_conv_id, asker_conv_type, question, draft}
+# state ∈ open | answered | ignored | expired。有界，replay 时从流水尾部重建。
+_history = OrderedDict()
+_HISTORY_MAX = 256
+
 # 表情轮询线程（单例，懒启动；没有待审时自行退出，下次转交再拉起）
 _poller_thread = None
 _poller_lock = threading.Lock()
@@ -385,6 +403,165 @@ def _seq_by_card_msg_id(msg_id):
 
 
 # ---------------------------------------------------------------------------
+# 审核流水（journal）：让短号 #N 跨重启唯一，并留下事后可查的裁决记录
+# ---------------------------------------------------------------------------
+
+def _journal_path(path=None):
+    """流水文件绝对路径。path 参数是给测试注入用的（同 core.brain 的 ext-session 写法）。"""
+    p = path or _JOURNAL_FILE
+    if os.path.isabs(p):
+        return p
+    return os.path.join(os.environ.get("PROJECT_DIR", os.getcwd()), p)
+
+
+def _journal_append(rec, path=None):
+    """往流水追加一条记录。返回 True=已落盘。
+
+    **不能照抄 _record_knowledge 的无锁 append**：那里一条记录几十字节，这里 open 记录
+    带完整草稿（几十行），Python 的 write() 会拆成多次 write(2)，两个 reply-pool 线程
+    并发追加就会把长记录撕开、互相插进对方中间。故：模块锁 + 单个 fd 内写完。
+    """
+    line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+    p = _journal_path(path)
+    try:
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with _journal_lock:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                written = 0
+                while written < len(line):
+                    written += os.write(fd, line[written:])
+            finally:
+                os.close(fd)
+        return True
+    except OSError as e:
+        log(f"supervisor_review: 写审核流水失败 {e}")
+        return False
+
+
+def _journal_tail(path=None, max_bytes=None):
+    """读流水**末尾**若干字节并解析 → (records, 坏行数)。文件不存在返回 ([], 0)。"""
+    p = _journal_path(path)
+    cap = max_bytes or _JOURNAL_TAIL_BYTES
+    try:
+        size = os.path.getsize(p)
+        with open(p, "rb") as f:
+            if size > cap:
+                f.seek(size - cap)
+                f.readline()      # 丢掉被切半的第一行
+            raw = f.read()
+    except OSError:
+        return [], 0              # 没有流水 = 还没审过东西，不是错误
+    recs, bad = [], 0
+    for ln in raw.decode("utf-8", "replace").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(r, dict):
+            recs.append(r)
+        else:
+            bad += 1
+    return recs, bad
+
+
+def _remember_history(seq, **fields):
+    """更新历史索引（有界 FIFO）。"""
+    rec = _history.get(seq) or {}
+    rec.update({k: v for k, v in fields.items() if v is not None})
+    _history[seq] = rec
+    _history.move_to_end(seq)
+    while len(_history) > _HISTORY_MAX:
+        _history.popitem(last=False)
+    return rec
+
+
+def _replay(path=None):
+    """从流水重建短号高水位 + 历史索引。返回高水位。
+
+    坏行**计数并上报**，不像知识库那样静默跳过 —— 这个文件决定 #N 从几开始，
+    悄悄少算一行就是重号事故。
+    """
+    global _seq_counter
+    recs, bad = _journal_tail(path)
+    high = 0
+    for r in recs:
+        n = r.get("n")
+        if not isinstance(n, int):
+            continue
+        high = max(high, n)
+        t = r.get("t")
+        if t == "open":
+            _remember_history(n, state="open", asker=r.get("asker"),
+                              asker_conv_id=r.get("conv_id"),
+                              asker_conv_type=r.get("conv_type"),
+                              question=r.get("q"), draft=r.get("draft"))
+        elif t == "done":
+            _remember_history(n, state=r.get("action") or "answered",
+                              answer=r.get("answer"))
+        elif t == "expire":
+            _remember_history(n, state="expired")
+    with _pending_lock:
+        _seq_counter = max(_seq_counter, high)
+    if bad:
+        log(f"supervisor_review: 审核流水有 {bad} 行无法解析（已跳过），"
+            f"短号高水位取到 #{high}")
+    if high:
+        log(f"supervisor_review: 已从流水恢复，短号从 #{high + 1} 续起"
+            f"（历史 {len(_history)} 条）")
+    return high
+
+
+def _ensure_replayed(path=None):
+    """首次用到短号时重建一次状态。
+
+    **不在 import 期做**：本模块在 custom.capabilities 的 import 链上，这里抛异常会让
+    所有能力注册失败、数字员工对谁都不吭声（同 _env_int 的教训）。
+    """
+    global _replayed
+    with _replay_lock:
+        if _replayed:
+            return
+        _replayed = True
+        try:
+            _replay(path)
+        except Exception as e:      # 恢复不了就当没有历史，绝不能拖垮能力注册
+            log(f"supervisor_review: 重建审核流水失败，退化为从 #1 起 {e}")
+
+
+def _record_decision(seq, state, answer=""):
+    """把裁决结果落进流水 + 历史索引。best-effort（裁决本身已经生效了）。
+
+    state ∈ answered | ignored | expired。留档是为了主管事后引用旧消息时，能分辨
+    "这条已经答过了"和"这条当时没人理"—— 两者的补裁语义不同。
+    """
+    _remember_history(seq, state=state, answer=answer or None)
+    _journal_append({"t": "expire" if state == "expired" else "done", "n": seq,
+                     "action": state, "answer": (answer or "")[:2000],
+                     "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+
+def _next_seq():
+    """分配一个跨重启唯一的短号 → (seq, 是否已落盘)。
+
+    **先落盘再返回**：号分配了却没记下来，重启后会重号，正是这次要修的事故。
+    落盘失败不放弃转交（丢掉提问者的问题更糟），但要显式告警，让人知道退化了。
+    """
+    global _seq_counter
+    _ensure_replayed()
+    with _pending_lock:
+        _seq_counter += 1
+        seq = _seq_counter
+    return seq, _journal_append({"t": "seq", "n": seq})
+
+
+# ---------------------------------------------------------------------------
 # 知识库
 # ---------------------------------------------------------------------------
 
@@ -617,6 +794,7 @@ def _timeout(seq):
     if not p:
         return
     log(f"supervisor_review: #{seq} 主管 {_TIMEOUT}s 未裁决 → 按不回复处理（已归档，可事后补裁）")
+    _record_decision(seq, "expired")
     # 与"忽略"完全一致：提问者那条静默收尾，不贴「完成」也不贴「未完成」
     _close_ack(p["asker_conv_id"], p["asker_conv_type"], ok=None)
     card_id = p.get("card_msg_id")
@@ -658,9 +836,10 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
     if not draft:
         log(f"supervisor_review: AI 草稿生成失败(status={status})，仍转交主管 user={user}")
 
-    with _pending_lock:
-        _seq_counter += 1
-        seq = _seq_counter
+    seq, persisted = _next_seq()
+    if not persisted:
+        # 退化：短号仍然可用，但重启后可能与历史撞号（回到 #108 之前的行为）
+        log(f"supervisor_review: #{seq} 未能写入审核流水，重启后该短号可能重复")
     card = _render_card(seq, user, text, draft, conv_type)
     if not _send_to_supervisor(card):
         # 转交失败：不能把提问者永久挂着 —— 直接把草稿发给他（有什么发什么）
@@ -692,6 +871,11 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
     if timer:
         timer.start()
     _ensure_poller()
+    _journal_append({"t": "open", "n": seq, "asker": user, "conv_id": conv_id,
+                     "conv_type": conv_type, "q": text, "draft": draft or "",
+                     "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+    _remember_history(seq, state="open", asker=user, asker_conv_id=conv_id,
+                      asker_conv_type=conv_type, question=text, draft=draft or "")
     log(f"supervisor_review: #{seq} 已转交主管审核 asker={user} q={text[:40]!r}")
 
     # 卡片自己的 msgId：贴表情裁决(A)与引用回复裁决(B)都靠它定位。取不到只是这两条路走
@@ -735,6 +919,7 @@ def _execute_verdict(seq, action, payload="", source=""):
 
     if action == "ignore":
         log(f"supervisor_review: #{seq} 主管选择忽略{via}，不回复 asker={p['asker']}")
+        _record_decision(seq, "ignored")
         # 提问者那条消息不会再收到任何回复 → 静默收尾，否则它每 5 分钟播「仍在处理中」
         _close_ack(asker_conv_id, asker_conv_type, ok=None)
         _send_to_supervisor(f"🚫 待审 #{seq} 已忽略{via}，未回复 {_asker_label(p)}。")
@@ -749,6 +934,7 @@ def _execute_verdict(seq, action, payload="", source=""):
             return True
         send_reply(asker_conv_id, asker_conv_type, draft)
         log(f"supervisor_review: #{seq} 主管同意{via}，草稿已发给 {p['asker']}")
+        _record_decision(seq, "answered", draft)
         _send_to_supervisor(f"✅ 待审 #{seq} 已按草稿回复 {_asker_label(p)}{via}。")
         return True
 
@@ -761,6 +947,7 @@ def _execute_verdict(seq, action, payload="", source=""):
     send_reply(asker_conv_id, asker_conv_type, answer)
     _record_knowledge(p["question"], answer, asker=p["asker"])
     log(f"supervisor_review: #{seq} 主管改写并已回复 {p['asker']}")
+    _record_decision(seq, "answered", answer)
     _send_to_supervisor(f"📝 待审 #{seq} 已用你的答案回复 {_asker_label(p)}，并已存入知识库。")
     return True
 
@@ -974,6 +1161,11 @@ def _reset():
     _handled_reactions.clear()
     _card_history.clear()
     _archive.clear()
+    # 只清内存，**不碰流水文件**。replay 单独可调（_ensure_replayed）—— 单测的 setUp
+    # 是先 _reset() 后 patch 路径的，若在这里读盘就会去读真实的 knowledge/ 文件。
+    _history.clear()
+    global _replayed
+    _replayed = False
 
 
 CAPABILITY = Capability(

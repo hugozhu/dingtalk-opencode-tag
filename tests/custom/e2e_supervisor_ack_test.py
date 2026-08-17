@@ -18,8 +18,11 @@ ACK_PROGRESS_INTERVAL 秒各往会话里播一条「⏳ 仍在处理中」，直
 把 ACK_PROGRESS_INTERVAL 压到 1s：修好后裁决完再等 3.5s 一条心跳都不该有；
 旧代码会稳定喷 3 条以上。
 """
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.join(
@@ -32,7 +35,12 @@ os.environ["AGENT_SUPERVISOR_NAME"] = "boss"
 os.environ["ACK_STAGES"] = "0:稍等:已收到，正在处理…"   # 立即贴处理中，无中间升级
 os.environ["ACK_PROGRESS_INTERVAL"] = "1"              # 心跳压到 1s（线上 300s）
 os.environ["ACK_PROGRESS_MESSAGE"] = "1"               # 心跳要发独立消息（本测就是抓它）
-os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "600"        # 不让超时兜底插进来
+os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "600"    # 不让超时兜底插进来
+# 审核流水指到 tmpdir —— 否则会写进真实 knowledge/，且短号从上次的高水位续起，
+# 本测里写死的「#1 …」就对不上了（e2e 之间互相串味）
+_TMP = tempfile.mkdtemp(prefix="e2e-sup-")
+atexit.register(shutil.rmtree, _TMP, True)   # sys.exit 在前，收尾只能挂 atexit
+os.environ["SUPERVISOR_REVIEW_JOURNAL"] = os.path.join(_TMP, "reviews.jsonl")
 
 import custom.capabilities                      # noqa: E402  注册全部能力
 import custom.capabilities.ack as ACK           # noqa: E402

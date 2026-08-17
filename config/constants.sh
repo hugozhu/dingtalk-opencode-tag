@@ -205,6 +205,13 @@ export SUPERVISOR_UNCLEAR_MAX_LEN="${SUPERVISOR_UNCLEAR_MAX_LEN:-8}"
 # 和「找财务小王签字」（答案）。判不了（模型不可用/答非所问）自动回落字数阈值。
 # 分工：贴表情 = 采纳/忽略，引用回复 = 正式作答。0=关掉判断，退回纯字数启发式。
 export SUPERVISOR_JUDGE_QUOTED="${SUPERVISOR_JUDGE_QUOTED:-1}"
+# 审核流水（JSONL，相对 PROJECT_DIR）：短号 #N 靠它**跨重启唯一**。
+# 以前 _seq_counter 是纯内存的，重启归零 → 主管会话里同时存在多张「待审 #3」，反查卡片
+# 时会匹配到上一轮那张同号的，贴表情从此静默失效。放 knowledge/ 下而不是根目录点文件——
+# 后者会被 stop/reboot 的 clean_runtime_state() 删掉。删了这个文件 = 短号重新从 1 开始。
+export SUPERVISOR_REVIEW_JOURNAL="${SUPERVISOR_REVIEW_JOURNAL:-knowledge/supervisor_reviews.jsonl}"
+# 启动时只回放流水末尾这么多字节（跑久了文件会很大，全量解析拖慢每次重启）
+export SUPERVISOR_REVIEW_JOURNAL_TAIL="${SUPERVISOR_REVIEW_JOURNAL_TAIL:-262144}"
 # 知识库（JSONL，相对 PROJECT_DIR）。AGENT_KNOWLEDGE_MAX=0 可关闭知识注入。
 export AGENT_KNOWLEDGE_FILE="${AGENT_KNOWLEDGE_FILE:-knowledge/supervisor_qa.jsonl}"
 export AGENT_KNOWLEDGE_MAX="${AGENT_KNOWLEDGE_MAX:-20}"

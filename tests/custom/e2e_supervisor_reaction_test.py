@@ -14,8 +14,11 @@
 反证开关：E2E_SIMULATE_BUG=1 把表情映射与 unclear 判定退回老行为（认不出=改写），
 此时必须 FAIL —— 否则这些断言证明不了任何事。
 """
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.join(
@@ -29,6 +32,11 @@ os.environ["AGENT_SELF_NAMES"] = "一粟"
 os.environ["ACK_STAGES"] = "0:稍等:已收到，正在处理…"
 os.environ["ACK_PROGRESS_INTERVAL"] = "0"          # 关掉心跳，本测不关心 #109
 os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "600"    # 不让超时兜底插进来
+# 审核流水指到 tmpdir —— 否则会写进真实 knowledge/，且短号从上次的高水位续起，
+# 本测里写死的「#1 …」就对不上了（e2e 之间互相串味）
+_TMP = tempfile.mkdtemp(prefix="e2e-sup-")
+atexit.register(shutil.rmtree, _TMP, True)   # sys.exit 在前，收尾只能挂 atexit
+os.environ["SUPERVISOR_REVIEW_JOURNAL"] = os.path.join(_TMP, "reviews.jsonl")
 os.environ["SUPERVISOR_REACTION_POLL"] = "0.2"     # 轮询压到 0.2s
 
 import custom.capabilities                          # noqa: E402  注册全部能力
