@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""端到端验证 #108：主管审核的「不发消息」出口要收尾 ack，不能一直播「仍在处理中」。
+"""端到端验证 #109：主管审核的「不发消息」出口要收尾 ack，不能一直播「仍在处理中」。
 
 复现的线上故障：主管在群里 @ 数字员工提问 → 草稿转交主管 → 主管单聊回「#1 忽略」→
 双方都不再有任何回复，但**两条消息的 ack worker 都还在等 reply-sent 信号**，于是每
@@ -103,7 +103,7 @@ SR.generate_reply_ex = lambda user, text, ctx=None: ("AI 草稿：我能干这�
 SR._locate_card_msg_id = lambda seq: ""   # 反查卡片 msgId 会真调 dws，本测不关心贴表情
 
 # 反证开关：E2E_SIMULATE_BUG=1 只把 _close_ack 变成 no-op（其余一字不改），精确还原
-# #108 修复前的行为，此时本测必须 FAIL。证明这几条断言真能抓住回归，而不是恒绿。
+# #109 修复前的行为，此时本测必须 FAIL。证明这几条断言真能抓住回归，而不是恒绿。
 if os.environ.get("E2E_SIMULATE_BUG") == "1":
     SR._close_ack = lambda *a, **k: None
     print("⚠️  E2E_SIMULATE_BUG=1：已禁用 _close_ack，模拟修复前行为（期望 FAIL）\n")
@@ -159,7 +159,7 @@ print(f"  V1 群里不落草稿，先转交主管      : {'✅' if v1 else '❌'
 print(f"  V2 裁决后两个 ack worker 都收尾  : {'✅' if v2 else '❌'}（不再挂死等信号）")
 print(f"  V3 提问者那条静默收尾（只移除）  : {'✅' if v3 else '❌'}（没答就别贴「完成」）")
 print(f"  V4 主管裁决消息落「完成」终态    : {'✅' if v4 else '❌'}")
-print(f"  V5 全程零「⏳ 仍在处理中」心跳   : {'✅' if v5 else '❌'}（#108 核心回归）")
+print(f"  V5 全程零「⏳ 仍在处理中」心跳   : {'✅' if v5 else '❌'}（#109 核心回归）")
 
 allok = v1 and v2 and v3 and v4 and v5
 print("PASS" if allok else "FAIL")

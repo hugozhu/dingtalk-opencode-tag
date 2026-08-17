@@ -602,7 +602,7 @@ class TestLifecycleWorker(unittest.TestCase):
         self.assertEqual(len(remove_calls), 1, "超时收尾应调用 remove")
 
     def test_reply_sent_none_closes_silently(self):
-        """ok=None → 静默收尾：移除「处理中」但不贴完成/失败（#108 忽略场景）。
+        """ok=None → 静默收尾：移除「处理中」但不贴完成/失败（#109 忽略场景）。
 
         贴「完成」= 骗提问者（他并没收到回复），贴「未完成」= 看着像故障。
         """

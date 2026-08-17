@@ -37,7 +37,7 @@
   表情认不出 → 同理（还会把表情名记进日志，方便补进 SUPERVISOR_APPROVE_EMOJIS）。
 - **给主管发卡片不用 send_reply**：卡片不是"对提问者的回复"，不该驱动 ack 状态机收尾。
   发给提问者的最终答案才用 send_reply（让 ack 回执正常落地）。
-- **不发消息的出口要显式收尾 ack**（#108）：ack 的"处理中→完成"只由 send_reply 广播的
+- **不发消息的出口要显式收尾 ack**（#109）：ack 的"处理中→完成"只由 send_reply 广播的
   reply-sent 驱动，而本能力有几条路径压根不产生 send_reply（主管的裁决消息、忽略、
   转交失败且无草稿、超时且无草稿）。不收尾 → 那条消息的 ack worker 一直等信号，每
   ACK_PROGRESS_INTERVAL 秒往会话播一条「仍在处理中」直到 ACK_DONE_TIMEOUT（默认 65
@@ -193,7 +193,7 @@ def _send_to_supervisor(text):
 
 
 def _close_ack(conv_id, conv_type, ok=True):
-    """显式收尾这条消息的 ack 回执（#108）。
+    """显式收尾这条消息的 ack 回执（#109）。
 
     只在**不会有 send_reply** 的出口调用（见模块 docstring）。ok=None → 只移除
     「处理中」不贴终态：忽略场景没给答案，贴「完成」是骗提问者。
@@ -341,7 +341,7 @@ def _repend(seq, p):
     """把已取出的待审放回去（裁决没能真正完成时）。
 
     `_pop` 顺手取消了超时定时器，所以放回去要重新起一个 —— 否则这条待审既没被裁决、
-    也没有兜底，提问者会被无限期挂着（连带 ack 每 5 分钟播「仍在处理中」，见 #108）。
+    也没有兜底，提问者会被无限期挂着（连带 ack 每 5 分钟播「仍在处理中」，见 #109）。
     **按原始 ts 续上剩余时间，不是重新计时**：兜底的契约是"提问者最迟 _TIMEOUT 秒后
     有回音"，每次放回都续满会把这个上限无限推后。
     """
@@ -672,7 +672,7 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
         return
 
     # **卡片一发出去就登记待审**：主管可能秒回/秒贴表情，登记晚一步那条裁决就会找不到
-    # 待审、被当成普通对话落到 text_reply（提问者的 ack 也就永远收不了尾，#108 那类症状）。
+    # 待审、被当成普通对话落到 text_reply（提问者的 ack 也就永远收不了尾，#109 那类症状）。
     # 所以下面的补发全文、反查 msgId 这些网络往返都排在登记之后。
     timer = None
     if _TIMEOUT > 0:
@@ -715,7 +715,7 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
 def _execute_verdict(seq, action, payload="", source=""):
     """执行一条裁决（approve/ignore/rewrite）。**文字裁决与贴表情裁决共用这一份**。
 
-    抽出来是为了两条入口的收尾语义完全一致 —— 尤其是 #108 的 ack 收尾，分两处写迟早
+    抽出来是为了两条入口的收尾语义完全一致 —— 尤其是 #109 的 ack 收尾，分两处写迟早
     漏一处。source 只影响回执措辞，让主管知道这条是打字裁的还是贴表情裁的。
 
     返回 True=已执行（待审已注销）；False=该 seq 已不在待审表（并发裁决时的正常竞态）。

@@ -27,7 +27,7 @@ os.environ["AGENT_SUPERVISOR_USER_ID"] = "sup-e2e"
 os.environ["AGENT_SUPERVISOR_NAME"] = "boss"
 os.environ["AGENT_SELF_NAMES"] = "一粟"
 os.environ["ACK_STAGES"] = "0:稍等:已收到，正在处理…"
-os.environ["ACK_PROGRESS_INTERVAL"] = "0"          # 关掉心跳，本测不关心 #108
+os.environ["ACK_PROGRESS_INTERVAL"] = "0"          # 关掉心跳，本测不关心 #109
 os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "600"    # 不让超时兜底插进来
 os.environ["SUPERVISOR_REACTION_POLL"] = "0.2"     # 轮询压到 0.2s
 

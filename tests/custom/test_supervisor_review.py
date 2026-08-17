@@ -336,7 +336,7 @@ class TestTimeout(_Base):
 
 
 class TestAckClosure(_Base):
-    """不发消息的出口必须显式收尾 ack（#108）。
+    """不发消息的出口必须显式收尾 ack（#109）。
 
     ack 的「处理中→完成」只由 send_reply 广播的 reply-sent 驱动。本能力有几条路径
     压根不产生 send_reply，不收尾 → 那条消息的 ack worker 每 5 分钟往会话播一条
@@ -810,7 +810,7 @@ class TestQuotedJudge(_Base):
 
 
 class TestPendingNotLost(_Base):
-    """裁决没能真正完成时，待审必须留着 —— 否则提问者永久挂起（并触发 #108 心跳）。"""
+    """裁决没能真正完成时，待审必须留着 —— 否则提问者永久挂起（并触发 #109 心跳）。"""
 
     def test_approve_without_draft_keeps_pending(self):
         self._escalate(draft="")
@@ -825,7 +825,7 @@ class TestPendingNotLost(_Base):
         """反查卡片 msgId 是一次网络往返 —— 待审必须在它之前就登记好。
 
         否则主管秒回「同意」时会找不到待审，被当成普通对话落到 text_reply（提问者的
-        ack 也就永远收不了尾，正是 #108 那类症状）。
+        ack 也就永远收不了尾，正是 #109 那类症状）。
         """
         seen = {}
 
