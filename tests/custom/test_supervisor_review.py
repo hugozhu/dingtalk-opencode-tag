@@ -38,9 +38,9 @@ class _Base(unittest.TestCase):
             patch.object(sr, "_JOURNAL_FILE", self.journal),
             patch.object(sr, "_TIMEOUT", 0),        # 0=不起定时器，超时单独测
             patch.object(sr, "_O2O_ONLY", False),   # 默认：单聊 + 群聊都审（#107）
-            # 反查卡片 msgId 会真的 shell 出去调 dws —— 单测里替换成确定值
-            patch.object(sr, "_locate_card_msg_id", lambda seq: f"cardMsg{seq}"),
-            patch.object(sr, "_REACTION_POLL", 0),  # 默认不起轮询线程，贴表情单独测
+            # 贴表情裁决要反查被贴消息的正文 —— 单测里给确定值，别 shell 出去调 dws
+            patch.object(sr, "_seq_of_message", lambda mid: 1 if mid else None),
+            patch.object(sr, "_REACTION_DEBOUNCE", 0),   # 单测不等宽限期
         ]
         for p in self.patches:
             p.start()
@@ -475,137 +475,104 @@ class TestCardRendering(_Base):
 
 
 class TestReactionVerdict(_Base):
-    """#107 A：贴表情裁决（轮询 list-emotion-replies）。"""
+    """贴表情裁决改为**事件驱动**（#108）：不再轮询，且不再只限卡片、不再只限待审期间。"""
 
-    @staticmethod
-    def _emotion_payload(msg_id, emoji, users=("boss",)):
-        return json.dumps({"result": {"messages": [
-            {"openMessageId": msg_id,
-             "emotionReplyList": [{"emoji": emoji, "replyUsers": list(users)}]},
-        ]}})
+    _LINE = ("[connect] 表情回应 @boss: {emoji} (convType=1 convId=cidBoss "
+             "reactedMsgId={mid} reactionOp={op} eventId={eid})")
+
+    def _reaction(self, emoji="赞", mid="msgCARD", op="add", eid="ev1"):
+        return sr.classify_line(self._LINE.format(emoji=emoji, mid=mid, op=op, eid=eid))
+
+    def test_classify_line_parses_reaction(self):
+        msg = self._reaction()
+        self.assertEqual(msg.kind, sr.KIND_REACTION)
+        self.assertEqual(msg.user, "boss")
+        self.assertEqual(msg.extra["reaction"], "赞")
+        self.assertEqual(msg.extra["reacted_msg_id"], "msgCARD")
+        self.assertEqual(msg.msg_id, "ev1")   # msg_id=event_id → 复用 core 的 dedup
+
+    def test_reaction_line_is_not_a_normal_message(self):
+        """这条行绝不能被 core 当成普通消息 —— 否则能力关掉时会被喂给大脑。"""
+        from core.inbound import parse_line
+        self.assertIsNone(parse_line(self._LINE.format(
+            emoji="赞", mid="m", op="add", eid="e")))
+
+    def test_thumbs_up_approves(self):
+        self._escalate(draft="AI草稿")
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(self._reaction("赞")))
+        self.assertEqual(rep.call_args[0][2], "AI草稿")
+        self.assertEqual(len(sr._pending), 0)
+
+    def test_cross_ignores(self):
+        self._escalate()
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(self._reaction("❌")))
+        rep.assert_not_called()
+        self.assertEqual(len(sr._pending), 0)
+
+    def test_reaction_on_non_review_message_ignored(self):
+        """贴在无关消息上（反查不出编号）→ 什么都不做，绝不改判到别的待审。"""
+        self._escalate()
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
+             patch.object(sr, "_seq_of_message", lambda mid: None), \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            sr.on_inbound(self._reaction("赞", mid="msg无关"))
+        rep.assert_not_called()
+        self.assertEqual(len(sr._pending), 1)
+
+    def test_non_supervisor_reaction_ignored(self):
+        """别人贴的表情不是裁决，更不能被当成新提问送审。"""
+        line = self._LINE.format(emoji="赞", mid="m", op="add", eid="e").replace(
+            "@boss:", "@张三:")
+        with patch.object(sr, "submit_reply") as sub, \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(sr.classify_line(line)))
+        sub.assert_not_called()      # 没有生成草稿、没造假待审
+        rep.assert_not_called()
+
+    def test_remove_within_debounce_cancels(self):
+        """贴错了立刻撤 → 取消裁决。事件驱动后每次贴都是不可撤的即时裁决，要留反悔窗口。"""
+        self._escalate(draft="AI草稿")
+        with patch.object(sr, "_REACTION_DEBOUNCE", 5), \
+             patch.object(sr, "submit_reply") as sub:
+            sr.on_inbound(self._reaction("赞", eid="e1"))
+            sr.on_inbound(self._reaction("赞", op="remove", eid="e2"))
+        sub.assert_not_called()
+        self.assertEqual(len(sr._pending), 1)
 
     def test_emoji_mapping(self):
         self.assertEqual(sr._emoji_action("赞"), "approve")
         self.assertEqual(sr._emoji_action("❌"), "ignore")
-        self.assertIsNone(sr._emoji_action("🐶"))     # 不认识 → None，不猜
+        self.assertIsNone(sr._emoji_action("🐶"))
 
-    def test_only_supervisor_reactions_count(self):
-        """别人贴的表情不是裁决。"""
-        entries = [{"emoji": "赞", "replyUsers": ["张三"]}]
-        self.assertEqual(sr._supervisor_emojis(entries), [])
-        entries.append({"emoji": "❌", "replyUsers": ["老板"]})
-        self.assertEqual(sr._supervisor_emojis(entries), ["❌"])
-
-    def test_malformed_reply_users_do_not_crash(self):
-        """钉钉 payload 形状没文档化 —— 万一 replyUsers 是对象数组也不能把轮询线程带走。"""
-        self.assertEqual(sr._supervisor_emojis([{"emoji": "赞", "replyUsers": [{"n": "boss"}]}]), [])
-        self.assertEqual(sr._supervisor_emojis([{"emoji": "赞", "replyUsers": "boss"}]), [])
-        self.assertEqual(sr._supervisor_emojis(None), [])
-
-    def test_thumbs_up_approves_draft(self):
-        """主管贴 👍 → 提问者收到草稿，全程零打字。"""
-        self._escalate(draft="AI草稿")
-        with patch.object(sr, "_run_cli",
-                          lambda a, timeout=60: (0, self._emotion_payload("cardMsg1", "赞"))), \
+    def test_unknown_emoji_asks(self):
+        self._escalate()
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
              patch.object(sr, "_send_to_supervisor") as sup, \
              patch.object(sr, "send_reply") as rep:
-            self.assertEqual(sr._poll_reactions_once(), 1)
-        self.assertEqual(rep.call_args[0][0], "cidZhang")
-        self.assertEqual(rep.call_args[0][2], "AI草稿")
-        self.assertEqual(len(sr._pending), 0)
-        self.assertIn("✅", sup.call_args[0][0])
-
-    def test_cross_ignores_without_replying(self):
-        self._escalate()
-        with patch.object(sr, "_run_cli",
-                          lambda a, timeout=60: (0, self._emotion_payload("cardMsg1", "❌"))), \
-             patch.object(sr, "_send_to_supervisor"), \
-             patch.object(sr, "send_reply") as rep:
-            self.assertEqual(sr._poll_reactions_once(), 1)
-        rep.assert_not_called()
-        self.assertEqual(len(sr._pending), 0)
-
-    def test_unknown_emoji_asks_once_and_keeps_pending(self):
-        """不认识的表情：待审保留、只提示一次（否则每轮都骚扰主管）。"""
-        self._escalate()
-        with patch.object(sr, "_run_cli",
-                          lambda a, timeout=60: (0, self._emotion_payload("cardMsg1", "🐶"))), \
-             patch.object(sr, "_send_to_supervisor") as sup, \
-             patch.object(sr, "send_reply") as rep:
-            sr._poll_reactions_once()
-            sr._poll_reactions_once()
-            sr._poll_reactions_once()
+            sr.on_inbound(self._reaction("🐶"))
         rep.assert_not_called()
         self.assertEqual(len(sr._pending), 1)
-        self.assertEqual(sup.call_count, 1)
         self.assertIn("🐶", sup.call_args[0][0])
 
-    def test_sticky_reaction_acts_only_once(self):
-        """表情是**状态**不是事件：贴上去就一直挂着，每轮都读得到，只能作用一次。
-
-        没有这层记账时，「同意但没草稿」会把待审放回去 → 下一轮读到同一个 👍 → 再放回，
-        每 5 秒给主管发一条同样的提示，且超时定时器被反复重置，提问者永远等不到兜底。
-        """
-        self._escalate(draft="")          # 模型挂了 → 无草稿（受支持的路径）
-        with patch.object(sr, "_run_cli",
-                          lambda a, timeout=60: (0, self._emotion_payload("cardMsg1", "赞"))), \
-             patch.object(sr, "_send_to_supervisor") as sup, \
-             patch.object(sr, "send_reply"):
-            for _ in range(4):
-                sr._poll_reactions_once()
-        self.assertEqual(sup.call_count, 1, "同一个表情被重复处理了")
-        self.assertEqual(len(sr._pending), 1)   # 待审留着让主管手写答案
-
-    def test_unmapped_emoji_does_not_shadow_later_valid_one(self):
-        """主管先误贴一个不认识的、再补贴 👍 —— 那个 👍 必须生效。"""
-        self._escalate(draft="AI草稿")
-        both = json.dumps({"result": {"messages": [{
-            "openMessageId": "cardMsg1",
-            "emotionReplyList": [{"emoji": "🐶", "replyUsers": ["boss"]},
-                                 {"emoji": "赞", "replyUsers": ["boss"]}],
-        }]}})
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, both)), \
+    def test_reaction_works_after_review_expired(self):
+        """核心诉求：待审早就结束了，事后贴表情照样能补裁（以前轮询线程已退出，无人读）。"""
+        self._escalate(user="张三", conv_id="cidZhang", draft="AI草稿")
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr._timeout(1)
+        self.assertEqual(len(sr._pending), 0)
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
              patch.object(sr, "_send_to_supervisor"), \
              patch.object(sr, "send_reply") as rep:
-            self.assertEqual(sr._poll_reactions_once(), 1)
+            sr.on_inbound(self._reaction("赞"))
+        self.assertEqual(rep.call_args[0][0], "cidZhang")
         self.assertEqual(rep.call_args[0][2], "AI草稿")
-
-    def test_repend_keeps_original_deadline(self):
-        """放回待审要续原来的剩余时间，不能每次都续满 —— 否则兜底永远不触发。"""
-        self._escalate(draft="")
-        with patch.object(sr, "_TIMEOUT", 600), \
-             patch.object(sr, "_send_to_supervisor"), \
-             patch.object(sr, "send_reply"):
-            sr._pending[1]["ts"] = time.time() - 590      # 只剩 10s
-            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))
-            timer = sr._pending[1]["timer"]
-        self.assertLess(timer.interval, 30, "重新计时了，兜底被无限推后")
-        timer.cancel()
-
-    def test_no_pending_makes_no_cli_call(self):
-        """没有待审就别去打扰 dws。"""
-        calls = []
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: calls.append(a) or (0, "{}")):
-            self.assertEqual(sr._poll_reactions_once(), 0)
-        self.assertEqual(calls, [])
-
-    def test_all_pending_polled_in_one_call(self):
-        """N 条待审只发一次 CLI（--msg-ids 逗号分隔），不是 N 次。"""
-        self._escalate(user="张三", conv_id="cidZhang", msg_id="m1")
-        self._escalate(user="李四", conv_id="cidLi", msg_id="m2")
-        calls = []
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: calls.append(a) or (0, "{}")):
-            sr._poll_reactions_once()
-        self.assertEqual(len(calls), 1)
-        self.assertIn("cardMsg1,cardMsg2", " ".join(calls[0]))
-
-    def test_cli_failure_is_survivable(self):
-        self._escalate()
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: (1, "boom")), \
-             patch.object(sr, "send_reply") as rep:
-            self.assertEqual(sr._poll_reactions_once(), 0)
-        rep.assert_not_called()
-        self.assertEqual(len(sr._pending), 1)        # 拉不到表情 ≠ 裁决，待审不能丢
 
 
 class TestQuotedVerdict(_Base):
@@ -655,7 +622,7 @@ class TestQuotedVerdict(_Base):
         self._escalate(user="张三", conv_id="cidZhang", msg_id="m1", draft="草稿1")
         self._escalate(user="李四", conv_id="cidLi", msg_id="m2", draft="草稿2")
         msg = _msg("boss", "同意", conv_id="cidBoss")
-        msg.extra["quoted_msg_id"] = "cardMsg1"
+        msg.extra.update({"quoted": True, "quoted_seq": 1, "quoted_msg_id": "q1"})
         with patch.object(sr, "_send_to_supervisor"), \
              patch.object(sr, "send_reply") as rep:
             self.assertTrue(sr.on_inbound(msg))
@@ -807,74 +774,6 @@ class TestJournal(_Base):
         self.assertTrue(os.path.exists(self.journal))
 
 
-class TestLocateCard(_Base):
-    """反查卡片 msgId —— 贴表情/引用裁决全靠它，之前整个被 stub 掉、零覆盖。
-
-    真实事故：守护进程由 reboot.sh 以 `env -i` 拉起，TZ 不继承 → 进程跑 UTC，钉钉时间是
-    CST，差 8 小时。锚点偏早 8 小时 + `--time` 是"从该点往后取最旧 N 条" → 刚发的卡片
-    不在结果里，反而匹配到重启前那张**同号**的旧卡片（_seq_counter 重启归零），于是轮询
-    一直盯着上一轮的卡片，主管贴的表情永远读不到，全程无报错。
-    """
-
-    def setUp(self):
-        super().setUp()
-        for p in self.patches:                 # 本组要测真函数，撤掉 _Base 的桩
-            p.stop()
-        self.patches = []
-
-    @staticmethod
-    def _payload(msgs):
-        return json.dumps({"result": {"messages": msgs}})
-
-    def test_queries_newest_first_not_local_time_window(self):
-        """必须走 --direction older（从最新往回数），否则进程时区一偏就全错。"""
-        seen = {}
-
-        def fake_cli(args, timeout=60):
-            seen["args"] = args
-            return 0, self._payload([])
-
-        with patch.object(sr, "_run_cli", fake_cli):
-            sr._locate_card_msg_id(3)
-        self.assertIn("--direction", seen["args"])
-        self.assertEqual(seen["args"][seen["args"].index("--direction") + 1], "older")
-
-    def test_picks_newest_card_when_seq_number_repeats(self):
-        """重启后编号会重来 —— 同号卡片有多张时必须取最新那张。"""
-        msgs = [
-            {"sender": "一粟", "openMessageId": "新", "content": "📋 **待审 #3**　来自：**冬翔**"},
-            {"sender": "一粟", "openMessageId": "旧", "content": "📋 **待审 #3**　来自：**靖之**"},
-        ]   # 接口按新→旧返回
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload(msgs))), \
-             patch.object(sr, "_SELF_NAMES", {"一粟"}):
-            self.assertEqual(sr._locate_card_msg_id(3), "新")
-
-    def test_ignores_messages_from_others(self):
-        """主管引用卡片回复时，他那条消息正文里也带卡片原文 —— 不能认成自己的卡片。"""
-        msgs = [
-            {"sender": "hugozhu", "openMessageId": "主管的", "content": "📋 **待审 #3**　来自…"},
-            {"sender": "一粟", "openMessageId": "我的", "content": "📋 **待审 #3**　来自…"},
-        ]
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload(msgs))), \
-             patch.object(sr, "_SELF_NAMES", {"一粟"}):
-            self.assertEqual(sr._locate_card_msg_id(3), "我的")
-
-    def test_seq_prefix_does_not_collide(self):
-        """#3 不能匹配到 #30 的卡片。"""
-        msgs = [{"sender": "一粟", "openMessageId": "三十", "content": "📋 **待审 #30**　来自…"}]
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload(msgs))), \
-             patch.object(sr, "_SELF_NAMES", {"一粟"}):
-            self.assertEqual(sr._locate_card_msg_id(3), "")
-
-    def test_not_found_is_logged_not_silent(self):
-        """找不到只能走文字裁决 —— 必须留下线索，否则线上是静默失效。"""
-        logs = []
-        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload([]))), \
-             patch.object(sr, "log", lambda m: logs.append(m)):
-            self.assertEqual(sr._locate_card_msg_id(3), "")
-        self.assertTrue(any("找回卡片" in m for m in logs))
-
-
 class TestQuotedJudge(_Base):
     """引用回复 = 正式作答：内容交大模型判能不能原样发给提问者（#107）。
 
@@ -882,9 +781,9 @@ class TestQuotedJudge(_Base):
     是评语）和「找财务小王签字」（7 字，是答案）。
     """
 
-    def _quoted(self, text, card="cardMsg1"):
+    def _quoted(self, text, seq=1):
         msg = _msg("boss", text, conv_id="cidBoss", msg_id="m9")
-        msg.extra["quoted_msg_id"] = card
+        msg.extra.update({"quoted": True, "quoted_seq": seq, "quoted_msg_id": "q1"})
         return msg
 
     def test_sendable_reply_goes_straight_to_asker(self):
@@ -918,7 +817,7 @@ class TestQuotedJudge(_Base):
             with patch.object(sr, "_judge_directly_sendable") as judge, \
                  patch.object(sr, "_send_to_supervisor"), \
                  patch.object(sr, "send_reply"):
-                sr.on_inbound(self._quoted(text, card=f"cardMsg{max(sr._pending)}"))
+                sr.on_inbound(self._quoted(text, seq=max(sr._pending)))
             judge.assert_not_called()
 
     def test_judge_failure_falls_back_to_heuristic(self):
@@ -965,26 +864,6 @@ class TestPendingNotLost(_Base):
         rep.assert_not_called()
         self.assertEqual(len(sr._pending), 1)
         self.assertIn("没有可放行的草稿", sup.call_args[0][0])
-
-    def test_pending_registered_before_card_msgid_lookup(self):
-        """反查卡片 msgId 是一次网络往返 —— 待审必须在它之前就登记好。
-
-        否则主管秒回「同意」时会找不到待审，被当成普通对话落到 text_reply（提问者的
-        ack 也就永远收不了尾，正是 #109 那类症状）。
-        """
-        seen = {}
-
-        def _slow_lookup(seq):
-            seen["pending_at_lookup"] = len(sr._pending)
-            return f"cardMsg{seq}"
-
-        with patch.object(sr, "_locate_card_msg_id", _slow_lookup), \
-             patch.object(sr, "generate_reply_ex", return_value=("草稿", "ok")), \
-             patch.object(sr, "_send_to_supervisor", return_value=True), \
-             patch.object(sr, "send_reply"):
-            sr._draft_and_forward("张三", "问题", "1", "cidZhang", "m1")
-        self.assertEqual(seen["pending_at_lookup"], 1)
-        self.assertEqual(sr._pending[1]["card_msg_id"], "cardMsg1")   # 回填成功
 
     def test_empty_rewrite_keeps_pending(self):
         self._escalate()

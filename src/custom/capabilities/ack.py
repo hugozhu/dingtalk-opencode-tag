@@ -540,6 +540,13 @@ def on_inbound(msg):
     """
     if msg.user in _SELF_NAMES:
         return False
+    if msg.kind == "reaction":
+        # 表情回应事件不是"一条要处理的消息"（#108）。不早退的话：它满足 _should_ack
+        # 的全部条件（主管发的、单聊、conv_id/msg_id 齐），于是 _begin 会顶掉
+        # _pending[主管conv] —— 把主管**正在处理的那条裁决消息**的 worker 提前收尾，
+        # 再给一个不存在的 msgId 反复贴表情，最后等满 65 分钟、每 5 分钟发一条
+        # 「仍在处理中」。主管贴一次表情 = 被打扰 13 次。
+        return False
     want_begin = _should_ack(msg)
     want_read = _should_mark_read(msg)
     do_begin, do_read = _note_and_plan(msg.msg_id, want_begin, want_read)

@@ -6,7 +6,7 @@
     → group_gate 放行 → ack 贴「处理中」→ supervisor_review 拦截
     → 后台出草稿 → 转交主管（卡片）→ 反查卡片 msgId → 登记待审
   主管给卡片贴 👍
-    → _poll_reactions_once 拉到表情 → _emoji_action → _execute_verdict(approve)
+    → bridge 产出的表情行 → classify_line → _on_reaction → _execute_verdict(approve)
     → 草稿发回**群里**，主管收到 ✅ 回执 —— 全程没打一个字
 
 同时验证 #107 D 的防误发：主管回一句「这个不太对」不能被当成答案公开发到群里。
@@ -37,7 +37,7 @@ os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "600"    # 不让超时兜底插进来
 _TMP = tempfile.mkdtemp(prefix="e2e-sup-")
 atexit.register(shutil.rmtree, _TMP, True)   # sys.exit 在前，收尾只能挂 atexit
 os.environ["SUPERVISOR_REVIEW_JOURNAL"] = os.path.join(_TMP, "reviews.jsonl")
-os.environ["SUPERVISOR_REACTION_POLL"] = "0.2"     # 轮询压到 0.2s
+os.environ["SUPERVISOR_REACTION_DEBOUNCE"] = "0"   # 不等反悔宽限期
 
 import custom.capabilities                          # noqa: E402  注册全部能力
 import custom.capabilities.ack as ACK               # noqa: E402
@@ -52,7 +52,6 @@ CARD_MSG = "msgCARD=="
 
 replies = []    # 真发给提问者的 (conv_id, text)
 cards = []      # 发给主管的卡片/回执
-reactions = {}  # 当前"钉钉上"卡片挂着的表情：msgId -> (emoji, user)
 
 
 def fake_send_impl(conv_id, conv_type, text, *, at_user_id=None):
@@ -68,21 +67,17 @@ def fake_card(text):
 
 
 def fake_run_cli(args, timeout=60):
-    """只实现本测用到的两个 dws 子命令。"""
-    if "list-emotion-replies" in args:
-        msgs = []
-        for mid, (emoji, user) in reactions.items():
-            msgs.append({"openMessageId": mid,
-                         "emotionReplyList": [{"emoji": emoji, "replyUsers": [user]}]})
+    """反查被贴表情的消息正文 —— 贴表情裁决靠它定位是第几号审核。"""
+    if "list-by-ids" in args:
         import json as _json
-        return 0, _json.dumps({"result": {"messages": msgs}})
+        return 0, _json.dumps({"result": {"messages": [
+            {"openMessageId": CARD_MSG, "content": "📋 **待审 #1**　来自：**boss**"}]}})
     return 0, "{}"
 
 
 CR.register_replier(fake_send_impl)
 SR._send_to_supervisor = fake_card
 SR._run_cli = fake_run_cli
-SR._locate_card_msg_id = lambda seq: CARD_MSG          # 反查卡片 msgId（真链路要调 dws list）
 SR.generate_reply_ex = lambda user, text, ctx=None: ("AI 草稿：我能干这些", "ok")
 ACK._mark_read = lambda conv_id, msg_id: True
 ACK._emotion_id = lambda emoji, text: ("eid", "bid")
@@ -90,9 +85,9 @@ ACK._add_text_emotion = lambda *a: True
 ACK._update_text_emotion = lambda *a: True
 ACK._run_cli = lambda args, timeout=15: (0, "{}")
 
-# 反证：退回 #107 之前的行为 —— 没有贴表情裁决（A），且认不出的短文本一律当答案（D）
+# 反证：关掉贴表情裁决（让事件行认不出）+ 认不出的短文本一律当答案
 if os.environ.get("E2E_SIMULATE_BUG") == "1":
-    SR._poll_reactions_once = lambda: 0
+    SR._on_reaction = lambda msg: None
     _orig_parse = SR._parse_verdict
     SR._parse_verdict = lambda t: (lambda r: (r[0], "rewrite", r[2])
                                    if r[1] == "unclear" else r)(_orig_parse(t))
@@ -129,12 +124,13 @@ v_no_leak = got_card and not replies          # 草稿不能落到群里
 print("\n=== 2) 卡片应该是瘦的（操作提示压成一行，草稿折叠）===")
 v_card_slim = "「#1 同意」放行" in card_text and card_text.count("回「") == 0
 
-print("\n=== 3) 主管给卡片贴 👍（零打字）===")
-reactions[CARD_MSG] = ("赞", "boss")
+print("\n=== 3) 主管给卡片贴 👍（零打字，走真实事件行）===")
+_rx = ("[connect] 表情回应 @boss: 赞 (convType=1 convId=e2e-sup "
+       f"reactedMsgId={CARD_MSG} reactionOp=add eventId=ev-1)")
+dispatch_inbound(SR.classify_line(_rx))
 v_approved = _wait(lambda: replies)
 
 print("\n=== 4) 换一条：主管回「这个不太对」——不能被当成答案发到群里 ===")
-reactions.clear()
 replies.clear()
 cards.clear()
 _ask(text="@一粟 报销怎么走", msg_id="m-grp-2")

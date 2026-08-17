@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import unittest
+import unittest.mock
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BRIDGE_PATH = os.path.join(PROJECT_ROOT, "bin", "custom", "dws_event_bridge.py")
@@ -300,6 +301,54 @@ class TestQuotedMessage(unittest.TestCase):
         self.assertEqual(msg.conv_id, "cidQ==")
         self.assertEqual(msg.msg_id, "msgQ==")
         self.assertEqual(msg.text, "改：这样答")
+
+
+class TestReactionEvent(unittest.TestCase):
+    """表情回应事件 → 专用行（#108）。"""
+
+    @staticmethod
+    def _rx(operator="hugozhu", name="赞", op="add"):
+        return {
+            "type": "user_im_message_reaction_o2o", "event_id": "ev-rx-1",
+            "operator": operator, "reaction_name": name, "reaction_text": name,
+            "operation_type": op, "message_id": "msgCARD==",
+            "conversation_id": "cidSUP==", "sender": "一粟",
+        }
+
+    def test_reaction_line_fields(self):
+        line = bridge._to_connect_line(self._rx())
+        self.assertIn("表情回应 @hugozhu: 赞", line)
+        self.assertIn("convType=1", line)           # 必须登记为单聊，否则被 group_gate 吞
+        self.assertIn("reactedMsgId=msgCARD==", line)
+        self.assertIn("reactionOp=add", line)
+        self.assertIn("eventId=ev-rx-1", line)
+
+    def test_reaction_line_is_not_a_normal_message(self):
+        """必须**不匹配** core 的 _REPLY_RE —— 能力关掉时它只是条惰性日志，不喂大脑。"""
+        import sys
+        src = os.path.join(PROJECT_ROOT, "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from core.inbound import parse_line
+        self.assertIsNone(parse_line(bridge._to_connect_line(self._rx())))
+
+    def test_own_reaction_is_dropped(self):
+        """ack 给主管每条消息贴的状态表情会**回声**成 reaction 事件（实测确认）。
+
+        不在这里挡掉，每条主管消息就有 3-N 条无用事件涌进 connect log。
+        """
+        with unittest.mock.patch.object(bridge, "_SELF_NAMES", {"一粟"}):
+            self.assertIsNone(bridge._to_connect_line(self._rx(operator="一粟")))
+
+    def test_remove_op_passed_through(self):
+        """撤表情也要透传 —— 能力用它取消宽限期内的裁决。"""
+        self.assertIn("reactionOp=remove",
+                      bridge._to_connect_line(self._rx(op="remove")))
+
+    def test_reaction_without_name_dropped(self):
+        evt = self._rx()
+        evt["reaction_name"] = evt["reaction_text"] = ""
+        self.assertIsNone(bridge._to_connect_line(evt))
 
 
 if __name__ == "__main__":

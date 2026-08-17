@@ -147,6 +147,18 @@ class TestAwaitingReply(unittest.TestCase):
             self.assertTrue(gg.on_inbound(_msg(text="同意", at=False, conv_id="cidG")))
 
 
+class TestReactionKind(unittest.TestCase):
+    def setUp(self):
+        gg._reset()
+
+    def test_reaction_passes_through(self):
+        """表情回应事件不归群闸门管（#108）—— 吞掉的话 supervisor_review 永远收不到。"""
+        m = _msg(text="", at=False, conv_id="cidSup")
+        m.kind = "reaction"
+        m.conv_type = "1"
+        self.assertFalse(gg.on_inbound(m))
+
+
 class TestWiring(unittest.TestCase):
     def test_priority_after_ack_before_talkers(self):
         """必须晚于 trace(0)/ack(1)——群消息照常记账+标已读；早于任何会开口/认命令的能力。"""

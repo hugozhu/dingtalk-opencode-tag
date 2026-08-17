@@ -116,6 +116,8 @@ def _offer_to_awaiting(msg):
 
 def on_inbound(msg):
     """群消息闸门。返回 True=吞掉（不再往下传），False=放行给后续能力。"""
+    if msg.kind == "reaction":
+        return False                      # 表情回应事件不归闸门管（#108）
     if str(msg.conv_type) != _CONV_TYPE_GROUP:
         return False                      # 单聊照常
     at_me = bool(msg.extra.get("at_mention"))

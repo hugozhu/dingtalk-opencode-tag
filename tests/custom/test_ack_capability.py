@@ -186,6 +186,20 @@ class TestOnInbound(unittest.TestCase):
             self.assertFalse(ack.on_inbound(_msg(user="数字员工")))
             beg.assert_not_called()
 
+    def test_reaction_kind_is_ignored(self):
+        """表情回应事件不能起 ack worker（#108）。
+
+        不早退的话它满足 _should_ack 的全部条件（主管发的、单聊、id 齐），_begin 会顶掉
+        _pending[主管conv] —— 把主管**正在处理的那条裁决消息**的 worker 提前收尾，再给
+        一个不存在的 msgId 反复贴表情，最后等满 65 分钟、每 5 分钟发一条「仍在处理中」。
+        主管贴一次表情 = 被打扰 13 次。
+        """
+        with patch.object(ack, "_begin") as beg:
+            self.assertFalse(ack.on_inbound(_msg(kind="reaction")))
+            beg.assert_not_called()
+        with ack._pending_lock:
+            self.assertEqual(len(ack._pending), 0)
+
     def test_dedup(self):
         with patch.object(ack, "_begin") as beg:
             ack.on_inbound(_msg(msg_id="d=="))

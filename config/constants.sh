@@ -179,11 +179,13 @@ export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-0}"
 export AGENT_SUPERVISOR_ALIASES="${AGENT_SUPERVISOR_ALIASES:-}"
 
 # --- 裁决交互（#107）：让主管少打字 ---
-# 贴表情裁决：主管直接给待审卡片贴个表情就完成裁决，最高频的「同意」降到一次点击。
-# 实现是轮询卡片上的表情回应（list-emotion-replies），不是订阅 reaction 事件 —— 后者的
-# msgId 是被贴表情那条原消息的 id，会和 ack/group_gate 的 msgId 表撞车。
-# 秒=轮询间隔；0=关闭（退回纯文字裁决）。没有待审时不发任何请求。
-export SUPERVISOR_REACTION_POLL="${SUPERVISOR_REACTION_POLL:-5}"
+# 贴表情裁决：主管给**任意一条**审核相关消息贴个表情就完成裁决（#108）。
+# 走事件订阅 user_im_message_reaction_o2o（只订阅主管一人），不再轮询 —— 于是待审结束
+# 之后、甚至重启之后贴的表情照样有效。订阅由 bin/custom/dws-connect.sh 在"配了
+# AGENT_SUPERVISOR_USER_ID 且开了 CAP_SUPERVISOR_REVIEW_ENABLED"时自动起。
+# 贴错立刻撤的宽限期（秒）：事件驱动后每次贴都是不可撤的即时裁决，而"手滑把没审过的
+# 草稿公开发到群里"不该是一键操作。宽限期内撤掉表情就取消。0=不宽限，立即执行。
+export SUPERVISOR_REACTION_DEBOUNCE="${SUPERVISOR_REACTION_DEBOUNCE:-3}"
 # 表情名 → 裁决。注意钉钉返回的是**表情名**而非 unicode 码点，各客户端叫法可能不同：
 # 认不出的表情不会被当成裁决，数字员工会问一句并把真实名字记进 monitor.log，按需补进这里。
 export SUPERVISOR_APPROVE_EMOJIS="${SUPERVISOR_APPROVE_EMOJIS:-赞,好的,OK,👍,✅}"

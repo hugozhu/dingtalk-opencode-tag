@@ -65,7 +65,7 @@ from collections import OrderedDict
 from core.agent_common import PROFILE, env_flag, log, submit_reply, _run_cli
 from core.brain import generate_reply_ex
 from core.capabilities import Capability, dispatch_reply_sent, register
-from core.inbound import KIND_TEXT, parse_line
+from core.inbound import InboundMessage, KIND_TEXT, parse_line
 from core.replier import send_reply
 from custom.identity import is_supervisor, supervisor_id, supervisor_names
 
@@ -79,8 +79,6 @@ _CONV_TYPE_O2O = "1"
 # 知识库路径（相对 PROJECT_DIR）
 _KNOWLEDGE_FILE = os.environ.get("AGENT_KNOWLEDGE_FILE", "knowledge/supervisor_qa.jsonl")
 
-# 贴表情裁决（#107 A）：轮询待审卡片上的表情，秒=间隔，0=关闭（退回纯文字裁决）
-_REACTION_POLL = float(os.environ.get("SUPERVISOR_REACTION_POLL", "5") or 0)
 # 表情 → 裁决映射。钉钉在 list-emotion-replies 里返回的**表情名**（不是 unicode 码点），
 # 各客户端/版本可能不同 —— 认不出的表情不猜，回主管问一句并把名字记进日志，见 _emoji_action。
 _APPROVE_EMOJIS = {e.strip() for e in os.environ.get(
@@ -109,10 +107,6 @@ _CARD_DRAFT_MAX_LINES = _env_int("SUPERVISOR_CARD_DRAFT_MAX_LINES", 12)
 _UNCLEAR_MAX_LEN = _env_int("SUPERVISOR_UNCLEAR_MAX_LEN", 8)
 # 引用回复的内容是否交大模型判"能不能原样发给提问者"。0=关（退回长度启发式）
 _JUDGE_QUOTED = env_flag("SUPERVISOR_JUDGE_QUOTED", default=True)
-# 数字员工自己的显示名（反查自己发的卡片用）。默认值与 ack/forward 对齐 —— 留空会让
-# _locate_card_msg_id 里的发送人校验静默失效（那正是防止匹配到主管引用回显的那道闸）。
-_SELF_NAMES = {n.strip() for n in os.environ.get(
-    "AGENT_SELF_NAMES", "数字员工,Claude Code").split(",") if n.strip()}
 
 # 裁决关键词。approve 收得比 ignore 宽：主管想放行时说法五花八门（「可以发」「就这样」），
 # 认不出就会掉进 rewrite 把这几个字当答案公开发出去 —— 这是 #107 要修的事故。
@@ -122,8 +116,7 @@ _IGNORE_KEYWORDS = {"忽略", "不回", "跳过", "ignore", "skip", "算了", "�
 # 无歧义改写前缀：主管显式声明"下面是答案"，跳过一切猜测
 _REWRITE_PREFIXES = ("改：", "改:", "答：", "答:", "更正：", "更正:")
 
-# 待审表：seq -> {asker, asker_conv_id, asker_conv_type, question, draft, ts, timer,
-#                card_msg_id}
+# 待审表：seq -> {asker, asker_conv_id, asker_conv_type, question, draft, ts, timer}
 _pending = {}
 _pending_lock = threading.Lock()
 _seq_counter = 0
@@ -146,22 +139,17 @@ _replayed = False
 _history = OrderedDict()
 _HISTORY_MAX = 256
 
-# 表情轮询线程（单例，懒启动；没有待审时自行退出，下次转交再拉起）
-_poller_thread = None
-_poller_lock = threading.Lock()
-_poller_stop = threading.Event()
-
-# 已处理过的表情：(card_msg_id, emoji) -> True，有界 FIFO。
-# **表情是"状态"不是"事件"**：主管贴上去就一直挂在那，每轮轮询都会重新读到。没有这张表
-# 的话，任何"没能真正裁完"的分支（如同意但没草稿 → 待审放回去）都会被下一轮重新触发，
-# 变成每 5 秒给主管发一条同样的提示、且超时定时器被反复重置，提问者永远等不到兜底。
-_handled_reactions = OrderedDict()
-_HANDLED_MAX = 512
-
-# 发过的卡片：card_msg_id -> seq，有界 FIFO。待审注销后仍保留一小段时间，用来分辨
-# "主管引用了一张已处理的旧卡片"（该告诉他已处理）与"引用了别的消息"（该回落到最近一条）。
-_card_history = OrderedDict()
-_CARD_HISTORY_MAX = 256
+# 表情回应事件（#108）：bridge 产出的专用行，kind 定义在 custom（core 不解读 kind，
+# 不必为此改 core/inbound.py）
+KIND_REACTION = "reaction"
+_REACTION_RE = re.compile(
+    r"^\[connect\] 表情回应 @(?P<op>.+?): (?P<name>.+?) \(convType=(?P<ct>\d+) "
+    r"convId=(?P<conv>[^\s)]*) reactedMsgId=(?P<mid>[^\s)]*) "
+    r"reactionOp=(?P<rop>[^\s)]*) eventId=(?P<eid>[^\s)]*)\)")
+# 贴错了立刻撤的宽限期（秒）。轮询时代 5s 内撤掉等于没发生，改成事件驱动后每次贴都是
+# **不可撤的即时裁决**，而"手滑把没审过的草稿公开发到群里"不该是一键操作。0=不宽限。
+_REACTION_DEBOUNCE = float(os.environ.get("SUPERVISOR_REACTION_DEBOUNCE", "3") or 0)
+_debounce_timers = {}
 
 # 引用回复的标记（bridge 在行尾追加，见 classify_line）
 _QUOTED_RE = re.compile(r"\bquotedMsgId=([^\s)]+)")
@@ -236,10 +224,7 @@ def _scene(conv_type):
 
 
 def _card_marker(seq):
-    """卡片首行的唯一前缀 —— 发完之后靠它把自己那条捞回来（见 _locate_card_msg_id）。
-
-    `**` 收尾保证 #1 不会前缀命中 #11。
-    """
+    """卡片首行的唯一前缀。`**` 收尾保证 #1 不会前缀命中 #11。"""
     return f"📋 **待审 #{seq}**"
 
 
@@ -260,11 +245,7 @@ def _fold_draft(draft):
 def _card_actions(seq):
     """卡片底部的操作提示 —— 压成一行，别把草稿挤下去。"""
     line = f"「#{seq} 同意」放行 / 「#{seq} 忽略」不回 / 「#{seq} 改：<答案>」改写"
-    if _REACTION_POLL > 0:
-        # 标明"限待审期间"：引用回复随时可用，贴表情暂时还只在待审挂着时有效（轮询在
-        # 待审清空后就退出）。不写清楚，主管会以为两条通道一样随时可用而踩空。
-        line += "　贴 👍 / ❌ 也行（限待审期间）"
-    return line
+    return line + "　贴 👍 / ❌ 也行"
 
 
 def _render_card(seq, asker, question, draft, conv_type=_CONV_TYPE_O2O):
@@ -382,7 +363,6 @@ def _repend(seq, p):
         _pending[seq] = p
     if p["timer"]:
         p["timer"].start()
-    _ensure_poller()   # 轮询线程可能已因空闲退出，放回待审就得把它拉起来
 
 
 def _asker_label(p):
@@ -398,17 +378,6 @@ def _latest_seq():
         if not _pending:
             return None
         return max(_pending, key=lambda s: _pending[s]["ts"])
-
-
-def _seq_by_card_msg_id(msg_id):
-    """按卡片 msgId 反查待审 seq（引用回复裁决用，#107 B）。无匹配返回 None。"""
-    if not msg_id:
-        return None
-    with _pending_lock:
-        for seq, p in _pending.items():
-            if p.get("card_msg_id") == msg_id:
-                return seq
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -617,45 +586,75 @@ def _record_knowledge(question, answer, asker=""):
 # 正是 DWS_EVENT_O2O_ALL=1。轮询把改动全锁在本文件里，代价只是最多一个轮询周期的延迟。
 # ---------------------------------------------------------------------------
 
-def _locate_card_msg_id(seq):
-    """反查刚发出的待审卡片自己的 msgId（贴表情裁决靠它轮询）。取不到返回 ""。
+# 与 bridge 的 _REVIEW_SEQ_RE 同一套规则：锚在正文开头，防外部可控文本注入假编号
+_REVIEW_SEQ_RE = re.compile(r"^\s*[^\w\s]*\s*\**待审\s*#(\d+)")
 
-    `dws chat message send` 返回的是 openTaskId 不是 msgId（见 query-send-status --help），
-    所以只能发完再从主管单聊里把这条捞回来，按卡片首行前缀匹配**自己发的**那条。
-    校验发送人很重要：主管引用卡片回复时，他那条消息的正文里也会带卡片原文。
+
+def _seq_of_message(msg_id):
+    """被贴表情的那条消息属于第几号审核；认不出返回 None。
+
+    取回正文再抽「待审 #N」，与引用回复用的是同一套解析 —— 于是**8 种消息都能贴表情**
+    （以前只有卡片行），而且不用再维护 msgId 索引。代价是一次 CLI 往返，但这是人工动作、
+    低频，比原来每 5s 一次的轮询便宜两个数量级。
     """
-    sid = _supervisor_id()
-    if not sid:
-        return ""
-    # **不能用本地时间当锚点**：守护进程由 reboot.sh 以 `env -i` 拉起，TZ 不被继承 → 进程
-    # 跑在 UTC，而钉钉的时间戳是 CST，差 8 小时。而 `--time` 是"从这个点往后取最旧的 N 条"，
-    # 锚点偏早 8 小时就会取到一堆历史消息、刚发的卡片反而不在结果里；更糟的是重启后
-    # `_seq_counter` 归零，历史里那张同号的旧卡片会被匹配上，于是轮询一直盯着**上一轮的
-    # 卡片**，主管贴在新卡片上的表情永远读不到，还全程不报错。
-    # 改成 `--direction older` + 一个必然在未来的锚点：结果是"从最新往回数 N 条"，
-    # 与进程时区差多少都无关，刚发出的卡片必在最前面。
-    anchor = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 86400))
-    rc, out = _run_cli(["chat", "message", "list", "--user", sid,
-                        "--time", anchor, "--direction", "older", "--limit", "30"])
+    if not msg_id:
+        return None
+    rc, out = _run_cli(["chat", "message", "list-by-ids", "--msg-ids", msg_id])
     if rc != 0:
-        log(f"supervisor_review: #{seq} 反查卡片 msgId 失败 rc={rc} out={out[:120]}")
-        return ""
+        log(f"supervisor_review: 取被贴表情的消息失败 rc={rc} out={out[:120]}")
+        return None
     try:
         msgs = (json.loads(out).get("result") or {}).get("messages") or []
     except (ValueError, AttributeError, TypeError) as e:
-        log(f"supervisor_review: #{seq} 卡片列表解析失败 {e}")
-        return ""
-    marker = _card_marker(seq)
+        log(f"supervisor_review: 解析被贴表情的消息失败 {e}")
+        return None
     for m in msgs:
-        if m.get("sender") not in _SELF_NAMES:
-            continue
-        if (m.get("content") or "").lstrip().startswith(marker):
-            return m.get("openMessageId", "") or ""
-    # 找不到就只能走文字裁决 —— 这条日志是唯一线索，别静默（常见原因：AGENT_SELF_NAMES
-    # 与钉钉上的真实显示名对不上，或者短时间发了太多消息把卡片挤出窗口）
-    log(f"supervisor_review: #{seq} 未在主管会话里找回卡片（自称 {sorted(_SELF_NAMES)}），"
-        f"贴表情/引用裁决对这条不可用")
-    return ""
+        hit = _REVIEW_SEQ_RE.match(str(m.get("content") or ""))
+        if hit:
+            return int(hit.group(1))
+    return None
+
+
+def _on_reaction(msg):
+    """主管给某条审核消息贴了表情 → 裁决。跑在 reply pool，不在入站线程里。"""
+    extra = msg.extra or {}
+    emoji = extra.get("reaction") or ""
+    action = _emoji_action(emoji)
+    seq = _seq_of_message(extra.get("reacted_msg_id"))
+    if seq is None:
+        log(f"supervisor_review: 表情 {emoji!r} 贴在非审核消息上，忽略")
+        return
+    if action is None:
+        _report_unknown_emoji(seq, emoji)
+        return
+    target, err = _target_from_seq(seq, "")
+    if target is None:
+        _send_to_supervisor(err or f"⚠️ 待审 #{seq} 处理不了。")
+        return
+    _execute_verdict(target, action, source=f"贴「{emoji}」")
+
+
+def _schedule_reaction(msg):
+    """给贴表情留一点反悔时间，然后执行。
+
+    轮询时代贴错了 5 秒内撤掉等于没发生；改成事件驱动后每一次贴都是**不可撤的即时
+    裁决**，而"手滑把一条没审过的草稿公开发到群里"不该是一键就能干成的事。
+    宽限期内撤掉（reactionOp=remove）就取消。
+    """
+    key = (msg.extra.get("reacted_msg_id"), msg.extra.get("reaction"))
+    old = _debounce_timers.pop(key, None)
+    if old:
+        old.cancel()
+    if msg.extra.get("reaction_op") == "remove":
+        log(f"supervisor_review: 主管撤回了表情 {key[1]!r}，取消该裁决")
+        return
+    if _REACTION_DEBOUNCE <= 0:
+        submit_reply(_on_reaction, msg)
+        return
+    t = threading.Timer(_REACTION_DEBOUNCE, lambda: submit_reply(_on_reaction, msg))
+    t.daemon = True
+    _debounce_timers[key] = t
+    t.start()
 
 
 def _supervisor_emojis(entries):
@@ -703,87 +702,6 @@ def _report_unknown_emoji(seq, emoji):
         f"{'/'.join(sorted(_IGNORE_EMOJIS)[:3])}，或直接回「#{seq} 同意」。")
 
 
-def _poll_reactions_once():
-    """拉一轮卡片表情 → 命中主管贴的就裁决。返回本轮执行的裁决条数。
-
-    一次 CLI 拉全部待审（--msg-ids 支持逗号分隔），没有待审就完全不发请求。
-    **每个 (卡片, 表情) 只作用一次**：表情贴上去会一直挂在消息上，每轮都读得到，
-    不记账的话任何没裁干净的分支都会被无限重放（见 _handled_reactions）。
-    """
-    with _pending_lock:
-        cards = {p["card_msg_id"]: seq for seq, p in _pending.items() if p.get("card_msg_id")}
-    if not cards:
-        return 0
-    rc, out = _run_cli(["chat", "message", "list-emotion-replies",
-                        "--msg-ids", ",".join(cards)])
-    if rc != 0:
-        log(f"supervisor_review: 拉表情失败 rc={rc} out={out[:120]}")
-        return 0
-    try:
-        msgs = (json.loads(out).get("result") or {}).get("messages") or []
-    except (ValueError, AttributeError, TypeError) as e:
-        log(f"supervisor_review: 表情返回解析失败 {e}")
-        return 0
-    done = 0
-    for m in msgs:
-        card_id = m.get("openMessageId", "")
-        seq = cards.get(card_id)
-        if seq is None:
-            continue
-        emojis = _supervisor_emojis(m.get("emotionReplyList"))
-        # 先找认得出的那个：主管可能误贴过别的表情，不该被它挡住
-        actionable = [(e, _emoji_action(e)) for e in emojis]
-        hit = next(((e, a) for e, a in actionable if a), None)
-        if hit is None:
-            for e, _ in actionable:
-                if _remember(_handled_reactions, (card_id, e), _HANDLED_MAX):
-                    _report_unknown_emoji(seq, e)
-            continue
-        emoji, action = hit
-        if not _remember(_handled_reactions, (card_id, emoji), _HANDLED_MAX):
-            continue   # 这个表情上一轮已经处理过了
-        if _execute_verdict(seq, action, source=f"贴「{emoji}」"):
-            done += 1
-    return done
-
-
-def _reaction_poller():
-    """表情轮询循环。先拉一次再等（do-while），保证至少跑一轮。
-
-    没有待审就退出线程 —— 守护进程 7x24 跑着，留个空转线程每 5s 抢一次锁毫无意义。
-    下次转交待审时 _ensure_poller 会重新拉起。
-    """
-    while not _poller_stop.is_set():
-        try:
-            _poll_reactions_once()
-        except Exception as e:   # 轮询挂了不能把线程带走，否则贴表情从此静默失效
-            log(f"supervisor_review: 表情轮询异常 {e}")
-        with _pending_lock:
-            idle = not _pending
-        if idle:
-            break
-        _poller_stop.wait(_REACTION_POLL)
-    with _poller_lock:
-        global _poller_thread
-        if _poller_thread is threading.current_thread():
-            _poller_thread = None
-
-
-def _ensure_poller():
-    """懒启动表情轮询线程（单例）。空闲退出后由下一条待审重新拉起。"""
-    global _poller_thread
-    if _REACTION_POLL <= 0:
-        return
-    with _poller_lock:
-        if _poller_thread is not None and _poller_thread.is_alive():
-            return
-        _poller_stop.clear()
-        _poller_thread = threading.Thread(target=_reaction_poller, daemon=True,
-                                          name="supervisor-reaction-poll")
-        _poller_thread.start()
-        log(f"supervisor_review: 表情轮询已启动（每 {_REACTION_POLL}s）")
-
-
 # ---------------------------------------------------------------------------
 # 拦截：生成草稿 → 转交主管
 # ---------------------------------------------------------------------------
@@ -828,7 +746,6 @@ def _revive_seq(seq):
         "draft": rec.get("draft") or "",
         "ts": time.time(),
         "timer": None,
-        "card_msg_id": "",
     })
     _remember_history(seq, state="open")
     log(f"supervisor_review: #{seq} 主管事后补裁，已从历史重新挂回待审")
@@ -875,29 +792,15 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
             "draft": draft or "",
             "ts": time.time(),
             "timer": timer,
-            "card_msg_id": "",     # 稍后回填（见下）
         }
     if timer:
         timer.start()
-    _ensure_poller()
     _journal_append({"t": "open", "n": seq, "asker": user, "conv_id": conv_id,
                      "conv_type": conv_type, "q": text, "draft": draft or "",
                      "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
     _remember_history(seq, state="open", asker=user, asker_conv_id=conv_id,
                       asker_conv_type=conv_type, question=text, draft=draft or "")
     log(f"supervisor_review: #{seq} 已转交主管审核 asker={user} q={text[:40]!r}")
-
-    # 卡片自己的 msgId：贴表情裁决(A)与引用回复裁决(B)都靠它定位。取不到只是这两条路走
-    # 不通，「#N 同意」照常。**在锁外做**：这是一次网络往返，攥着 _pending_lock 会把轮询
-    # 线程一起堵住。**排在补发全文之前**：反查是按时间窗口 + 前缀找自己那条，先发别的
-    # 消息等于把要找的卡片往后挤。回填时待审可能已经被裁掉了（主管手快），所以要判在不在。
-    card_msg_id = _locate_card_msg_id(seq)
-    if card_msg_id:
-        _remember(_card_history, card_msg_id, _CARD_HISTORY_MAX)
-        _card_history[card_msg_id] = seq
-        with _pending_lock:
-            if seq in _pending:
-                _pending[seq]["card_msg_id"] = card_msg_id
 
     # 草稿被折叠了就把全文补一条（卡片只留前几行，见 _fold_draft）
     _, full = _fold_draft(draft)
@@ -1047,8 +950,8 @@ def _unclear_hint(seq, text):
         # seq 必须在最前：引用定位的正则锚在正文开头，若把主管原话放前面，他话里带的
         # 「待审 #3」会被当成本条的编号
         f"🤔 待审 #{seq} 仍在——没听懂「{text[:30]}」。",
-        f"放行回「#{seq} 同意」" + ("或直接贴 👍；" if _REACTION_POLL > 0 else "；"),
-        f"不回复回「#{seq} 忽略」" + ("或贴 ❌；" if _REACTION_POLL > 0 else "；"),
+        f"放行回「#{seq} 同意」或直接贴 👍；",
+        f"不回复回「#{seq} 忽略」或贴 ❌；",
         f"要改写回「#{seq} 改：<你的答案>」。",
     ])
 
@@ -1066,9 +969,7 @@ def _resolve_target(msg, typed_seq):
     extra = msg.extra or {}
     quoted_id = extra.get("quoted_msg_id")
     if extra.get("quoted") or quoted_id:
-        seq = _seq_by_card_msg_id(quoted_id)          # 精确：正挂着的卡片
-        if seq is None:
-            seq = extra.get("quoted_seq")             # 正文里的「待审 #N」
+        seq = extra.get("quoted_seq")             # 被引用正文里的「待审 #N」
         if seq is None:
             return None, ("🤔 你引用的这条我对不上号（不像是某次待审的消息）。"
                           "要裁决请引用那次审核的卡片或回执，或直接回「#N …」。")
@@ -1154,6 +1055,15 @@ def on_inbound(msg):
     **裁决只认主管单聊**：群里主管发的一律当新提问送审（#107）。群消息本就是冲着
     数字员工来的，若也拿去解析裁决，主管在群里说一句「同意」就会放行另一个人的待审。
     """
+    if msg.kind == KIND_REACTION:
+        # **必须在最前面拦掉**：本函数最后一个分支是无条件送审，杂散表情事件（比如
+        # operator 没匹配上主管名）会掉进去，给一个空问题生成草稿、再发一张假卡片。
+        if _is_supervisor(msg.user):
+            _schedule_reaction(msg)
+        else:
+            log(f"supervisor_review: 忽略非主管 {msg.user!r} 的表情回应")
+        return True
+
     is_o2o = str(msg.conv_type) == _CONV_TYPE_O2O
     if _O2O_ONLY and not is_o2o:
         return False   # 显式配了只审单聊 → 群聊放行
@@ -1193,6 +1103,19 @@ def classify_line(line):
     classify_line 正是 core 为这种情况留的口子（见 core/capabilities.py）——这里**复用
     parse_line 解析正文**，只补几个字段，零 core 改动。返回 None 则交回 core 标准解析。
     """
+    m = _REACTION_RE.match(line or "")
+    if m:
+        # msg_id 填 **event_id**：core 的声明式 dedup 按 msg_id 记，正好等于按事件去重
+        # （dws 是 at-least-once，重连会重投）。若填被贴表情那条消息的 id，同一条消息被
+        # 反复贴/撤就会被 core 当成重复而吞掉。event_id 缺失时用内容合成一个。
+        eid = m.group("eid") or f"{m.group('mid')}:{m.group('name')}:{m.group('rop')}"
+        return InboundMessage(
+            user=m.group("op"), text="", conv_type=m.group("ct"),
+            conv_id=m.group("conv"), msg_id=eid, kind=KIND_REACTION,
+            raw_line=line,
+            extra={"reacted_msg_id": m.group("mid"), "reaction": m.group("name"),
+                   "reaction_op": m.group("rop")})
+
     tail = _line_tail(line)
     if "quotedMsgId=" not in tail:
         return None
@@ -1213,15 +1136,13 @@ def classify_line(line):
 
 # 测试用：清空待审 + 重置短号 + 停轮询
 def _reset():
-    global _seq_counter, _poller_thread
-    with _poller_lock:
-        old = _poller_thread
-        _poller_thread = None
-    _poller_stop.set()
-    # 等旧线程真正退出再放行：不 join 的话它还睡在 wait() 里，下一次 _ensure_poller
-    # 的 _poller_stop.clear() 会把它一起唤醒，于是有两个轮询线程抢同一张待审表。
-    if old is not None and old.is_alive() and old is not threading.current_thread():
-        old.join(timeout=2.0)
+    global _seq_counter
+    for t in list(_debounce_timers.values()):
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    _debounce_timers.clear()
     with _pending_lock:
         for p in _pending.values():
             if p.get("timer"):
@@ -1231,8 +1152,6 @@ def _reset():
                     pass
         _pending.clear()
         _seq_counter = 0
-    _handled_reactions.clear()
-    _card_history.clear()
     # 只清内存，**不碰流水文件**。replay 单独可调（_ensure_replayed）—— 单测的 setUp
     # 是先 _reset() 后 patch 路径的，若在这里读盘就会去读真实的 knowledge/ 文件。
     _history.clear()
@@ -1244,7 +1163,7 @@ CAPABILITY = Capability(
     name="supervisor_review",
     on_inbound=on_inbound,
     classify_line=classify_line,   # 认领带引用信息的行（#107 B）
-    handles_kinds={KIND_TEXT},
+    handles_kinds={KIND_TEXT, KIND_REACTION},
     priority=30,             # 晚于 question20/permission15，早于 image40/forward50/text100
     default_enabled=False,   # 显式开（改变默认回复行为，不该悄悄生效）
     loop_guard=True,         # 数字员工自己发的不处理

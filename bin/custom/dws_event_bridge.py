@@ -31,7 +31,16 @@ _CONV_TYPE_BY_EVENT = {
     "user_im_message_receive_o2o_all": 1,   # rule_type=all 的全量单聊订阅
     "user_im_message_receive_at": 2,
     "user_im_message_receive_group": 2,
+    "user_im_message_reaction_o2o": 1,      # 主管给消息贴表情（#108）
 }
+
+# 表情回应事件：主管给数字员工发的消息贴 👍/❌ 即完成裁决（#108）
+_REACTION_EVENT = "user_im_message_reaction_o2o"
+# 数字员工自己的显示名 —— **必须过滤自己贴的表情**：ack 会给主管的每条消息贴
+# 「收到/处理中/完成」文字表情，每一次都会回声成一条 reaction 事件（实测确认）。
+# 不在这里挡掉，每条主管消息就会有 3-N 条无用事件涌进 connect log。
+_SELF_NAMES = {n.strip() for n in os.environ.get(
+    "AGENT_SELF_NAMES", "数字员工,Claude Code").split(",") if n.strip()}
 
 # 格式健康检查阈值：收到 >= 该条数原始事件却成功解析 0 条 → 大概率 dws 输出格式与
 # bridge 解析不匹配（如 dws 升级改了格式），此时数字员工收不到任何消息但进程/连接全绿，
@@ -109,6 +118,26 @@ def _quoted_msg_id(src):
     return ""
 
 
+def _reaction_line(evt, conv_type):
+    """表情回应事件 → 专用 connect 行；不是表情事件/该忽略则返回 None。
+
+    这条行**故意不匹配 core.inbound 的 _REPLY_RE**（它要求 "收到 @"）—— 于是
+    supervisor_review 关掉时，它只是 connect log 里一条惰性日志，不会被当成普通消息
+    喂给大脑。认领它的是 supervisor_review.classify_line。
+    """
+    operator = str(evt.get("operator") or "")
+    if operator in _SELF_NAMES:
+        return None          # 自己贴的（ack 的状态表情）—— 回声，丢掉
+    name = str(evt.get("reaction_name") or evt.get("reaction_text") or "").strip()
+    reacted = evt.get("message_id") or ""
+    if not name or not reacted:
+        return None
+    tail = (f"convType={conv_type} convId={evt.get('conversation_id','')} "
+            f"reactedMsgId={reacted} reactionOp={evt.get('operation_type','add')} "
+            f"eventId={evt.get('event_id','')}")
+    return f"[connect] 表情回应 @{operator}: {name} ({tail})"
+
+
 def _to_connect_line(evt):
     """把一个 dws 事件对象转成 connect-log 行；无法解析返回 None。
 
@@ -150,6 +179,10 @@ def _to_connect_line(evt):
     # 打标 atMention=1 让 core.inbound.parse_line 解析进 extra['at_mention']，供 ack 回执判定
     # “群里被 @”这一路（#46）。放在 msgId 之后、) 之前——_CONVID_RE/_MSGID_RE 止于空白/)，不受影响。
     at_mention = etype == "user_im_message_receive_at"
+
+    # 表情事件没有 content，必须在下面那道 `if not content` 之前分支出去，否则被静默丢掉
+    if etype == _REACTION_EVENT:
+        return _reaction_line(evt, conv_type)
 
     if not content:
         return None
