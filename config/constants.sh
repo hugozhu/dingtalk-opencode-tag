@@ -214,6 +214,15 @@ export SUPERVISOR_JUDGE_QUOTED="${SUPERVISOR_JUDGE_QUOTED:-1}"
 export SUPERVISOR_REVIEW_JOURNAL="${SUPERVISOR_REVIEW_JOURNAL:-knowledge/supervisor_reviews.jsonl}"
 # 启动时只回放流水末尾这么多字节（跑久了文件会很大，全量解析拖慢每次重启）
 export SUPERVISOR_REVIEW_JOURNAL_TAIL="${SUPERVISOR_REVIEW_JOURNAL_TAIL:-262144}"
+# 消息落盘存储（capabilities/msgstore_cap + custom/msgstore，#111）：任何会话进出的每条
+# 消息收到即落盘，事后按 msgId 查回是一次本地查表。在此之前数字员工其实是"把钉钉当存储"
+# ——引用旧消息裁决要靠正文里的「待审 #N」标记 + list-by-ids 回读，没标记的消息完全定位
+# 不了。目录结构：<DIR>/<会话id 百分号编码>/<YYYY-MM-DD>.jsonl，按天分片便于整文件清理。
+# 关掉只影响"事后查回"，不影响消息收发。
+export CAP_MSGSTORE_ENABLED="${CAP_MSGSTORE_ENABLED:-1}"
+export AGENT_MSGSTORE_DIR="${AGENT_MSGSTORE_DIR:-knowledge/messages}"
+export AGENT_MSGSTORE_KEEP_DAYS="${AGENT_MSGSTORE_KEEP_DAYS:-30}"   # 超期整分片删掉
+export AGENT_MSGSTORE_TEXT_MAX="${AGENT_MSGSTORE_TEXT_MAX:-4000}"   # 单条正文上限（截断标记 trunc）
 # 知识库（JSONL，相对 PROJECT_DIR）。AGENT_KNOWLEDGE_MAX=0 可关闭知识注入。
 export AGENT_KNOWLEDGE_FILE="${AGENT_KNOWLEDGE_FILE:-knowledge/supervisor_qa.jsonl}"
 export AGENT_KNOWLEDGE_MAX="${AGENT_KNOWLEDGE_MAX:-20}"

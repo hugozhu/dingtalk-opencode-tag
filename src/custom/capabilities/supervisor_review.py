@@ -67,6 +67,7 @@ from core.brain import generate_reply_ex
 from core.capabilities import Capability, dispatch_reply_sent, register
 from core.inbound import InboundMessage, KIND_TEXT, parse_line
 from core.replier import send_reply
+from custom import msgstore
 from custom.identity import is_supervisor, supervisor_id, supervisor_names
 
 # 超时未裁决 → 按**不回复**处理并归档（秒），主管事后引用卡片仍可补裁。
@@ -116,7 +117,8 @@ _IGNORE_KEYWORDS = {"忽略", "不回", "跳过", "ignore", "skip", "算了", "�
 # 无歧义改写前缀：主管显式声明"下面是答案"，跳过一切猜测
 _REWRITE_PREFIXES = ("改：", "改:", "答：", "答:", "更正：", "更正:")
 
-# 待审表：seq -> {asker, asker_conv_id, asker_conv_type, question, draft, ts, timer}
+# 待审表：seq -> {asker, asker_conv_id, asker_conv_type, asker_msg_id, question,
+#                draft, ts, timer}
 _pending = {}
 _pending_lock = threading.Lock()
 _seq_counter = 0
@@ -484,6 +486,7 @@ def _replay(path=None):
             _remember_history(n, state="open", asker=r.get("asker"),
                               asker_conv_id=r.get("conv_id"),
                               asker_conv_type=r.get("conv_type"),
+                              asker_msg_id=r.get("msg_id"),
                               question=r.get("q"), draft=r.get("draft"))
         elif t == "done":
             _remember_history(n, state=r.get("action") or "answered",
@@ -521,7 +524,7 @@ def _ensure_replayed(path=None):
             log(f"supervisor_review: 重建审核流水失败，退化为从 #1 起 {e}")
 
 
-def _record_decision(seq, state, answer=""):
+def _record_decision(seq, state, answer="", p=None):
     """把裁决结果落进流水 + 历史索引。best-effort（裁决本身已经生效了）。
 
     state ∈ answered | ignored | expired。留档是为了主管事后引用旧消息时，能分辨
@@ -531,6 +534,15 @@ def _record_decision(seq, state, answer=""):
     _journal_append({"t": "expire" if state == "expired" else "done", "n": seq,
                      "action": state, "answer": (answer or "")[:2000],
                      "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+    # 同时挂到**提问者那条原始消息**上（#111）：人事后查的是"我问的那句后来怎么样了"，
+    # 而不是"第 N 号待审"。best-effort，落盘失败不影响裁决本身。
+    rec = p or _history.get(seq) or {}
+    try:
+        msgstore.record_feedback(rec.get("asker_conv_id", ""), rec.get("asker_msg_id", ""),
+                                 seq=seq, action=state, answer=answer,
+                                 by=", ".join(sorted(_supervisor_names())) or "主管")
+    except Exception as e:
+        log(f"supervisor_review: 记录裁决反馈失败 {e}")
 
 
 def _next_seq():
@@ -598,15 +610,21 @@ def _record_knowledge(question, answer, asker=""):
 _REVIEW_SEQ_RE = re.compile(r"^\s*[^\w\s]*\s*\**待审\s*#(\d+)")
 
 
-def _seq_of_message(msg_id):
+def _seq_of_message(msg_id, conv_id=""):
     """被贴表情的那条消息属于第几号审核；认不出返回 None。
 
-    取回正文再抽「待审 #N」，与引用回复用的是同一套解析 —— 于是**8 种消息都能贴表情**
-    （以前只有卡片行），而且不用再维护 msgId 索引。代价是一次 CLI 往返，但这是人工动作、
-    低频，比原来每 5s 一次的轮询便宜两个数量级。
+    先查**本地消息存储**（#111，零网络往返）；查不到再回落 `list-by-ids` —— 存储启用
+    之前的老消息不在库里，回落保证平滑过渡。两条路都是取回正文再抽「待审 #N」，与引用
+    回复用的是同一套解析，于是 8 种消息都能贴表情（以前只有卡片行）。
     """
     if not msg_id:
         return None
+    if conv_id:
+        rec = msgstore.find(conv_id, msg_id)
+        if rec:
+            hit = _REVIEW_SEQ_RE.match(str(rec.get("text") or ""))
+            if hit:
+                return int(hit.group(1))
     rc, out = _run_cli(["chat", "message", "list-by-ids", "--msg-ids", msg_id])
     if rc != 0:
         log(f"supervisor_review: 取被贴表情的消息失败 rc={rc} out={out[:120]}")
@@ -634,7 +652,7 @@ def _on_reaction(msg):
     extra = msg.extra or {}
     emoji = extra.get("reaction") or ""
     action = _emoji_action(emoji)
-    seq = _seq_of_message(extra.get("reacted_msg_id"))
+    seq = _seq_of_message(extra.get("reacted_msg_id"), msg.conv_id)
     if seq is None:
         log(f"supervisor_review: 表情 {emoji!r} 贴在非审核消息上，忽略")
         return
@@ -735,7 +753,7 @@ def _timeout(seq):
     if not p:
         return
     log(f"supervisor_review: #{seq} 主管 {_TIMEOUT}s 未裁决 → 按不回复处理（已归档，可事后补裁）")
-    _record_decision(seq, "expired")
+    _record_decision(seq, "expired", p=p)
     # 与"忽略"完全一致：提问者那条静默收尾，不贴「完成」也不贴「未完成」
     _close_ack(p["asker_conv_id"], p["asker_conv_type"], ok=None)
     _send_to_supervisor(
@@ -758,6 +776,7 @@ def _revive_seq(seq):
         "asker_conv_type": rec.get("asker_conv_type") or _CONV_TYPE_O2O,
         "question": rec.get("question") or "",
         "draft": rec.get("draft") or "",
+        "asker_msg_id": rec.get("asker_msg_id") or "",
         "ts": time.time(),
         "timer": None,
     })
@@ -802,6 +821,7 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
             "asker": user,
             "asker_conv_id": conv_id,
             "asker_conv_type": conv_type,
+            "asker_msg_id": msg_id,
             "question": text,
             "draft": draft or "",
             "ts": time.time(),
@@ -810,10 +830,11 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
     if timer:
         timer.start()
     _journal_append({"t": "open", "n": seq, "asker": user, "conv_id": conv_id,
-                     "conv_type": conv_type, "q": text, "draft": draft or "",
+                     "conv_type": conv_type, "msg_id": msg_id, "q": text, "draft": draft or "",
                      "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
     _remember_history(seq, state="open", asker=user, asker_conv_id=conv_id,
-                      asker_conv_type=conv_type, question=text, draft=draft or "")
+                      asker_conv_type=conv_type, asker_msg_id=msg_id,
+                      question=text, draft=draft or "")
     log(f"supervisor_review: #{seq} 已转交主管审核 asker={user} q={text[:40]!r}")
 
     # 草稿被折叠了就把全文补一条（卡片只留前几行，见 _fold_draft）
@@ -845,7 +866,7 @@ def _execute_verdict(seq, action, payload="", source=""):
 
     if action == "ignore":
         log(f"supervisor_review: #{seq} 主管选择忽略{via}，不回复 asker={p['asker']}")
-        _record_decision(seq, "ignored")
+        _record_decision(seq, "ignored", p=p)
         # 提问者那条消息不会再收到任何回复 → 静默收尾，否则它每 5 分钟播「仍在处理中」
         _close_ack(asker_conv_id, asker_conv_type, ok=None)
         _send_to_supervisor(f"🚫 待审 #{seq} 已忽略{via}，未回复 {_asker_label(p)}。")
@@ -860,7 +881,7 @@ def _execute_verdict(seq, action, payload="", source=""):
             return True
         send_reply(asker_conv_id, asker_conv_type, draft)
         log(f"supervisor_review: #{seq} 主管同意{via}，草稿已发给 {p['asker']}")
-        _record_decision(seq, "answered", draft)
+        _record_decision(seq, "answered", draft, p=p)
         _send_to_supervisor(f"✅ 待审 #{seq} 已按草稿回复 {_asker_label(p)}{via}。")
         return True
 
@@ -873,7 +894,7 @@ def _execute_verdict(seq, action, payload="", source=""):
     send_reply(asker_conv_id, asker_conv_type, answer)
     _record_knowledge(p["question"], answer, asker=p["asker"])
     log(f"supervisor_review: #{seq} 主管改写并已回复 {p['asker']}")
-    _record_decision(seq, "answered", answer)
+    _record_decision(seq, "answered", answer, p=p)
     _send_to_supervisor(f"📝 待审 #{seq} 已用你的答案回复 {_asker_label(p)}，并已存入知识库。")
     return True
 

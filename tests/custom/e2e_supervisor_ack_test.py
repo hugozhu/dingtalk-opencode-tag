@@ -41,6 +41,7 @@ os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "600"    # 不让超时兜底插进来
 _TMP = tempfile.mkdtemp(prefix="e2e-sup-")
 atexit.register(shutil.rmtree, _TMP, True)   # sys.exit 在前，收尾只能挂 atexit
 os.environ["SUPERVISOR_REVIEW_JOURNAL"] = os.path.join(_TMP, "reviews.jsonl")
+os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_TMP, "messages")
 
 import custom.capabilities                      # noqa: E402  注册全部能力
 import custom.capabilities.ack as ACK           # noqa: E402

@@ -32,6 +32,7 @@ os.environ["ACK_PROGRESS_INTERVAL"] = "0"
 os.environ["SUPERVISOR_REACTION_POLL"] = "0"        # 本测不关心贴表情
 os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "0"       # 不起超时定时器
 os.environ["SUPERVISOR_REVIEW_JOURNAL"] = os.path.join(_TMP, "reviews.jsonl")
+os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_TMP, "messages")
 
 import custom.capabilities                          # noqa: E402  注册全部能力
 import custom.capabilities.ack as ACK               # noqa: E402

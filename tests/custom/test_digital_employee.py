@@ -17,6 +17,15 @@ import unittest
 import urllib.error
 from unittest.mock import patch, MagicMock
 
+# 消息存储指到临时目录：本测走真实 dispatch_inbound，msgstore 会落盘，
+# 不隔离就会把夹具数据写进真实的 knowledge/messages（踩过一次）
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+_MS_TMP = _tempfile.mkdtemp(prefix="test-de-ms-")
+_atexit.register(_shutil.rmtree, _MS_TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_MS_TMP, "messages")
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:

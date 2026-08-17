@@ -48,3 +48,18 @@ def has_supervisor():
 def is_supervisor(user):
     """该发送人显示名是主管吗？未配主管时恒为 False（调用方自行兜底）。"""
     return bool(user) and user in supervisor_names()
+
+
+def self_names():
+    """数字员工自己的显示名集合（判定一条消息是不是自己发的）。
+
+    默认值与 ack/forward/dws_event_bridge 保持一致 —— 留空会让"这条是不是我自己发的"
+    一律判否，msgstore 就会把出站消息记成入站。
+    """
+    return {n.strip() for n in os.environ.get(
+        "AGENT_SELF_NAMES", "数字员工,Claude Code").split(",") if n.strip()}
+
+
+def is_self(user):
+    """这条消息是数字员工自己发的吗（订阅会把自己发的回显进来）。"""
+    return bool(user) and user in self_names()

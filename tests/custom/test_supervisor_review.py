@@ -18,6 +18,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../src'))
 from core.inbound import InboundMessage  # noqa: E402
 from custom.capabilities import supervisor_review as sr  # noqa: E402
 
+# _Base 会把 _seq_of_message 换成桩（避免真 shell 出去调 dws），想测真函数就用这份引用
+_REAL_SEQ_OF_MESSAGE = sr._seq_of_message
+
 
 def _msg(user, text, conv_id="cidAsker", conv_type="1", msg_id="m1"):
     return InboundMessage(user=user, text=text, conv_type=conv_type,
@@ -39,11 +42,14 @@ class _Base(unittest.TestCase):
             patch.object(sr, "_TIMEOUT", 0),        # 0=不起定时器，超时单独测
             patch.object(sr, "_O2O_ONLY", False),   # 默认：单聊 + 群聊都审（#107）
             # 贴表情裁决要反查被贴消息的正文 —— 单测里给确定值，别 shell 出去调 dws
-            patch.object(sr, "_seq_of_message", lambda mid: 1 if mid else None),
+            patch.object(sr, "_seq_of_message", lambda mid, conv_id="": 1 if mid else None),
             patch.object(sr, "_REACTION_DEBOUNCE", 0),   # 单测不等宽限期
         ]
         for p in self.patches:
             p.start()
+        # 消息存储也要指到 tmpdir —— supervisor_review 记裁决反馈时会写它，
+        # 不隔离就会把夹具数据写进真实的 knowledge/messages
+        os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(self.tmpdir, "messages")
         os.environ["AGENT_SUPERVISOR_USER_ID"] = "sup123"
         os.environ["AGENT_SUPERVISOR_NAME"] = "boss"
         os.environ["AGENT_SUPERVISOR_ALIASES"] = "老板"
@@ -54,7 +60,7 @@ class _Base(unittest.TestCase):
         sr._reset()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         for k in ("AGENT_SUPERVISOR_USER_ID", "AGENT_SUPERVISOR_NAME",
-                  "AGENT_SUPERVISOR_ALIASES"):
+                  "AGENT_SUPERVISOR_ALIASES", "AGENT_MSGSTORE_DIR"):
             os.environ.pop(k, None)
 
     def _escalate(self, user="张三", text="问题", conv_id="cidZhang", msg_id="m1",
@@ -126,7 +132,7 @@ class TestInterception(_Base):
     def test_no_supervisor_configured_passes_through(self):
         """没配主管 → 本能力等于关闭，不能把消息吞掉。"""
         for k in ("AGENT_SUPERVISOR_USER_ID", "AGENT_SUPERVISOR_NAME",
-                  "AGENT_SUPERVISOR_ALIASES"):
+                  "AGENT_SUPERVISOR_ALIASES", "AGENT_MSGSTORE_DIR"):
             os.environ.pop(k, None)
         self.assertFalse(sr.on_inbound(_msg("张三", "你好")))
 
@@ -519,7 +525,7 @@ class TestReactionVerdict(_Base):
         """贴在无关消息上（反查不出编号）→ 什么都不做，绝不改判到别的待审。"""
         self._escalate()
         with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
-             patch.object(sr, "_seq_of_message", lambda mid: None), \
+             patch.object(sr, "_seq_of_message", lambda mid, conv_id="": None), \
              patch.object(sr, "_send_to_supervisor"), \
              patch.object(sr, "send_reply") as rep:
             sr.on_inbound(self._reaction("赞", mid="msg无关"))
@@ -562,6 +568,36 @@ class TestReactionVerdict(_Base):
             self._escalate(draft="AI草稿2", msg_id="m2")   # 重新挂一条待审
             sr.on_inbound(self._reaction("赞", eid="ev-dup"))   # 同一事件被重投
             self.assertEqual(rep.call_count, 1, "重投的事件又裁了一次")
+
+    def test_seq_lookup_prefers_local_store(self):
+        """贴表情定位优先查本地存储，不走 CLI（#111）。"""
+        from custom import msgstore
+        with patch.object(msgstore, "find",
+                          return_value={"text": "📋 **待审 #42**　来自：**张三**"}), \
+             patch.object(sr, "_run_cli") as cli:
+            self.assertEqual(_REAL_SEQ_OF_MESSAGE("mX", conv_id="cidBoss"), 42)
+        cli.assert_not_called()
+
+    def test_seq_lookup_falls_back_to_cli(self):
+        """存储里没有（启用之前的老消息）→ 回落 list-by-ids，保证平滑过渡。"""
+        from custom import msgstore
+        payload = json.dumps({"result": {"messages": [
+            {"openMessageId": "mY", "content": "📄 待审 #9 的完整草稿：…"}]}})
+        with patch.object(msgstore, "find", return_value=None), \
+             patch.object(sr, "_run_cli", lambda a, timeout=60: (0, payload)):
+            self.assertEqual(_REAL_SEQ_OF_MESSAGE("mY", conv_id="cidBoss"), 9)
+
+    def test_decision_recorded_to_msgstore(self):
+        """裁决反馈挂在**提问者原始消息**上 —— 人查的是"我问的那句后来怎么样了"。"""
+        from custom import msgstore
+        self._escalate(user="张三", conv_id="cidZhang", msg_id="mAsk", draft="AI草稿")
+        with patch.object(msgstore, "record_feedback") as fb, \
+             patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr.on_inbound(_msg("boss", "#1 同意", conv_id="cidBoss"))
+        fb.assert_called_once()
+        self.assertEqual(fb.call_args[0][0], "cidZhang")     # 提问者所在会话
+        self.assertEqual(fb.call_args[0][1], "mAsk")         # 提问者那条消息
+        self.assertEqual(fb.call_args[1]["action"], "answered")
 
     def test_emoji_mapping(self):
         self.assertEqual(sr._emoji_action("赞"), "approve")

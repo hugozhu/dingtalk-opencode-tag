@@ -12,8 +12,11 @@
 
 对照旧行为：failed 时 text_reply 直接 return，send_reply 不触发，ack 永远停在「处理中」。
 """
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import time
 import threading
 from unittest.mock import patch, MagicMock
@@ -21,6 +24,9 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 
+_TMP = tempfile.mkdtemp(prefix="e2e-ms-")
+atexit.register(shutil.rmtree, _TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_TMP, "messages")
 os.environ["AGENT_BRAIN"] = "opencode"
 os.environ["AGENT_FALLBACK_REPLY"] = "⚠️ 暂时无法处理你的消息，请稍后再试。"
 os.environ["ACK_STAGES"] = "0:稍等:已收到，正在处理…"   # 立即贴处理中
