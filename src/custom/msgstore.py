@@ -29,6 +29,11 @@ conv_id（被引用的那条必在同一会话里），reaction 事件带 conver
 TZ，跑在 UTC，而钉钉给的时间戳是本地时区——存字符串必然埋雷（已经因此静默失效过一次，
 见 commit 531d039）。
 
+**已知缺口**：发给主管的待审卡片**不在库里**。现网单聊订阅用的是
+`user_im_message_receive_o2o_all`（"当前用户**收到**的所有单聊消息"），自己发出的单聊
+不回显；群订阅是双向的，所以发到群里的答复能入库。卡片仍靠正文里的「待审 #N」标记定位。
+补齐的办法是加订 `user_im_message_receive_o2o --user <主管>`（双向），已评估，暂不做。
+
 开关：CAP_MSGSTORE_ENABLED（默认开，见 capabilities/msgstore_cap.py）。
 """
 
@@ -125,7 +130,7 @@ def _clip(text):
 
 
 def record(msg, direction="in", path=None):
-    """记一条消息。direction: in=别人发的 / out=数字员工自己发的（回显进来的）。"""
+    """记一条消息。direction: in=别人发的 / out=自己发的（经群订阅回显进来的）。"""
     if not getattr(msg, "msg_id", ""):
         return False        # 没有 id 就无从查回，存了也没用
     text, trunc = _clip(getattr(msg, "text", ""))
