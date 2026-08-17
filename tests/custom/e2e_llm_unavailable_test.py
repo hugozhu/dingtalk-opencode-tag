@@ -52,10 +52,12 @@ def fake_remove(conv_id, msg_id, emoji, text):
     emotions.append(("remove", emoji, text))
     return True
 
-def fake_update(conv_id, msg_id, old, new):
-    # 原地更新（#85）：记为显示出 new 状态（沿用 "add" 语义，兼容下方断言）
-    emotions.append(("add", new[0], new[1]))
-    print(f"  [ack表情↻] {old[0]}｜{old[1]} → {new[0]}｜{new[1]}")
+def fake_update(conv_id, msg_id, old_eid, old_bid, new_emoji, new_text, new_eid, new_bid):
+    # 原地更新：记为显示出 new 状态（沿用 "add" 语义，兼容下方断言）。
+    # 签名必须跟 ack._update_text_emotion 一致 —— #95 给它加了 emotionId/backgroundId
+    # 参数（从 4 个变 8 个），这个替身当时没跟上，导致 worker 抛 TypeError、V3 恒 ❌。
+    emotions.append(("add", new_emoji, new_text))
+    print(f"  [ack表情↻] {old_eid} → {new_emoji}｜{new_text}")
     return True
 
 CR.register_replier(fake_send_impl)     # 真 send_reply 协议，仅换平台实现

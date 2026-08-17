@@ -7,6 +7,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../src'))
 
@@ -14,10 +15,11 @@ from core.inbound import InboundMessage  # noqa: E402
 from custom.capabilities import group_gate as gg  # noqa: E402
 
 
-def _msg(text="你好", conv_type="2", msg_id="m1", at=False, user="张三"):
+def _msg(text="你好", conv_type="2", msg_id="m1", at=False, user="张三",
+         conv_id="cidGroup"):
     extra = {"at_mention": True} if at else {}
     return InboundMessage(user=user, text=text, conv_type=conv_type,
-                          conv_id="cidGroup", msg_id=msg_id, extra=extra)
+                          conv_id=conv_id, msg_id=msg_id, extra=extra)
 
 
 class TestGate(unittest.TestCase):
@@ -83,6 +85,66 @@ class TestBounds(unittest.TestCase):
         for i in range(gg._SEEN_MAX + 50):
             gg.on_inbound(_msg(msg_id=f"m{i}", at=True))
         self.assertLessEqual(len(gg._seen), gg._SEEN_MAX)
+
+
+class TestAwaitingReply(unittest.TestCase):
+    """数字员工自己在群里问了话，对方回一句不会 @ 它 —— 闸门必须先让"正等回答"的能力过目。
+
+    回归的是真事故：群里发「🔐 需要授权」后，用户回「同意」被闸门吞掉，审批只能等到
+    超时自动拒绝（e2e_permission_test 的 V2 因此恒 ❌，耗时 63s）。
+    """
+
+    def setUp(self):
+        gg._reset()
+        from core.builtin_caps import permission
+        self.permission = permission
+        permission._reset()
+
+    def tearDown(self):
+        self.permission._reset()
+        gg._reset()
+
+    def _arm_pending(self, conv_id="cidG"):
+        """在该群挂一条待审批。"""
+        with self.permission._pending_lock:
+            self.permission._pending["req1"] = {
+                "sid": "s1", "conv_id": conv_id, "conv_type": "2",
+                "action": "bash", "api": "v1", "timer": None,
+            }
+
+    def test_approval_reply_reaches_permission(self):
+        """有待审批时，群里没 @ 的「同意」要被 permission 收走，而不是被闸门吞掉。"""
+        self._arm_pending()
+        with patch.object(self.permission, "on_inbound", return_value=True) as oi:
+            self.assertTrue(gg.on_inbound(_msg(text="同意", at=False, conv_id="cidG")))
+        oi.assert_called_once()
+
+    def test_unrelated_chatter_still_swallowed(self):
+        """但闲聊仍要吞掉 —— permission 对不认识的文本返回 False，放行会让数字员工接话。"""
+        self._arm_pending()
+        with patch.object(self.permission, "on_inbound", return_value=False) as oi:
+            self.assertTrue(gg.on_inbound(_msg(text="今晚吃啥", at=False, conv_id="cidG")))
+        oi.assert_called_once()      # 问过了
+        # 返回 True = 吞掉，不会走到 text_reply
+
+    def test_no_pending_does_not_probe(self):
+        """没有待答请求时不该去打扰任何能力。"""
+        with patch.object(self.permission, "on_inbound") as oi:
+            self.assertTrue(gg.on_inbound(_msg(text="闲聊", at=False, conv_id="cidG")))
+        oi.assert_not_called()
+
+    def test_pending_in_another_group_does_not_leak(self):
+        """待审批挂在别的群 → 本群的消息照旧吞掉。"""
+        self._arm_pending(conv_id="cid其他群")
+        with patch.object(self.permission, "on_inbound") as oi:
+            self.assertTrue(gg.on_inbound(_msg(text="同意", at=False, conv_id="cidG")))
+        oi.assert_not_called()
+
+    def test_probe_failure_does_not_break_gate(self):
+        """探测出错不能把闸门带走（best-effort）。"""
+        self._arm_pending()
+        with patch.object(self.permission, "on_inbound", side_effect=RuntimeError("boom")):
+            self.assertTrue(gg.on_inbound(_msg(text="同意", at=False, conv_id="cidG")))
 
 
 class TestWiring(unittest.TestCase):
