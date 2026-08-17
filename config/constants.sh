@@ -12,6 +12,14 @@
 #      **必须**与 DWS_PROFILE 填成同一个真实 profile。留占位 'your-profile' 会导致
 #      dws 用不存在的 profile → "未登录，请先执行 dws auth login"。
 
+# --- 时区 ---
+# reboot.sh 用 `env -i` 起服务（#71，为了让改过的 config 真生效），它保留了 LANG 却
+# **没保留 TZ** —— 守护进程于是跑在 UTC，而钉钉给的时间戳是本地时区。后果：
+#   · monitor.log 的时间和钉钉会话里的时间差 8 小时，排查时对不上号；
+#   · 任何"按时间窗口查消息"的代码锚点偏 8 小时（曾导致贴表情裁决静默失效）。
+# 显式设死，别指望继承。非中国区改成自己的时区。
+export TZ="${TZ:-Asia/Shanghai}"
+
 # --- 数字员工身份 ---
 export AGENT_ROBOT_CODE="${AGENT_ROBOT_CODE:-your-robot-code}"
 export AGENT_USER_ID="${AGENT_USER_ID:-your-user-id}"

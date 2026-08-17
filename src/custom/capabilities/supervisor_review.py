@@ -441,10 +441,16 @@ def _locate_card_msg_id(seq):
     sid = _supervisor_id()
     if not sid:
         return ""
-    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 300))
-    # limit 给宽：并发转交时每条待审会占 1~2 条消息（卡片 + 折叠草稿全文），还有各种回执
+    # **不能用本地时间当锚点**：守护进程由 reboot.sh 以 `env -i` 拉起，TZ 不被继承 → 进程
+    # 跑在 UTC，而钉钉的时间戳是 CST，差 8 小时。而 `--time` 是"从这个点往后取最旧的 N 条"，
+    # 锚点偏早 8 小时就会取到一堆历史消息、刚发的卡片反而不在结果里；更糟的是重启后
+    # `_seq_counter` 归零，历史里那张同号的旧卡片会被匹配上，于是轮询一直盯着**上一轮的
+    # 卡片**，主管贴在新卡片上的表情永远读不到，还全程不报错。
+    # 改成 `--direction older` + 一个必然在未来的锚点：结果是"从最新往回数 N 条"，
+    # 与进程时区差多少都无关，刚发出的卡片必在最前面。
+    anchor = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 86400))
     rc, out = _run_cli(["chat", "message", "list", "--user", sid,
-                        "--time", since, "--limit", "30"])
+                        "--time", anchor, "--direction", "older", "--limit", "30"])
     if rc != 0:
         log(f"supervisor_review: #{seq} 反查卡片 msgId 失败 rc={rc} out={out[:120]}")
         return ""

@@ -662,6 +662,74 @@ class TestQuotedVerdict(_Base):
         self.assertIn("裁决过", sup.call_args[0][0])
 
 
+class TestLocateCard(_Base):
+    """反查卡片 msgId —— 贴表情/引用裁决全靠它，之前整个被 stub 掉、零覆盖。
+
+    真实事故：守护进程由 reboot.sh 以 `env -i` 拉起，TZ 不继承 → 进程跑 UTC，钉钉时间是
+    CST，差 8 小时。锚点偏早 8 小时 + `--time` 是"从该点往后取最旧 N 条" → 刚发的卡片
+    不在结果里，反而匹配到重启前那张**同号**的旧卡片（_seq_counter 重启归零），于是轮询
+    一直盯着上一轮的卡片，主管贴的表情永远读不到，全程无报错。
+    """
+
+    def setUp(self):
+        super().setUp()
+        for p in self.patches:                 # 本组要测真函数，撤掉 _Base 的桩
+            p.stop()
+        self.patches = []
+
+    @staticmethod
+    def _payload(msgs):
+        return json.dumps({"result": {"messages": msgs}})
+
+    def test_queries_newest_first_not_local_time_window(self):
+        """必须走 --direction older（从最新往回数），否则进程时区一偏就全错。"""
+        seen = {}
+
+        def fake_cli(args, timeout=60):
+            seen["args"] = args
+            return 0, self._payload([])
+
+        with patch.object(sr, "_run_cli", fake_cli):
+            sr._locate_card_msg_id(3)
+        self.assertIn("--direction", seen["args"])
+        self.assertEqual(seen["args"][seen["args"].index("--direction") + 1], "older")
+
+    def test_picks_newest_card_when_seq_number_repeats(self):
+        """重启后编号会重来 —— 同号卡片有多张时必须取最新那张。"""
+        msgs = [
+            {"sender": "一粟", "openMessageId": "新", "content": "📋 **待审 #3**　来自：**冬翔**"},
+            {"sender": "一粟", "openMessageId": "旧", "content": "📋 **待审 #3**　来自：**靖之**"},
+        ]   # 接口按新→旧返回
+        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload(msgs))), \
+             patch.object(sr, "_SELF_NAMES", {"一粟"}):
+            self.assertEqual(sr._locate_card_msg_id(3), "新")
+
+    def test_ignores_messages_from_others(self):
+        """主管引用卡片回复时，他那条消息正文里也带卡片原文 —— 不能认成自己的卡片。"""
+        msgs = [
+            {"sender": "hugozhu", "openMessageId": "主管的", "content": "📋 **待审 #3**　来自…"},
+            {"sender": "一粟", "openMessageId": "我的", "content": "📋 **待审 #3**　来自…"},
+        ]
+        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload(msgs))), \
+             patch.object(sr, "_SELF_NAMES", {"一粟"}):
+            self.assertEqual(sr._locate_card_msg_id(3), "我的")
+
+    def test_seq_prefix_does_not_collide(self):
+        """#3 不能匹配到 #30 的卡片。"""
+        msgs = [{"sender": "一粟", "openMessageId": "三十", "content": "📋 **待审 #30**　来自…"}]
+        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload(msgs))), \
+             patch.object(sr, "_SELF_NAMES", {"一粟"}):
+            self.assertEqual(sr._locate_card_msg_id(3), "")
+
+    def test_not_found_is_logged_not_silent(self):
+        """找不到只能走文字裁决 —— 必须留下线索，否则线上是静默失效。"""
+        logs = []
+        with patch.object(sr, "_run_cli", lambda a, timeout=60: (0, self._payload([]))), \
+             patch.object(sr, "log", lambda m: logs.append(m)):
+            self.assertEqual(sr._locate_card_msg_id(3), "")
+        self.assertTrue(any("找回卡片" in m for m in logs))
+
+
 class TestQuotedJudge(_Base):
     """引用回复 = 正式作答：内容交大模型判能不能原样发给提问者（#107）。
 
