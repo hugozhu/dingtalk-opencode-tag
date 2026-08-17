@@ -138,6 +138,11 @@ _replayed = False
 # state ∈ open | answered | ignored | expired。有界，replay 时从流水尾部重建。
 _history = OrderedDict()
 _HISTORY_MAX = 256
+# 已处理过的表情事件 id。**必须持久化**：dws 是 at-least-once，重连/重启会重投旧事件，
+# 而 core 的声明式 dedup 是内存态、重启即丢。重投一条几小时前的 👍 + "忽略/超时的可以
+# 事后补裁"的语义 = 把当时没人放行的草稿幽灵般发出去。
+_handled_events = OrderedDict()
+_HANDLED_EVENTS_MAX = 512
 
 # 表情回应事件（#108）：bridge 产出的专用行，kind 定义在 custom（core 不解读 kind，
 # 不必为此改 core/inbound.py）
@@ -485,6 +490,9 @@ def _replay(path=None):
                               answer=r.get("answer"))
         elif t == "expire":
             _remember_history(n, state="expired")
+    for r in recs:
+        if r.get("t") == "rx" and r.get("id"):
+            _remember(_handled_events, r["id"], _HANDLED_EVENTS_MAX)
     with _pending_lock:
         _seq_counter = max(_seq_counter, high)
     if bad:
@@ -617,6 +625,12 @@ def _seq_of_message(msg_id):
 
 def _on_reaction(msg):
     """主管给某条审核消息贴了表情 → 裁决。跑在 reply pool，不在入站线程里。"""
+    _ensure_replayed()
+    if msg.msg_id and not _remember(_handled_events, msg.msg_id, _HANDLED_EVENTS_MAX):
+        log(f"supervisor_review: 表情事件 {msg.msg_id[:16]} 已处理过（重投），忽略")
+        return
+    if msg.msg_id:
+        _journal_append({"t": "rx", "id": msg.msg_id})
     extra = msg.extra or {}
     emoji = extra.get("reaction") or ""
     action = _emoji_action(emoji)
@@ -1152,6 +1166,7 @@ def _reset():
         except Exception:
             pass
     _debounce_timers.clear()
+    _handled_events.clear()
     with _pending_lock:
         for p in _pending.values():
             if p.get("timer"):

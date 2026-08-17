@@ -546,6 +546,23 @@ class TestReactionVerdict(_Base):
         sub.assert_not_called()
         self.assertEqual(len(sr._pending), 1)
 
+    def test_replayed_event_is_not_executed_twice(self):
+        """dws 是 at-least-once：重投的旧表情事件不能再裁一次（跨重启也不行）。
+
+        不然重投一条几小时前的 👍 + "忽略/超时的可以事后补裁"的语义 = 把当时没人放行的
+        草稿幽灵般发出去。core 的 dedup 是内存态，顶不住重启。
+        """
+        self._escalate(draft="AI草稿")
+        with patch.object(sr, "submit_reply", lambda fn, *a: fn(*a)), \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            sr.on_inbound(self._reaction("赞", eid="ev-dup"))
+            self.assertEqual(rep.call_count, 1)
+            sr._reset()                                    # 模拟重启：内存全丢
+            self._escalate(draft="AI草稿2", msg_id="m2")   # 重新挂一条待审
+            sr.on_inbound(self._reaction("赞", eid="ev-dup"))   # 同一事件被重投
+            self.assertEqual(rep.call_count, 1, "重投的事件又裁了一次")
+
     def test_emoji_mapping(self):
         self.assertEqual(sr._emoji_action("赞"), "approve")
         self.assertEqual(sr._emoji_action("❌"), "ignore")
