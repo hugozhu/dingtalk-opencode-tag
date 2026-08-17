@@ -263,16 +263,65 @@ class TestParseVerdict(_Base):
 
 
 class TestTimeout(_Base):
-    def test_timeout_releases_draft_to_asker(self):
-        """主管一直不回 → 超时把草稿发给提问者，不能无限期挂着。"""
+    def test_timeout_does_not_release_draft(self):
+        """主管一直不回 → **按不回复处理**，绝不自动放行没人看过的草稿。
+
+        没人管不等于默认同意：自动放行等于把一条从没被人审过的草稿发出去（群里还是
+        公开发言），审核闸门就白设了。
+        """
         self._escalate(draft="AI草稿")
         seq = max(sr._pending)
-        with patch.object(sr, "_send_to_supervisor"), \
+        with patch.object(sr, "_send_to_supervisor") as sup, \
              patch.object(sr, "send_reply") as rep:
             sr._timeout(seq)
-        rep.assert_called_once()
-        self.assertEqual(rep.call_args[0][2], "AI草稿")
+        rep.assert_not_called()
         self.assertEqual(len(sr._pending), 0)
+        self.assertIn("不回复", sup.call_args[0][0])
+
+    def test_timeout_archives_for_later(self):
+        """超时的问题没被丢掉 —— 归档，主管事后引用卡片还能补裁。"""
+        self._escalate(draft="AI草稿")
+        seq = max(sr._pending)
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr._timeout(seq)
+        self.assertIn("cardMsg1", sr._archive)
+
+    def test_quoting_archived_card_still_works(self):
+        """核心：超时之后引用那张卡片回「同意」，草稿照样发给提问者。"""
+        self._escalate(user="张三", conv_id="cidZhang", draft="AI草稿")
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr._timeout(1)
+        msg = _msg("boss", "同意", conv_id="cidBoss", msg_id="m9")
+        msg.extra["quoted_msg_id"] = "cardMsg1"
+        with patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(msg))
+        self.assertEqual(rep.call_args[0][0], "cidZhang")
+        self.assertEqual(rep.call_args[0][2], "AI草稿")
+        self.assertNotIn("cardMsg1", sr._archive)      # 补裁完就不该再被翻出来
+
+    def test_archived_rewrite_is_learned(self):
+        """事后补写的答案同样进知识库。"""
+        self._escalate(text="报销怎么走", draft="AI瞎猜")
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            sr._timeout(1)
+        msg = _msg("boss", "改：找财务小王", conv_id="cidBoss", msg_id="m9")
+        msg.extra["quoted_msg_id"] = "cardMsg1"
+        with patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            sr.on_inbound(msg)
+        self.assertEqual(rep.call_args[0][2], "找财务小王")
+        with open(self.kf, encoding="utf-8") as f:
+            recs = [json.loads(x) for x in f if x.strip()]
+        self.assertEqual(recs[0]["answer"], "找财务小王")
+
+    def test_archive_is_bounded(self):
+        """归档有界，长跑不涨内存。"""
+        with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply"):
+            for i in range(sr._ARCHIVE_MAX + 10):
+                self._escalate(conv_id=f"cid{i}", msg_id=f"m{i}")
+                sr._timeout(max(sr._pending))
+        self.assertLessEqual(len(sr._archive), sr._ARCHIVE_MAX)
 
     def test_timeout_after_verdict_is_noop(self):
         """已裁决后定时器才触发 → 不能重复发第二条。"""
@@ -334,15 +383,15 @@ class TestAckClosure(_Base):
         rep.assert_not_called()
         disp.assert_called_once_with("cidZhang", "1", False)
 
-    def test_timeout_without_draft_closes_ack_failed(self):
-        """超时且无草稿可放行 → 提问者什么也收不到，同样要收尾。"""
-        self._escalate(draft="")
+    def test_timeout_closes_ack_silently(self):
+        """超时 = 按不回复处理 → 静默收尾（与「忽略」一致），提问者那条不贴终态。"""
+        self._escalate(draft="AI草稿")
         seq = max(sr._pending)
         with patch.object(sr, "_send_to_supervisor"), patch.object(sr, "send_reply") as rep, \
              patch.object(sr, "dispatch_reply_sent") as disp:
             sr._timeout(seq)
         rep.assert_not_called()
-        disp.assert_called_once_with("cidZhang", "1", False)
+        disp.assert_called_once_with("cidZhang", "1", None)
 
     def test_close_ack_survives_dispatch_failure(self):
         """收尾是 best-effort —— 广播抛错不能拖垮审核主流程。"""
@@ -610,7 +659,7 @@ class TestQuotedVerdict(_Base):
             self.assertTrue(sr.on_inbound(msg))
         rep.assert_not_called()
         self.assertEqual(len(sr._pending), 1)          # 李四的待审没被误判
-        self.assertIn("已处理", sup.call_args[0][0])
+        self.assertIn("裁决过", sup.call_args[0][0])
 
 
 class TestPendingNotLost(_Base):

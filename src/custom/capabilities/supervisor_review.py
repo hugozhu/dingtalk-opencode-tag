@@ -10,7 +10,8 @@
 
 三条裁决入口，最终都汇到 `_execute_verdict`（#107）：
   1. **贴表情**（`_poll_reactions_once`）—— 最高频的「同意/忽略」降到一次点击
-  2. **引用卡片回复**（`classify_line` → `extra['quoted_msg_id']`）—— 不用敲 #N
+  2. **引用卡片回复**（`classify_line` → `extra['quoted_msg_id']`）—— 不用敲 #N，
+     且**超时归档的卡片照样能补裁**
   3. **文字**（`_parse_verdict`）—— 改写时仍然要打字，这是本来就避不掉的
 
 设计要点：
@@ -40,9 +41,11 @@
   转交失败且无草稿、超时且无草稿）。不收尾 → 那条消息的 ack worker 一直等信号，每
   ACK_PROGRESS_INTERVAL 秒往会话播一条「仍在处理中」直到 ACK_DONE_TIMEOUT（默认 65
   分钟）。群聊里尤其刺眼：主管已经决定忽略，群里还在报进度。见 _close_ack。
-- **超时兜底**：默认 600s 未裁决 → 把 AI 草稿发回原会话，避免提问者被无限期挂着。
-  取舍：群聊超时等于把**未经审核**的草稿公开发出去 —— 沉默更糟（群里问了没人理），
-  故保持与单聊一致。要更严就把 SUPERVISOR_REVIEW_TIMEOUT 调大。
+- **超时 = 不回复，不是放行**：默认 600s 无人裁决 → 按「忽略」处理（提问者收不到任何
+  东西）。没人管**不等于**默认同意 —— 自动放行意味着一条从没被人看过的草稿被发出去，
+  群里更是直接公开发言，等于在审核闸门上开了个洞。沉默的代价可见可补救，发错话的不是。
+  超时的待审进 _archive，主管**事后引用那张卡片**随时能补裁（见 _revive），所以问题
+  不会被丢掉，只是没人替他答应。
 
 开关：CAP_SUPERVISOR_REVIEW_ENABLED（模板默认关，config/constants.local.sh 里开）。
 """
@@ -61,7 +64,8 @@ from core.inbound import KIND_TEXT, parse_line
 from core.replier import send_reply
 from custom.identity import is_supervisor, supervisor_id, supervisor_names
 
-# 超时未裁决 → 放行 AI 草稿（秒）。0=永不超时（提问者可能被无限期挂着，慎用）。
+# 超时未裁决 → 按**不回复**处理并归档（秒），主管事后引用卡片仍可补裁。
+# 0=永不超时（待审一直挂着，提问者也一直等不到，慎用）。
 _TIMEOUT = int(os.environ.get("SUPERVISOR_REVIEW_TIMEOUT", "600"))
 # 仅拦单聊（=1 时群聊放行，回到 #107 之前的行为）。默认 0：群里的公开发言更该先审。
 _O2O_ONLY = env_flag("SUPERVISOR_REVIEW_O2O_ONLY", default=False)
@@ -132,6 +136,12 @@ _HANDLED_MAX = 512
 # "主管引用了一张已处理的旧卡片"（该告诉他已处理）与"引用了别的消息"（该回落到最近一条）。
 _card_history = OrderedDict()
 _CARD_HISTORY_MAX = 256
+
+# 超时未裁决而被归档的待审：card_msg_id -> (seq, record)，有界 FIFO。
+# 超时按"不回复"处理，但**问题本身没消失** —— 主管事后引用那张卡片仍能补裁，
+# 届时由 _revive 把它重新挂回待审表。
+_archive = OrderedDict()
+_ARCHIVE_MAX = 64
 
 # 引用回复的原消息 id（bridge 在行尾追加，见 classify_line）
 _QUOTED_RE = re.compile(r"\bquotedMsgId=([^\s)]+)")
@@ -572,17 +582,49 @@ def _ensure_poller():
 # ---------------------------------------------------------------------------
 
 def _timeout(seq):
-    """超时未裁决：把 AI 草稿发给提问者兜底，并告知主管。"""
+    """超时未裁决 → **按不回复处理**，并归档等主管事后补裁。
+
+    为什么默认是"不回复"而不是"放行草稿"：没人管**不等于**默认同意。自动放行意味着
+    一条**从没被人看过**的 AI 草稿被发出去，群聊场景更是直接公开发言——审核闸门存在
+    的全部意义就是不让这种事发生，超时兜底不该在闸门上开个洞。沉默的代价（提问者没
+    收到答案）是可见、可补救的；发错话的代价不是。
+
+    补救路径：归档进 _archive，主管什么时候想起来，引用那张卡片回一句就能补答（见
+    _revive）。所以这不是"问题被丢掉"，只是"没人替你答应"。
+    """
     p = _pop(seq)
     if not p:
         return
-    draft = p.get("draft") or ""
-    log(f"supervisor_review: #{seq} 主管 {_TIMEOUT}s 未裁决，放行 AI 草稿")
-    if draft:
-        send_reply(p["asker_conv_id"], p["asker_conv_type"], draft)
-    else:
-        _close_ack(p["asker_conv_id"], p["asker_conv_type"], ok=False)   # 无草稿可放行 → 失败终态
-    _send_to_supervisor(f"⏰ 待审 #{seq}（来自 {p['asker']}）超时未裁决，已自动放行 AI 草稿。")
+    log(f"supervisor_review: #{seq} 主管 {_TIMEOUT}s 未裁决 → 按不回复处理（已归档，可事后补裁）")
+    # 与"忽略"完全一致：提问者那条静默收尾，不贴「完成」也不贴「未完成」
+    _close_ack(p["asker_conv_id"], p["asker_conv_type"], ok=None)
+    card_id = p.get("card_msg_id")
+    if card_id:
+        _archive[card_id] = (seq, p)
+        _archive.move_to_end(card_id)
+        while len(_archive) > _ARCHIVE_MAX:
+            _archive.popitem(last=False)
+    tail = ("　想补答就**引用那张卡片**回一句（同意 / 改：<答案>）。" if card_id
+            else "")
+    _send_to_supervisor(
+        f"⏰ 待审 #{seq}（来自 {_asker_label(p)}）{_TIMEOUT}s 未裁决，"
+        f"已按**不回复**处理。{tail}")
+
+
+def _revive(card_msg_id):
+    """主管事后引用了一张归档卡片 → 重新挂回待审表。返回 seq；不是归档卡片返回 None。
+
+    重新计时（刷新 ts）：主管既然回来处理了，就该给一个完整的裁决窗口，而不是挂上去
+    一秒后又超时。裁不完（比如同意但没草稿）就照常留在待审里，再超时会再归档一次。
+    """
+    entry = _archive.pop(card_msg_id, None)
+    if entry is None:
+        return None
+    seq, p = entry
+    p["ts"] = time.time()
+    _repend(seq, p)
+    log(f"supervisor_review: #{seq} 主管事后引用卡片，已重新挂回待审")
+    return seq
 
 
 def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
@@ -718,14 +760,17 @@ def _handle_verdict(msg):
     # 引用了哪张卡片就裁哪条 —— 比 #N 和"最近一条"都准，且主管不用敲编号（#107 B）
     quoted_id = (msg.extra or {}).get("quoted_msg_id")
     quoted = _seq_by_card_msg_id(quoted_id)
+    if quoted is None and quoted_id:
+        # 超时归档的卡片可以事后补裁 —— 超时只是"当时没人回复"，问题本身还在
+        quoted = _revive(quoted_id)
     if quoted is not None:
         seq = quoted
     elif quoted_id and quoted_id in _card_history:
-        # 引用的是一张**已处理**的旧卡片 —— 绝不能悄悄改判到"最近一条"，那会把裁决
+        # 引用的是一张**已裁决过**的旧卡片 —— 绝不能悄悄改判到"最近一条"，那会把裁决
         # 落到另一个提问者头上（主管在这里的指向性是最明确的，猜错代价最大）。
         old = _card_history[quoted_id]
-        _send_to_supervisor(f"⚠️ 你引用的待审 #{old} 已处理过了。要裁最新那条请直接回，"
-                            f"或引用它的卡片。")
+        _send_to_supervisor(f"⚠️ 你引用的待审 #{old} 已经裁决过了，不能重复处理。"
+                            f"要裁别的请引用它的卡片，或直接回「#N …」。")
         return True
     if seq is None:
         seq = _latest_seq()
@@ -817,6 +862,7 @@ def _reset():
         _seq_counter = 0
     _handled_reactions.clear()
     _card_history.clear()
+    _archive.clear()
 
 
 CAPABILITY = Capability(

@@ -159,7 +159,10 @@ export AGENT_SUPERVISOR_NAME="${AGENT_SUPERVISOR_NAME:-}"
 # **默认关**：它改变默认回复行为（提问者不再立即拿到答案），必须显式开。
 # 依赖 AGENT_SUPERVISOR_USER_ID（发卡片）+ AGENT_SUPERVISOR_NAME（认主管入站消息）。
 export CAP_SUPERVISOR_REVIEW_ENABLED="${CAP_SUPERVISOR_REVIEW_ENABLED:-0}"
-export SUPERVISOR_REVIEW_TIMEOUT="${SUPERVISOR_REVIEW_TIMEOUT:-600}"   # 超时放行草稿(秒)，0=不超时
+# 超时未裁决(秒) → **按不回复处理**（不是放行草稿！没人管不等于默认同意，自动放行
+# 等于把一条从没被人看过的草稿发出去，群里还是公开发言）。超时的待审会归档，主管
+# 事后**引用那张卡片**回一句仍能补裁。0=永不超时（待审一直挂着，提问者也一直等）。
+export SUPERVISOR_REVIEW_TIMEOUT="${SUPERVISOR_REVIEW_TIMEOUT:-600}"
 # 1=只审单聊（群聊直接回，不经主管）。默认 0=群聊也审。群里被审的范围与 text_reply 一致：
 # 数字员工本来会回的那些（整群订阅=每条；只订阅 DWS_EVENT_AT=只有被 @ 的）。
 export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-0}"
