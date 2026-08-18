@@ -138,11 +138,17 @@ def _recognize_via_serve(img_bytes, mime="image/png"):
                 pass
 
 
-def _recognize(image_path, tmp_dir):
+def _recognize(image_path, tmp_dir=None):
     """读图片字节 → vision 识别，返回描述文本（失败返回 ""）。用完删临时目录。
 
     优先经 opencode serve 用 AGENT_VISION_MODEL 识别（免外部 proxy）；空则回退
     agent_common._proxy_vision（外部 PROXY_URL）。
+
+    tmp_dir 可省：省略时清理图片自身所在的目录。**这个默认值是必须的** —— handler.py
+    的两个调用点（合并转发内层图片、以文件形式发来的图片）一直是按单参数调的，两个
+    必填参数时它们每次都抛 TypeError，被外层 `except Exception` 吞成 desc=""，于是那
+    两条路的识别**一直是 100% 失败**、只吐「[图片，识别失败]」。单测没发现是因为
+    patch 时没带 autospec，替身能接受任意参数。
     """
     mime = "image/jpeg" if image_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
     try:
@@ -156,7 +162,7 @@ def _recognize(image_path, tmp_dir):
         log(f"image: 识别读文件失败 {e}")
         return ""
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(tmp_dir or os.path.dirname(image_path), ignore_errors=True)
 
 
 def handle_image(user, text, msg_id, conv_id, conv_type):

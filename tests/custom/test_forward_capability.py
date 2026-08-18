@@ -151,7 +151,7 @@ class TestForwardImageEntry(unittest.TestCase):
         from custom import handler
         from custom.capabilities import image
         with patch.object(handler, "_download_image_to_path", return_value="/tmp/fake.png"), \
-             patch.object(image, "_recognize", return_value="GEMINI识别文本") as rec:
+             patch.object(image, "_recognize", autospec=True, side_effect=lambda *a, **k: "GEMINI识别文本") as rec:
             out = handler._fetch_image_entry("[图片消息](mediaId=$abc123)", "msg1", "cid1")
         rec.assert_called_once_with("/tmp/fake.png")   # 走 image 能力的统一识别
         self.assertIn("GEMINI识别文本", out)
@@ -172,7 +172,7 @@ class TestForwardImageEntry(unittest.TestCase):
         from custom import handler
         from custom.capabilities import image
         with patch.object(handler, "_download_image_to_path", return_value="/tmp/fake.png"), \
-             patch.object(image, "_recognize", return_value=""):
+             patch.object(image, "_recognize", autospec=True, side_effect=lambda *a, **k: ""):
             out = handler._fetch_image_entry("[图片消息](mediaId=$abc)", "m", "c")
         self.assertEqual(out, "[图片，识别失败]")   # 留标记，不静默丢弃
 

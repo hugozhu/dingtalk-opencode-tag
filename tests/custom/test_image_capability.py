@@ -51,7 +51,7 @@ class TestImageRouting(unittest.TestCase):
 class TestHandleImage(unittest.TestCase):
     def test_full_pipeline_replies_to_group(self):
         with patch.object(image, "_download_image", return_value=("/tmp/fake.png", "/tmp/dir")), \
-             patch.object(image, "_recognize", return_value="图中是等式 1 + 1 = 2"), \
+             patch.object(image, "_recognize", autospec=True, side_effect=lambda *a, **k: "图中是等式 1 + 1 = 2"), \
              patch.object(image, "generate_reply", return_value="这张图是 1+1=2，正确。") as gen, \
              patch.object(image, "send_reply", return_value=True) as snd:
             image.handle_image("hugozhu", "[图片消息](mediaId=$x)这题对吗",
@@ -78,7 +78,7 @@ class TestHandleImage(unittest.TestCase):
 
     def test_recognize_failure_notifies(self):
         with patch.object(image, "_download_image", return_value=("/tmp/f.png", "/tmp/dir")), \
-             patch.object(image, "_recognize", return_value=""), \
+             patch.object(image, "_recognize", autospec=True, side_effect=lambda *a, **k: ""), \
              patch.object(image, "generate_reply") as gen, \
              patch.object(image, "send_reply") as snd:
             image.handle_image("u", "[图片消息](mediaId=$x)", "m==", "c==", "2")
