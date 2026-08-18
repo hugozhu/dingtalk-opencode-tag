@@ -84,6 +84,11 @@ export AGENT_MEDIA_FAIL_TTL="${AGENT_MEDIA_FAIL_TTL:-60}"
 # 拼上下文时最多等识别多久（秒）。调用方跑在 reply 池（默认 4 个 worker），**绝不无限
 # 等** —— 等下去会让所有会话的回复一起排队饿死。等不到就降级（prompt 里说"识别中"）。
 export AGENT_MEDIA_WAIT_SEC="${AGENT_MEDIA_WAIT_SEC:-20}"
+# 跨进程单飞的锁参数：in-flight 表是进程内的，而 bin/custom/convq.py 是独立进程 ——
+# daemon 正在识别时 agent 查一次就是第二次下载 + 第二次视觉调用。锁 TTL 必须大于
+# 「下载 30s + 视觉 90s」，否则正常的慢识别会被别人抢走。
+export AGENT_MEDIA_LOCK_TTL="${AGENT_MEDIA_LOCK_TTL:-180}"
+export AGENT_MEDIA_PEER_WAIT="${AGENT_MEDIA_PEER_WAIT:-150}"
 
 # 追问时回看最近的图（src/custom/context.py，#112）：群里先发图（不 @）、紧接着 @ 提问，
 # 那张图会被 group_gate 吞掉，大脑什么也看不到。回看一眼同会话最近的图补进 prompt。
