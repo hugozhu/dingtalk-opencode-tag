@@ -113,12 +113,34 @@ v3 = ("可能" in prompt and "忽略" in prompt
       and "这个怎么理解" in prompt)
 v4 = len(downloads) == 1
 
+print("\n=== 3) 打开 premedia（默认关）：图一到就先识别好放着 ===")
+os.environ["CAP_PREMEDIA_ENABLED"] = "1"
+dispatch_inbound(InboundMessage(
+    user="李四", text="[图片消息](mediaId=$iwEcBBBB)", conv_type="2", conv_id=GRP,
+    msg_id="msgIMG2==", kind=KIND_IMAGE))
+_wait(lambda: msgstore.description_of(GRP, "msgIMG2=="))
+pre = msgstore.description_of(GRP, "msgIMG2==")
+print(f"    追问之前就已有描述: {bool(pre)} by={pre and pre.get('by')}")
+
+dl_before = len(downloads)
+dispatch_inbound(InboundMessage(
+    user="李四", text="@一粟 这张呢？", conv_type="2", conv_id=GRP,
+    msg_id="msgASK2==", kind=KIND_TEXT, extra={"at_mention": True}))
+_wait(lambda: len(prompts) > 1)
+prompt2 = prompts[1][0] if len(prompts) > 1 else ""
+print(f"    追问又下载了几次: {len(downloads) - dl_before}")
+
+v5 = bool(pre) and pre.get("by") == "premedia" and pre.get("ok")
+v6 = len(downloads) == dl_before and "考勤表" in prompt2
+
 print("\n=== 结果 ===")
 print(f"  V1 未 @ 的图被吞但已入库      : {'✅' if v1 else '❌'}")
 print(f"  V2 追问的 prompt 带上了图片内容: {'✅' if v2 else '❌'}（raw=True，不加发言人前缀）")
 print(f"  V3 措辞是推测语气且可忽略      : {'✅' if v3 else '❌'}（时间邻近≠用户在说它）")
 print(f"  V4 同一张图只下载一次          : {'✅' if v4 else '❌'}（单飞缓存生效）")
+print(f"  V5 premedia 在追问前就识别好了 : {'✅' if v5 else '❌'}（by=premedia）")
+print(f"  V6 追问零下载、直接命中缓存    : {'✅' if v6 else '❌'}（预识别没白做）")
 
-allok = v1 and v2 and v3 and v4
+allok = v1 and v2 and v3 and v4 and v5 and v6
 print("PASS" if allok else "FAIL")
 sys.exit(0 if allok else 1)

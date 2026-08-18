@@ -91,6 +91,14 @@ export AGENT_MEDIA_WAIT_SEC="${AGENT_MEDIA_WAIT_SEC:-20}"
 export AGENT_MEDIA_LOOKBACK_SEC="${AGENT_MEDIA_LOOKBACK_SEC:-120}"
 export AGENT_MEDIA_LOOKBACK_MAX="${AGENT_MEDIA_LOOKBACK_MAX:-3}"
 
+# 群图预识别（src/custom/capabilities/premedia.py，#112）：图一发出来就先识别好放着，
+# 追问到达时直接命中缓存、零等待。**默认关** —— 这是全仓唯一"为没人跟它说话的消息
+# 花钱"的能力，与 group_gate「没 @ 我就不动」的哲学相反：活跃群一天几百张截图全识别
+# 一遍是真金白银的视觉调用，而绝大多数永远不会有人追问。想开在 local 里显式设 1。
+export CAP_PREMEDIA_ENABLED="${CAP_PREMEDIA_ENABLED:-0}"
+# 每会话每 5 分钟最多预识别几张（有人一口气贴 20 张截图不该打爆视觉模型）
+export PREMEDIA_RATE_PER_5MIN="${PREMEDIA_RATE_PER_5MIN:-6}"
+
 # --- 业务特定（用户扩展）---
 # 在这里加自己的业务常量
 
