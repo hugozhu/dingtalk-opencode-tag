@@ -158,6 +158,9 @@ _REACTION_RE = re.compile(
 _REACTION_DEBOUNCE = float(os.environ.get("SUPERVISOR_REACTION_DEBOUNCE", "3") or 0)
 _debounce_timers = {}
 
+# 引用了图片时，最多等多久拿识别结果。跑在 reply 池（默认 4 个 worker），不能久等
+_MEDIA_WAIT = _env_int("AGENT_MEDIA_WAIT_SEC", 20)
+
 # 引用回复的标记（bridge 在行尾追加，见 classify_line）
 _QUOTED_RE = re.compile(r"\bquotedMsgId=([^\s)]+)")
 _QUOTED_SEQ_RE = re.compile(r"\bquotedSeq=(\d+|\?)")
@@ -791,7 +794,8 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id, quoted_msg_id=Non
     # 被引用的消息要进上下文（#112）：先查本地存储，查不到回落 CLI。取不到就照常，
     # 只是少一段上下文，不该让整条消息处理不了。
     prompt, raw = text, False
-    q = quoted.resolve(conv_id, quoted_msg_id) if quoted_msg_id else None
+    q = (quoted.resolve(conv_id, quoted_msg_id, media_wait=_MEDIA_WAIT)
+         if quoted_msg_id else None)
     if q:
         prompt, raw = quoted.build_prompt(user, text, q), True
         log(f"supervisor_review: 已补入被引用消息的上下文 from={q.get('sender')!r} "

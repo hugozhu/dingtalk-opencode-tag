@@ -29,6 +29,9 @@ from core.brain import generate_reply, register_session as _register_textreply_s
 from core.replier import send_reply
 
 # 图片 mediaId 提取（content 形如 "[图片消息](mediaId=$xxx)"，ID 含 $@/_- 等，止于 )）
+# 识别等待上限（秒）：handle_image 跑在 task 池，等太久会占着 worker 不放
+_VISION_WAIT = int(os.environ.get("AGENT_MEDIA_WAIT_SEC", "120") or 120)
+
 _RE_MEDIA_ID = re.compile(r"mediaId=([^\s)]+)")
 # 去掉 content 里的图片标记，剩下的当用户 caption（"[图片消息](mediaId=x)看标红处" → "看标红处"）
 _RE_IMAGE_TAG = re.compile(r"\[图片消息\]\(mediaId=[^\s)]+\)")
@@ -174,12 +177,13 @@ def handle_image(user, text, msg_id, conv_id, conv_type):
     media_id = mid_m.group(1)
     caption = _RE_IMAGE_TAG.sub("", text or "").strip()  # 图外的说明文字
 
-    image_path, tmp_dir = _download_image(media_id, msg_id, conv_id)
-    if not image_path:
+    # 走单飞：同一张图可能同时被预识别/追问回看要到，谁先到谁真跑，别重复下载+识别
+    # （at_mention 是每份投递的属性，靠它分流必然重复，见 custom/mediadesc）
+    from custom import mediadesc
+    desc, st = mediadesc.describe(conv_id, msg_id, text, wait=_VISION_WAIT, by="image")
+    if st == "download":
         send_reply(conv_id, conv_type, "抱歉，这张图片我没能下载下来，能再发一次吗？")
         return
-
-    desc = _recognize(image_path, tmp_dir)
     if not desc:
         send_reply(conv_id, conv_type,
                    "抱歉，图片内容识别失败了（可能是识别服务不可达）。你可以把关键内容用文字发我。")

@@ -75,6 +75,35 @@ class TestResolve(_Base):
             self.assertTrue(quoted.resolve(CONV, "m" + t)["media"], t)
 
 
+class TestQuotedMedia(_Base):
+    """引用一张图 = **显式证据**，用户明确指了它 —— 这条路最该带上识别结果。"""
+
+    def test_media_wait_triggers_recognition(self):
+        from custom import mediadesc
+        self._store("mImg", "[图片消息](mediaId=$abc)")
+        with patch.object(mediadesc, "describe", return_value=("图中是一张考勤表", "ok")):
+            q = quoted.resolve(CONV, "mImg", media_wait=5)
+        self.assertEqual(q["desc"], "图中是一张考勤表")
+        self.assertIn("考勤表", quoted.build_prompt("张三", "看一下", q))
+
+    def test_without_wait_no_recognition(self):
+        """不等就不识别（调用方明确表示不想被视觉调用堵住）。"""
+        from custom import mediadesc
+        self._store("mImg2", "[图片消息](mediaId=$abc)")
+        with patch.object(mediadesc, "describe") as d:
+            q = quoted.resolve(CONV, "mImg2")
+        d.assert_not_called()
+        self.assertEqual(q["desc"], "")
+
+    def test_recognition_pending_falls_back_to_notice(self):
+        """识别没赶上 → 退回"我看不到图"的说法，而不是假装有内容。"""
+        from custom import mediadesc
+        self._store("mImg3", "[图片消息](mediaId=$abc)")
+        with patch.object(mediadesc, "describe", return_value=("", "pending")):
+            q = quoted.resolve(CONV, "mImg3", media_wait=1)
+        self.assertIn("看不到", quoted.build_prompt("张三", "看一下", q))
+
+
 class TestBuildPrompt(unittest.TestCase):
     def test_blocks_are_separated(self):
         """分块写 —— 混成一句话下游会把引用内容当成用户的诉求。"""

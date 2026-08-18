@@ -169,45 +169,17 @@ def _shard_days(conv_id, path=None):
     return sorted(days, reverse=True)
 
 
-def find(conv_id, msg_id, path=None):
-    """按 msgId 查回一条消息记录；查不到返回 None。
+def _scan(conv_id, pred, path=None, newest_first=True, limit=0, days=None):
+    """在该会话的分片里扫记录，命中 pred 的收集起来。
 
-    从最新一天往回扫，**同一天内取最后一条**（同 id 可能被重投写过多次，最后一条最新）。
+    分片按天切、按新→旧遍历；**同一天内取最后一条**（同一 id 可能被重投写过多次）。
     扫描范围由保留天数封顶，不会随时间无限变慢。
+    收敛成一个函数是因为 find/feedback_of/description_of/recent_media 本来是四段几乎
+    一样的循环 —— 再加一种记录类型时不该又抄一遍。
     """
-    if not msg_id:
-        return None
-    for day in _shard_days(conv_id, path=path):
-        hit = None
-        p = _shard(conv_id, day=day, path=path)
-        try:
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                for ln in f:
-                    ln = ln.strip()
-                    if not ln:
-                        continue
-                    # 不做"子串预筛"式的优化：那要假设 id 在行里字面出现，一旦某个写入方
-                    # 用了 ensure_ascii（把中文转成 \uXXXX）或 id 含被转义的字符，就会
-                    # **静默漏查**。分片按"会话+天"切过，逐行解析的开销可以接受。
-                    try:
-                        r = json.loads(ln)
-                    except ValueError:
-                        continue        # 坏行跳过：查询是尽力而为，不该因一行坏了就失败
-                    if isinstance(r, dict) and r.get("t") == "msg" and r.get("id") == msg_id:
-                        hit = r
-        except OSError:
-            continue
-        if hit:
-            return hit
-    return None
-
-
-def feedback_of(conv_id, msg_id, path=None):
-    """这条消息的裁决反馈（最后一条）；没有返回 None。"""
-    if not msg_id:
-        return None
-    for day in _shard_days(conv_id, path=path):
-        hit = None
+    out = []
+    for day in _shard_days(conv_id, path=path)[:days or None]:
+        hits = []
         try:
             with open(_shard(conv_id, day=day, path=path), "r",
                       encoding="utf-8", errors="replace") as f:
@@ -215,17 +187,80 @@ def feedback_of(conv_id, msg_id, path=None):
                     ln = ln.strip()
                     if not ln:
                         continue
+                    # 不做"子串预筛"式的优化：那要假设 id 在行里字面出现，一旦某个写入方
+                    # 用了 ensure_ascii（把中文转成 \uXXXX）就会**静默漏查**。
                     try:
                         r = json.loads(ln)
                     except ValueError:
-                        continue
-                    if isinstance(r, dict) and r.get("t") == "fb" and r.get("id") == msg_id:
-                        hit = r
+                        continue    # 坏行跳过：查询是尽力而为，不该因一行坏了就失败
+                    if isinstance(r, dict) and pred(r):
+                        hits.append(r)
         except OSError:
             continue
-        if hit:
-            return hit
-    return None
+        if newest_first:
+            hits.reverse()
+        out.extend(hits)
+        if limit and len(out) >= limit:
+            return out[:limit]
+    return out[:limit] if limit else out
+
+
+def find(conv_id, msg_id, path=None):
+    """按 msgId 查回一条消息记录；查不到返回 None。"""
+    if not msg_id:
+        return None
+    hits = _scan(conv_id, lambda r: r.get("t") == "msg" and r.get("id") == msg_id,
+                 path=path, limit=1)
+    return hits[0] if hits else None
+
+
+def feedback_of(conv_id, msg_id, path=None):
+    """这条消息的裁决反馈（最后一条）；没有返回 None。"""
+    if not msg_id:
+        return None
+    hits = _scan(conv_id, lambda r: r.get("t") == "fb" and r.get("id") == msg_id,
+                 path=path, limit=1)
+    return hits[0] if hits else None
+
+
+def record_description(conv_id, msg_id, text, by="", ok=True, err="", path=None):
+    """记一条"这张图识别出来是什么"。失败也要记（ok=False）—— 否则坏 mediaId 会被
+    反复重试，每次都是一轮下载 + 视觉超时。"""
+    if not msg_id:
+        return False
+    desc, trunc = _clip(text)       # 密集文字截图的 OCR 轻松超上限，不截会撑爆分片
+    rec = {"t": "desc", "id": msg_id, "conv": conv_id, "text": desc,
+           "by": by, "ok": bool(ok), "err": err, "ts": int(time.time())}
+    if trunc:
+        rec["trunc"] = True
+    return _append(conv_id, rec, path=path)
+
+
+def description_of(conv_id, msg_id, path=None):
+    """这张图的识别结果记录（最后一条）；没有返回 None。"""
+    if not msg_id:
+        return None
+    hits = _scan(conv_id, lambda r: r.get("t") == "desc" and r.get("id") == msg_id,
+                 path=path, limit=1)
+    return hits[0] if hits else None
+
+
+def recent_media(conv_id, sender=None, within_sec=120, limit=3, path=None):
+    """会话里最近的媒体消息（新→旧）。用于"先发图、再追问"的回看。
+
+    - **跨天扫**：分片按 %Y-%m-%d 切，而守护进程跑 UTC —— 23:59 发图、00:01 追问，
+      只扫今天就查不到（这个仓库已经因为时区/边界静默失效过一次，531d039）
+    - 只取 dir=="in"（自己发出去的不算）
+    - 跳过已经被单独回复过的（描述已经在会话历史里，再塞一遍是重复）
+    """
+    cutoff = time.time() - within_sec
+    hits = _scan(conv_id,
+                 lambda r: (r.get("t") == "msg" and r.get("dir") == "in"
+                            and (r.get("ts") or 0) >= cutoff
+                            and "mediaId=" in (r.get("text") or "")
+                            and (sender is None or r.get("from") == sender)),
+                 path=path, limit=limit, days=2)
+    return hits
 
 
 def prune(keep_days=None, path=None):

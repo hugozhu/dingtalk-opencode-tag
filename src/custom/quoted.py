@@ -54,10 +54,12 @@ def _from_cli(msg_id):
     return None
 
 
-def resolve(conv_id, msg_id):
-    """取回被引用的消息 → {"text", "sender", "media"}；取不到返回 None。
+def resolve(conv_id, msg_id, media_wait=None):
+    """取回被引用的消息 → {"text", "sender", "media", "desc"}；取不到返回 None。
 
-    media=True 表示被引用的是图片/文件这类媒体消息（第一阶段不做识别，见模块 docstring）。
+    被引用的是图片时会尝试识别（走 mediadesc 单飞，可能命中已有描述而零开销）——
+    **引用是显式证据**，用户明确指了这张图，比"时间上挨着"的猜测可靠得多，所以这条路
+    最该带上识别结果。media_wait=None 表示不等（只发起）。
     """
     if not msg_id:
         return None
@@ -65,7 +67,13 @@ def resolve(conv_id, msg_id):
     if not got:
         return None
     text, sender = got
-    return {"text": text, "sender": sender, "media": bool(_MEDIA_RE.match(text or ""))}
+    media = bool(_MEDIA_RE.match(text or ""))
+    desc = ""
+    if media and media_wait:
+        from custom import mediadesc
+        desc, _st = mediadesc.describe(conv_id, msg_id, text, wait=media_wait,
+                                       by="quoted")
+    return {"text": text, "sender": sender, "media": media, "desc": desc}
 
 
 def build_prompt(user, text, quoted):
@@ -75,7 +83,9 @@ def build_prompt(user, text, quoted):
     引用内容当成用户的诉求。
     """
     who = quoted.get("sender") or "某人"
-    if quoted.get("media"):
+    if quoted.get("desc"):
+        body = "（这是一张图片，以下是它的内容识别结果）\n" + quoted["desc"]
+    elif quoted.get("media"):
         body = ("（这是一张图片或一个文件，我目前还看不到它的内容 —— 如果用户的问题依赖"
                 "它的具体内容，请说明你需要对方直接把它发给你，不要猜测内容。）")
     else:
