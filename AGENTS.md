@@ -110,6 +110,10 @@ bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路�
 | `src/core/event_watcher.py` | @core | `connect_sse` / `log_tail_thread` / `format_and_forward` | 事件流主进程（调用 custom.routes 的 hook） |
 | `src/custom/handler.py` | @custom | `fetch_attachments` / `render_prompt` / `_lookup_senders_batch` / `match_business_line` | 业务 handler（FDE 改这里） |
 | `src/custom/routes.py` | @custom | `route_reply` / `route_business_line` / `route_sse_event` | 业务路由注册（FDE 改这里，不改 core） |
+| `src/custom/msgstore.py` | @custom | `record` / `transcript` / `search` / `message` / `recent_media` | 消息落盘存储 + 查询时 join desc/fb |
+| `src/custom/mediadesc.py` | @custom | `describe` / `describe_sync` / `_acquire` | 图片识别单飞（进程内 Future + 跨进程文件锁） |
+| `src/custom/convq.py` | @custom | `main` / `cmd_hint` / `CLI_PATH` | 给大脑查本会话记录的 CLI（入口 `bin/custom/convq.py`） |
+| `src/custom/context.py` | @custom | `build` | 拼这一轮的上下文（引用优先、时间窗其次，不阻塞） |
 | `src/templates/handler_template.py` | @template | (同 custom/handler.py 的纯净版) | diff 基线，不要改 |
 | `tests/core/test_agent_common.py` | @core | `TestCleanSessionTitle` / `TestHandlerPools` | Python 单测 |
 | `tests/core/unit_test.sh` | @core | (脚本本身，含 dws-connect 订阅选择) | shell 单测 |
@@ -238,3 +242,5 @@ systemctl --user start dingtalk-agent.service     # 启动
 - **不要**用 `flock`（macOS 不可用）——用 `shlock` 或文件存在性判断
 - **不要**用 `tee -a file >&2`（launchd 已重定向 stderr 到同一文件，会双写）——`log()` 只写 stderr
 - **不要**把真实凭据写入 `config/config.example.json` 或 `config/constants.sh`——只填 `*.local.*`（已 gitignore）
+- **不要**直接 `cat`/`grep` `knowledge/messages/*/*.jsonl`——用 `bin/custom/convq.py`：它按会话限定、把图片识别结果与主管裁决 join 到消息上、时间戳按本地时区渲染、输出有上限。裸读拿到的是 epoch 秒和三种散落的记录类型，容易读错
+- **不要**在 `config/constants.sh` 里加了配置就以为生效了——`constants.local.sh` 是**替代**不是叠加（见 `bin/core/healthcheck.sh` 的 `if/elif`），要真生效必须同时写进 local 那份
