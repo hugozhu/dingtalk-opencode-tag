@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../src'))
 
-from custom import brain  # noqa: E402
+from custom import brain, convq  # noqa: E402
 
 
 class TestKnowledgeInjection(unittest.TestCase):
@@ -114,6 +114,43 @@ class TestKnowledgeInjection(unittest.TestCase):
     def test_effective_prompt_unchanged_without_knowledge(self):
         """无知识 → 与原 _SYSTEM_PROMPT 完全一致（零行为变化）。"""
         self.assertEqual(brain._effective_system_prompt(), brain._SYSTEM_PROMPT)
+
+
+class TestConvqHint(unittest.TestCase):
+    """告诉大脑「这个会话的历史能查」。conv_id 由 ctx 带进来，不让它自己填。"""
+
+    CONV = "cidQUwzlI5Y+edy9mlQuCbqf/PML5zzQGOkDHSQfIeaPP4g="
+
+    def test_no_conv_id_is_byte_identical(self):
+        """**零影响纪律**：不传 conv_id 时必须和加这个功能之前一模一样。"""
+        self.assertEqual(brain._convq_hint(""), "")
+        self.assertEqual(brain._effective_system_prompt(),
+                         brain._SYSTEM_PROMPT + brain._load_knowledge())
+
+    def test_hint_carries_conv_id_and_absolute_path(self):
+        h = brain._convq_hint(self.CONV)
+        self.assertIn(self.CONV, h)
+        self.assertIn(convq.CLI_PATH, h)
+        self.assertTrue(os.path.isabs(convq.CLI_PATH))
+
+    def test_conv_id_is_quoted_for_shell(self):
+        """conv_id 含 `+ / =`，不加引号大脑复制过去就是一条坏命令。"""
+        self.assertIn(f"--conv '{self.CONV}'", brain._convq_hint(self.CONV))
+
+    def test_hint_redirects_away_from_raw_jsonl(self):
+        """本次改造的核心意图：把「自己去 cat jsonl」这个本能**改道**，不只是补充。"""
+        h = brain._convq_hint(self.CONV)
+        self.assertIn("不要直接读", h)
+        self.assertIn("jsonl", h)
+
+    def test_hint_mentions_unaddressed_group_messages(self):
+        """群里没 @ 它的消息被 group_gate 吞掉了 —— 不点名说，大脑不会想到去查。"""
+        self.assertIn("没 @ 你的消息", brain._convq_hint(self.CONV))
+
+    def test_effective_prompt_appends_hint_after_knowledge(self):
+        p = brain._effective_system_prompt(self.CONV)
+        self.assertTrue(p.startswith(brain._SYSTEM_PROMPT))
+        self.assertIn(self.CONV, p)
 
 
 if __name__ == "__main__":
