@@ -161,6 +161,104 @@ class TestPrune(_Base):
         self.assertEqual(msgstore.prune(keep_days=1, path=os.path.join(self.root, "无")), 0)
 
 
+class TestQueryJoins(_Base):
+    """查询时把 desc/fb join 到消息上 —— 存储保持追加日志，AI Ready 体现在查询侧。"""
+
+    def _write(self, day, recs):
+        d = os.path.join(self.root, msgstore.conv_key(CONV))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{day}.jsonl"), "a", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    def _today(self):
+        return time.strftime("%Y-%m-%d")
+
+    def _yesterday(self):
+        return time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+
+    def test_transcript_joins_desc_and_fb(self):
+        msgstore.record(_msg("mIMG", "[图片消息](mediaId=$x)", kind="image"), "in",
+                        path=self.root)
+        msgstore.record(_msg("mASK", "这个图你统计下"), "in", path=self.root)
+        msgstore.record_description(CONV, "mIMG", "8月考勤表", by="premedia",
+                                    path=self.root)
+        msgstore.record_feedback(CONV, "mASK", seq=7, action="answered",
+                                 answer="迟到 2 次", by="朱鸿", path=self.root)
+        rows = msgstore.transcript(CONV, path=self.root)
+        by_id = {r["msg"]["id"]: r for r in rows}
+        self.assertEqual(by_id["mIMG"]["desc"]["text"], "8月考勤表")
+        self.assertIsNone(by_id["mIMG"]["fb"])
+        self.assertEqual(by_id["mASK"]["fb"]["answer"], "迟到 2 次")
+        self.assertIsNone(by_id["mASK"]["desc"])
+
+    def test_transcript_is_oldest_first(self):
+        """正序：倒着讲的对话读起来是反的。"""
+        for i in range(3):
+            msgstore.record(_msg(f"m{i}", f"第{i}句"), "in", path=self.root)
+        rows = msgstore.transcript(CONV, path=self.root)
+        self.assertEqual([r["msg"]["id"] for r in rows], ["m0", "m1", "m2"])
+
+    def test_transcript_limit_takes_newest(self):
+        for i in range(5):
+            msgstore.record(_msg(f"m{i}"), "in", path=self.root)
+        rows = msgstore.transcript(CONV, limit=2, path=self.root)
+        self.assertEqual([r["msg"]["id"] for r in rows], ["m3", "m4"])
+
+    def test_desc_written_after_midnight_still_joins(self):
+        """**跨午夜**：图在昨天发、识别在今天才落盘，只扫同样天数会漏（531d039 那类边界）。"""
+        self._write(self._yesterday(), [
+            {"t": "msg", "dir": "in", "id": "mIMG", "conv": CONV, "from": "张三",
+             "kind": "image", "text": "[图片消息](mediaId=$x)",
+             "ts": int(time.time()) - 86400}])
+        self._write(self._today(), [
+            {"t": "desc", "id": "mIMG", "conv": CONV, "text": "考勤表",
+             "by": "ondemand", "ok": True, "ts": int(time.time())}])
+        rows = msgstore.transcript(CONV, days=1, path=self.root)
+        self.assertEqual(len(rows), 0, "days=1 时昨天的消息本就不该出现")
+        rows = msgstore.transcript(CONV, days=2, path=self.root)
+        self.assertEqual(rows[0]["desc"]["text"], "考勤表")
+
+    def test_search_hits_ocr_text(self):
+        """「上次那张写着预算的截图」—— 只有搜 OCR 才找得到，这就是描述落盘的意义。"""
+        msgstore.record(_msg("mIMG", "[图片消息](mediaId=$x)", kind="image"), "in",
+                        path=self.root)
+        msgstore.record_description(CONV, "mIMG", "Q3 预算表：市场 120 万", by="image",
+                                    path=self.root)
+        hits = msgstore.search(CONV, "预算", path=self.root)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["msg"]["id"], "mIMG")      # 返回的是所属消息
+        self.assertIn("预算", hits[0]["desc"]["text"])
+
+    def test_search_deduplicates_double_hits(self):
+        """正文和 OCR 都命中时只算一条，否则 limit 会被同一条消息吃掉。"""
+        msgstore.record(_msg("mIMG", "预算的图", kind="image"), "in", path=self.root)
+        msgstore.record_description(CONV, "mIMG", "预算表", by="image", path=self.root)
+        self.assertEqual(len(msgstore.search(CONV, "预算", path=self.root)), 1)
+
+    def test_search_is_case_insensitive_and_bounded(self):
+        for i in range(30):
+            msgstore.record(_msg(f"m{i}", "Deploy 上线"), "in", path=self.root)
+        self.assertEqual(len(msgstore.search(CONV, "deploy", limit=5, path=self.root)), 5)
+
+    def test_search_empty_keyword_returns_nothing(self):
+        msgstore.record(_msg("m1", "随便"), "in", path=self.root)
+        self.assertEqual(msgstore.search(CONV, "   ", path=self.root), [])
+
+    def test_message_returns_full_view(self):
+        msgstore.record(_msg("m1", "报销怎么走"), "in", path=self.root)
+        msgstore.record_feedback(CONV, "m1", action="answered", answer="找小王",
+                                 path=self.root)
+        v = msgstore.message(CONV, "m1", path=self.root)
+        self.assertEqual(v["msg"]["text"], "报销怎么走")
+        self.assertEqual(v["fb"]["answer"], "找小王")
+        self.assertIsNone(msgstore.message(CONV, "不存在", path=self.root))
+
+    def test_empty_conversation_returns_empty(self):
+        self.assertEqual(msgstore.transcript("cid空==", path=self.root), [])
+        self.assertEqual(msgstore.search("cid空==", "x", path=self.root), [])
+
+
 class TestRobustness(_Base):
     def test_bad_lines_do_not_break_lookup(self):
         d = os.path.join(self.root, msgstore.conv_key(CONV))

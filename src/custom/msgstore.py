@@ -265,6 +265,79 @@ def recent_media(conv_id, sender=None, within_sec=120, limit=3, path=None):
     return hits
 
 
+def _attach(conv_id, msgs, days=None, path=None):
+    """给一批消息挂上各自的 desc / fb → `[{"msg","desc","fb"}]`（保持传入顺序）。
+
+    **第二趟多扫一天**：图在午夜前发、desc 在午夜后才写完，而分片按 `%Y-%m-%d` 切 ——
+    只扫同样天数就会把这条 desc 漏掉（与 531d039 同一类边界 bug，代价只是多读一个分片）。
+    """
+    ids = {m.get("id") for m in msgs if m.get("id")}
+    if not ids:
+        return [{"msg": m, "desc": None, "fb": None} for m in msgs]
+    side = _scan(conv_id,
+                 lambda r: r.get("t") in ("desc", "fb") and r.get("id") in ids,
+                 path=path, days=(days + 1) if days else None)
+    desc, fb = {}, {}
+    for r in side:                  # _scan 是新→旧，故首次见到的就是最新那条
+        (desc if r.get("t") == "desc" else fb).setdefault(r.get("id"), r)
+    return [{"msg": m, "desc": desc.get(m.get("id")), "fb": fb.get(m.get("id"))}
+            for m in msgs]
+
+
+def transcript(conv_id, limit=30, days=2, path=None):
+    """最近 limit 条消息 + 各自的识别结果/主管裁决，**时间正序**（先发的在前）。
+
+    正序是因为它的唯一消费者是"把会话讲给大脑听"——倒序的对话读起来是反的。
+    """
+    msgs = _scan(conv_id, lambda r: r.get("t") == "msg",
+                 path=path, limit=limit, days=days)
+    msgs.reverse()                  # _scan 给的是新→旧
+    return _attach(conv_id, msgs, days=days, path=path)
+
+
+def search(conv_id, keyword, limit=20, days=7, where="all", path=None):
+    """按子串找消息（大小写不敏感），**新→旧**。
+
+    `where="all"` 时**连图片的识别文本一起搜** —— 群里那句「上次那张写着预算的截图」
+    只有搜 OCR 才找得到，这正是把描述落盘的意义。命中 desc 时返回它所属的那条消息。
+    """
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        return []
+
+    def _hit(r):
+        t = r.get("t")
+        if t == "msg" and where in ("all", "msg"):
+            return kw in (r.get("text") or "").lower()
+        if t == "desc" and where in ("all", "desc"):
+            return kw in (r.get("text") or "").lower()
+        return False
+
+    # 不给 _scan 传 limit：同一条消息可能既在正文命中又在 desc 命中，去重后才够数
+    seen, msgs = set(), []
+    for r in _scan(conv_id, _hit, path=path, days=days):
+        mid = r.get("id")
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        m = r if r.get("t") == "msg" else find(conv_id, mid, path=path)
+        if m:
+            msgs.append(m)
+        if len(msgs) >= limit:
+            break
+    return _attach(conv_id, msgs, days=days, path=path)
+
+
+def message(conv_id, msg_id, path=None):
+    """一条消息的全貌（正文 + 识别结果 + 裁决）→ `{"msg","desc","fb"}`；没有返回 None。"""
+    m = find(conv_id, msg_id, path=path)
+    if not m:
+        return None
+    return {"msg": m,
+            "desc": description_of(conv_id, msg_id, path=path),
+            "fb": feedback_of(conv_id, msg_id, path=path)}
+
+
 def prune(keep_days=None, path=None):
     """删掉过期分片，返回删了几个。
 
