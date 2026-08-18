@@ -67,7 +67,7 @@ from core.brain import generate_reply_ex
 from core.capabilities import Capability, dispatch_reply_sent, register
 from core.inbound import InboundMessage, KIND_TEXT, parse_line
 from core.replier import send_reply
-from custom import msgstore
+from custom import msgstore, quoted
 from custom.identity import is_supervisor, supervisor_id, supervisor_names
 
 # 超时未裁决 → 按**不回复**处理并归档（秒），主管事后引用卡片仍可补裁。
@@ -785,10 +785,18 @@ def _revive_seq(seq):
     return True
 
 
-def _draft_and_forward(user, text, conv_type, conv_id, msg_id):
+def _draft_and_forward(user, text, conv_type, conv_id, msg_id, quoted_msg_id=None):
     """后台线程：生成草稿 → 转交主管 → 登记待审。"""
     global _seq_counter
-    draft, status = generate_reply_ex(user, text, ctx={
+    # 被引用的消息要进上下文（#112）：先查本地存储，查不到回落 CLI。取不到就照常，
+    # 只是少一段上下文，不该让整条消息处理不了。
+    prompt, raw = text, False
+    q = quoted.resolve(conv_id, quoted_msg_id) if quoted_msg_id else None
+    if q:
+        prompt, raw = quoted.build_prompt(user, text, q), True
+        log(f"supervisor_review: 已补入被引用消息的上下文 from={q.get('sender')!r} "
+            f"media={q.get('media')}")
+    draft, status = generate_reply_ex(user, prompt, raw=raw, ctx={
         "conv_id": conv_id, "conv_type": conv_type, "msg_id": msg_id, "user": user,
     })
     # 草稿生成失败也要转交 —— 主管仍可手写答案，不能因模型挂了就把问题丢了
@@ -1124,8 +1132,11 @@ def on_inbound(msg):
         return consumed
 
     # 其余（含主管的群消息）：拦下来，后台出草稿 + 转交主管（不回提问者）
+    # 带上被引用消息的 id：群里"引用一条消息再 @ 我"时，用户那句话（「看一下」）离开被
+    # 引用的内容就没有意义（#112）。**裁决路径不经这里**，所以主管引用卡片仍按「待审 #N」
+    # 走裁决，不会被当成"提问的上下文"。
     submit_reply(_draft_and_forward, msg.user, msg.text, msg.conv_type,
-                 msg.conv_id, msg.msg_id)
+                 msg.conv_id, msg.msg_id, (msg.extra or {}).get("quoted_msg_id"))
     return True
 
 

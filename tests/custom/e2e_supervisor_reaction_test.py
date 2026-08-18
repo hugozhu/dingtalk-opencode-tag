@@ -79,7 +79,7 @@ def fake_run_cli(args, timeout=60):
 CR.register_replier(fake_send_impl)
 SR._send_to_supervisor = fake_card
 SR._run_cli = fake_run_cli
-SR.generate_reply_ex = lambda user, text, ctx=None: ("AI 草稿：我能干这些", "ok")
+SR.generate_reply_ex = lambda user, text, ctx=None, raw=False: ("AI 草稿：我能干这些", "ok")
 ACK._mark_read = lambda conv_id, msg_id: True
 ACK._emotion_id = lambda emoji, text: ("eid", "bid")
 ACK._add_text_emotion = lambda *a: True

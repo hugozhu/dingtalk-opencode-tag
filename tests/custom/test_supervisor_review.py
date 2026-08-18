@@ -827,6 +827,77 @@ class TestJournal(_Base):
         self.assertTrue(os.path.exists(self.journal))
 
 
+class TestQuotedContext(_Base):
+    """群里"引用一条消息再 @ 我"时，被引用的内容要进上下文（#112）。
+
+    真实案例：主管引用一张图片 + 「@一粟 看一下」，大脑却只收到「看一下」。
+    """
+
+    def test_quoted_content_enters_draft_prompt(self):
+        from custom import quoted as Q
+        seen = {}
+
+        def fake_brain(user, text, ctx=None, raw=False):
+            seen["prompt"], seen["raw"] = text, raw
+            return "草稿", "ok"
+
+        with patch.object(Q, "resolve",
+                          return_value={"text": "季度目标定了吗？", "sender": "可菡",
+                                        "media": False}), \
+             patch.object(sr, "generate_reply_ex", fake_brain), \
+             patch.object(sr, "_send_to_supervisor", return_value=True), \
+             patch.object(sr, "send_reply"):
+            sr._draft_and_forward("hugozhu", "@一粟 看一下", "2", "cid群", "m1",
+                                  "被引用的msgId")
+        self.assertTrue(seen["raw"], "结构化 prompt 必须走 raw=True，否则会被再拼一层前缀")
+        self.assertIn("季度目标定了吗？", seen["prompt"])
+        self.assertIn("看一下", seen["prompt"])
+
+    def test_no_quote_keeps_plain_text(self):
+        """没引用时行为不变（仍是纯文本 + raw=False）。"""
+        seen = {}
+
+        def fake_brain(user, text, ctx=None, raw=False):
+            seen["prompt"], seen["raw"] = text, raw
+            return "草稿", "ok"
+
+        with patch.object(sr, "generate_reply_ex", fake_brain), \
+             patch.object(sr, "_send_to_supervisor", return_value=True), \
+             patch.object(sr, "send_reply"):
+            sr._draft_and_forward("张三", "报销怎么走", "1", "cidZhang", "m1")
+        self.assertFalse(seen["raw"])
+        self.assertEqual(seen["prompt"], "报销怎么走")
+
+    def test_unresolvable_quote_does_not_block(self):
+        """取不到被引用内容 → 照常出草稿，只是少一段上下文。"""
+        from custom import quoted as Q
+        with patch.object(Q, "resolve", return_value=None), \
+             patch.object(sr, "generate_reply_ex", return_value=("草稿", "ok")), \
+             patch.object(sr, "_send_to_supervisor", return_value=True) as sup, \
+             patch.object(sr, "send_reply"):
+            sr._draft_and_forward("张三", "看一下", "2", "cid群", "m1", "查不到的id")
+        sup.assert_called_once()
+        self.assertEqual(len(sr._pending), 1)
+
+    def test_supervisor_verdict_is_not_treated_as_context(self):
+        """**交叉验证**：主管引用卡片回「同意」仍走裁决，不能被当成"提问的上下文"。
+
+        两条路都用 quotedMsgId，必须确认它们不打架。
+        """
+        from custom import quoted as Q
+        self._escalate(user="张三", conv_id="cidZhang", draft="AI草稿")
+        msg = _msg("boss", "同意", conv_id="cidBoss", msg_id="m9")
+        msg.extra.update({"quoted": True, "quoted_seq": 1, "quoted_msg_id": "cardMsg1"})
+        with patch.object(Q, "resolve") as res, \
+             patch.object(sr, "submit_reply") as sub, \
+             patch.object(sr, "_send_to_supervisor"), \
+             patch.object(sr, "send_reply") as rep:
+            self.assertTrue(sr.on_inbound(msg))
+        res.assert_not_called()          # 没去取引用内容
+        sub.assert_not_called()          # 没被当成新提问送审
+        self.assertEqual(rep.call_args[0][2], "AI草稿")   # 正常放行了草稿
+
+
 class TestQuotedJudge(_Base):
     """引用回复 = 正式作答：内容交大模型判能不能原样发给提问者（#107）。
 

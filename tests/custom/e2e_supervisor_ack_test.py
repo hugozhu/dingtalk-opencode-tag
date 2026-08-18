@@ -108,7 +108,7 @@ ACK._run_cli = fake_cli
 ACK._mark_read = lambda conv_id, msg_id: True
 ACK._emotion_id = lambda emoji, text: ("eid", "bid")
 SR._send_to_supervisor = fake_card
-SR.generate_reply_ex = lambda user, text, ctx=None: ("AI 草稿：我能干这些", "ok")
+SR.generate_reply_ex = lambda user, text, ctx=None, raw=False: ("AI 草稿：我能干这些", "ok")
 SR._locate_card_msg_id = lambda seq: ""   # 反查卡片 msgId 会真调 dws，本测不关心贴表情
 
 # 反证开关：E2E_SIMULATE_BUG=1 只把 _close_ack 变成 no-op（其余一字不改），精确还原
