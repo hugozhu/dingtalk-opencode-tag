@@ -72,6 +72,25 @@ export VISION_MODEL="${VISION_MODEL:-gemini-3.1-flash-image}"
 # 留空则只用外部 proxy (PROXY_URL + VISION_MODEL)。
 export AGENT_VISION_MODEL="${AGENT_VISION_MODEL:-}"
 
+# 图片描述的单飞识别（src/custom/mediadesc.py，#112）。同一张图只识别一次：at_mention
+# 是**每份投递**的属性，群订阅 + DWS_EVENT_AT 同开时一条被 @ 的图会进来两份且群流那份
+# 没有 @ 标记，靠标记分流必然重复下载 + 重复视觉调用。
+# 同时最多几个识别在跑。task 池默认才 8 个 worker 且与 file/forward/audio 共用 ——
+# 群里有人贴 20 张截图时不设上限会把池占满，真正被 @ 的重活反而排不上。
+export AGENT_MEDIA_MAX_INFLIGHT="${AGENT_MEDIA_MAX_INFLIGHT:-2}"
+# 识别失败后多久允许重试（秒）。坏 mediaId 不该被窗口内每条追问反复重试（每次都是
+# 一轮下载 + 视觉超时）。
+export AGENT_MEDIA_FAIL_TTL="${AGENT_MEDIA_FAIL_TTL:-60}"
+# 拼上下文时最多等识别多久（秒）。调用方跑在 reply 池（默认 4 个 worker），**绝不无限
+# 等** —— 等下去会让所有会话的回复一起排队饿死。等不到就降级（prompt 里说"识别中"）。
+export AGENT_MEDIA_WAIT_SEC="${AGENT_MEDIA_WAIT_SEC:-20}"
+
+# 追问时回看最近的图（src/custom/context.py，#112）：群里先发图（不 @）、紧接着 @ 提问，
+# 那张图会被 group_gate 吞掉，大脑什么也看不到。回看一眼同会话最近的图补进 prompt。
+# 窗口刻意短：越长越容易把无关的旧图挂到新问题上。措辞是推测语气 + 明确授权模型忽略。
+export AGENT_MEDIA_LOOKBACK_SEC="${AGENT_MEDIA_LOOKBACK_SEC:-120}"
+export AGENT_MEDIA_LOOKBACK_MAX="${AGENT_MEDIA_LOOKBACK_MAX:-3}"
+
 # --- 业务特定（用户扩展）---
 # 在这里加自己的业务常量
 

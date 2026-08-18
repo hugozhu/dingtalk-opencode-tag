@@ -67,7 +67,7 @@ from core.brain import generate_reply_ex
 from core.capabilities import Capability, dispatch_reply_sent, register
 from core.inbound import InboundMessage, KIND_TEXT, parse_line
 from core.replier import send_reply
-from custom import msgstore, quoted
+from custom import context, msgstore
 from custom.identity import is_supervisor, supervisor_id, supervisor_names
 
 # 超时未裁决 → 按**不回复**处理并归档（秒），主管事后引用卡片仍可补裁。
@@ -157,9 +157,6 @@ _REACTION_RE = re.compile(
 # **不可撤的即时裁决**，而"手滑把没审过的草稿公开发到群里"不该是一键操作。0=不宽限。
 _REACTION_DEBOUNCE = float(os.environ.get("SUPERVISOR_REACTION_DEBOUNCE", "3") or 0)
 _debounce_timers = {}
-
-# 引用了图片时，最多等多久拿识别结果。跑在 reply 池（默认 4 个 worker），不能久等
-_MEDIA_WAIT = _env_int("AGENT_MEDIA_WAIT_SEC", 20)
 
 # 引用回复的标记（bridge 在行尾追加，见 classify_line）
 _QUOTED_RE = re.compile(r"\bquotedMsgId=([^\s)]+)")
@@ -791,15 +788,11 @@ def _revive_seq(seq):
 def _draft_and_forward(user, text, conv_type, conv_id, msg_id, quoted_msg_id=None):
     """后台线程：生成草稿 → 转交主管 → 登记待审。"""
     global _seq_counter
-    # 被引用的消息要进上下文（#112）：先查本地存储，查不到回落 CLI。取不到就照常，
-    # 只是少一段上下文，不该让整条消息处理不了。
-    prompt, raw = text, False
-    q = (quoted.resolve(conv_id, quoted_msg_id, media_wait=_MEDIA_WAIT)
-         if quoted_msg_id else None)
-    if q:
-        prompt, raw = quoted.build_prompt(user, text, q), True
-        log(f"supervisor_review: 已补入被引用消息的上下文 from={q.get('sender')!r} "
-            f"media={q.get('media')}")
+    # 上下文补全（#112）：被引用的那条消息、以及"刚才发的图 + 现在的追问"这种跨消息
+    # 场景，都交给 context.build。它自带兜底，任何异常都退回原文 —— 在这里抛出去就是
+    # #109 那套症状：卡片不发、提问者收不到东西、ack 停在「处理中」周期播报。
+    prompt, raw = context.build(user, text, conv_id,
+                                quoted_msg_id=quoted_msg_id, exclude_msg_id=msg_id)
     draft, status = generate_reply_ex(user, prompt, raw=raw, ctx={
         "conv_id": conv_id, "conv_type": conv_type, "msg_id": msg_id, "user": user,
     })
