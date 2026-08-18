@@ -94,6 +94,10 @@ export AGENT_MEDIA_PEER_WAIT="${AGENT_MEDIA_PEER_WAIT:-150}"
 # 那张图会被 group_gate 吞掉，大脑什么也看不到。回看一眼同会话最近的图补进 prompt。
 # 窗口刻意短：越长越容易把无关的旧图挂到新问题上。措辞是推测语气 + 明确授权模型忽略。
 export AGENT_MEDIA_LOOKBACK_SEC="${AGENT_MEDIA_LOOKBACK_SEC:-120}"
+# 拼上下文时等识别多久（秒）。**默认 0 = 不等**：识别照常发起，但这一轮不为它堵住
+# reply 池；没赶上就在 prompt 里给出 convq 命令，让大脑自己去取（它有 300s 预算，
+# 比这里宽裕得多）。设成 20 就回到 2026-08-18 之前"堵着等"的行为 —— 回滚闸门。
+export AGENT_CONTEXT_WAIT_SEC="${AGENT_CONTEXT_WAIT_SEC:-0}"
 export AGENT_MEDIA_LOOKBACK_MAX="${AGENT_MEDIA_LOOKBACK_MAX:-3}"
 
 # 群图预识别（src/custom/capabilities/premedia.py，#112）：图一发出来就先识别好放着，

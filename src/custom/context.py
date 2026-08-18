@@ -35,15 +35,19 @@ import os
 import time
 
 from core.agent_common import log
-from custom import mediadesc, msgstore, quoted
+from custom import convq, mediadesc, msgstore, quoted
 
 # 回看窗口（秒）。刻意短：越长越容易把无关的旧图挂到新问题上。
 _WINDOW = int(os.environ.get("AGENT_MEDIA_LOOKBACK_SEC", "120") or 120)
 # 最多带几张（有人连发几张再问"这几张什么意思"）
 _MAX_IMAGES = int(os.environ.get("AGENT_MEDIA_LOOKBACK_MAX", "3") or 3)
-# 等识别的总预算（秒）。**绝不无限等**：调用方跑在 reply 池，默认只有 4 个 worker，
-# 等下去会让所有会话的回复一起排队饿死。等不到就降级，prompt 里说明"正在识别中"。
-_WAIT = int(os.environ.get("AGENT_MEDIA_WAIT_SEC", "20") or 20)
+# 等识别的总预算（秒）。**默认 0 = 不等**：识别照常发起，但这一轮不为它堵着 reply 池
+# （默认只有 4 个 worker，等下去所有会话的回复一起排队饿死）。没赶上就在 prompt 里给出
+# convq 命令，让大脑自己去取 —— 它有自己的 300s 预算，比这里宽裕得多。
+# 设回 20 就是 2026-08-18 之前的行为，这是**回滚闸门**。
+# 注意别复用 AGENT_MEDIA_WAIT_SEC：capabilities/image.py 用同一个名字但默认 120，
+# 共用会让"关掉这里的等待"顺手把图片识别的等待也砍到 0。
+_WAIT = int(os.environ.get("AGENT_CONTEXT_WAIT_SEC", "0") or 0)
 
 
 def build(user, text, conv_id, quoted_msg_id=None, exclude_msg_id=None):
@@ -73,7 +77,7 @@ def _build(user, text, conv_id, quoted_msg_id, exclude_msg_id):
         return text, False
     log(f"context: 回看补入 {len(shots)} 张图 conv={conv_id[:12]} "
         f"pending={sum(1 for s in shots if s['pending'])}")
-    return _lookback_prompt(user, text, shots), True
+    return _lookback_prompt(user, text, shots, conv_id), True
 
 
 def _lookback(conv_id, exclude_msg_id):
@@ -88,26 +92,36 @@ def _lookback(conv_id, exclude_msg_id):
         if rec and rec.get("ok") and rec.get("by") == "image":
             continue        # image 能力已经就它单独回复过，描述在会话历史里了
         left = deadline - time.monotonic()
+        # wait=None 仍然**发起**识别：premedia 和 daemon 侧单飞照旧受益，等大脑真的
+        # 跑 convq image 时多半直接命中缓存，或者 join 上同一把锁
         desc, st = mediadesc.describe(conv_id, c["id"], c.get("text") or "",
                                       wait=left if left > 0 else None,
                                       by="ondemand")
         if desc:
-            out.append({"desc": desc, "pending": False})
+            out.append({"msg_id": c["id"], "desc": desc, "pending": False})
         elif st in ("pending", "busy"):
-            out.append({"desc": "", "pending": True})
+            out.append({"msg_id": c["id"], "desc": "", "pending": True})
         # download / recognize 失败就当没这张图：跟模型说"有张图但读不出来"帮不上忙，
         # 只会让它绕着这个不存在的信息编话
     return out
 
 
-def _lookback_prompt(user, text, shots):
+def _lookback_prompt(user, text, shots, conv_id=""):
     """回看图片 + 用户原话 → 结构化 prompt（配 generate_reply 的 raw=True）。"""
     n = len(shots)
     blocks = []
     for i, s in enumerate(shots, 1):
-        blocks.append(f"【图片 {i}/{n}】" if n > 1 else "【图片】")
-        blocks.append(s["desc"] if not s["pending"]
-                      else "（这张图还在识别中，暂时拿不到内容）")
+        head = f"【图片 {i}/{n}】" if n > 1 else "【图片】"
+        blocks.append(f"{head} msg={s['msg_id']}")
+        if not s["pending"]:
+            blocks.append(s["desc"])
+        else:
+            # **死胡同 + 一扇标好的门**。只说"还在识别中"是在邀请模型编内容。
+            blocks.append(
+                "（内容正在识别中。**需要它的内容时先运行下面这条命令**，它会等到识别"
+                "完成再返回：\n  "
+                + convq.cmd_hint(conv_id, "image", s["msg_id"])
+                + "\n 在拿到结果之前，不要猜测这张图里是什么。）")
         blocks.append("")
     return "\n".join([
         "【刚才同一会话里发过的图片】",

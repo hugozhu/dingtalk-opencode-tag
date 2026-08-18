@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../src'))
 
 from core.inbound import InboundMessage  # noqa: E402
-from custom import context, mediadesc, msgstore, quoted  # noqa: E402
+from custom import context, convq, mediadesc, msgstore, quoted  # noqa: E402
 
 CONV = "cid群=="
 
@@ -154,6 +154,69 @@ class TestLookback(_Base):
             context.build("张三", "看看", CONV)
         self.assertEqual(len(waits), 2)
         self.assertLess(waits[1], waits[0], "第二张的等待预算没被第一张扣减")
+
+
+class TestNoLongerRacesTheVisionModel(_Base):
+    """本次改造的正主：不再拿 reply 池（4 个 worker）去跟视觉模型赛跑。"""
+
+    def test_does_not_block_on_recognition(self):
+        """**2026-08-18 14:28 的事故**：等了 20s 还是没赶上，白堵一个 worker。"""
+        self._img("mIMG")
+
+        def slow(conv, mid, text, wait=None, by=""):
+            # 忠实于 describe 的契约：wait 有值才阻塞，wait=None 立刻返回 pending。
+            # 不这么写的话，stub 自己在睡觉，测的就不是"我们等没等"了。
+            if wait:
+                time.sleep(3)
+                return "考勤表", "ok"
+            return "", "pending"
+
+        with patch.object(mediadesc, "describe", side_effect=slow):
+            t0 = time.monotonic()
+            prompt, raw = context.build("张三", "这个图你统计下", CONV)
+        self.assertLess(time.monotonic() - t0, 1.0, "还在等识别")
+        self.assertTrue(raw)
+
+    def test_still_initiates_recognition(self):
+        """不等 ≠ 不发起：daemon 先跑起来，大脑稍后 convq 时多半直接命中缓存。"""
+        self._img("mIMG")
+        with patch.object(mediadesc, "describe", return_value=("", "pending")) as d:
+            context.build("张三", "这个图你统计下", CONV)
+        d.assert_called_once()
+        self.assertIsNone(d.call_args.kwargs["wait"])
+
+    def test_pending_block_gives_a_runnable_command(self):
+        """死胡同 + **一扇标好的门**。只说"还在识别中"是在邀请模型编内容。"""
+        self._img("mIMG")
+        with patch.object(mediadesc, "describe", return_value=("", "pending")):
+            prompt, _ = context.build("张三", "这个图你统计下", CONV)
+        self.assertIn(convq.CLI_PATH, prompt)
+        self.assertIn("image 'mIMG'", prompt)
+        self.assertIn(f"--conv '{CONV}'", prompt)
+        self.assertIn("不要猜测", prompt)
+
+    def test_ready_description_is_still_inlined(self):
+        """已经识别好的仍然直接内联 —— 能省一次工具往返就省。"""
+        self._img("mIMG")
+        with patch.object(mediadesc, "describe", return_value=("考勤表", "ok")):
+            prompt, _ = context.build("张三", "这个怎么理解", CONV)
+        self.assertIn("考勤表", prompt)
+        self.assertNotIn("convq.py image", prompt)
+
+    def test_msg_id_rendered_even_when_ready(self):
+        """描述被截断时，msg_id 是取全文的唯一把手。"""
+        self._img("mIMG")
+        with patch.object(mediadesc, "describe", return_value=("考勤表", "ok")):
+            prompt, _ = context.build("张三", "这个怎么理解", CONV)
+        self.assertIn("msg=mIMG", prompt)
+
+    def test_rollback_lever_restores_old_behavior(self):
+        """设回 AGENT_CONTEXT_WAIT_SEC=20 就是改造前的行为 —— 线上出问题的退路。"""
+        self._img("mIMG")
+        with patch.object(context, "_WAIT", 20), \
+             patch.object(mediadesc, "describe", return_value=("考勤表", "ok")) as d:
+            context.build("张三", "这个怎么理解", CONV)
+        self.assertGreater(d.call_args.kwargs["wait"], 0)
 
 
 class TestQuotedWins(_Base):

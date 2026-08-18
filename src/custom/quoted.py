@@ -55,11 +55,15 @@ def _from_cli(msg_id):
 
 
 def resolve(conv_id, msg_id, media_wait=None):
-    """取回被引用的消息 → {"text", "sender", "media", "desc"}；取不到返回 None。
+    """取回被引用的消息 → {"text","sender","media","desc","msg_id","conv_id"}；取不到 None。
 
-    被引用的是图片时会尝试识别（走 mediadesc 单飞，可能命中已有描述而零开销）——
-    **引用是显式证据**，用户明确指了这张图，比"时间上挨着"的猜测可靠得多，所以这条路
-    最该带上识别结果。media_wait=None 表示不等（只发起）。
+    被引用的是图片时**一律发起识别**（走 mediadesc 单飞，可能命中已有描述而零开销）——
+    **引用是显式证据**，用户明确指了这张图，比"时间上挨着"的猜测可靠得多。
+
+    注意 `media_wait` 只决定**等不等**，不决定发不发起：写成 `if media and media_wait`
+    会让 wait=0 的调用方（改造后的 context.py 就是）连识别都不触发，于是描述永远不会
+    出现，convq 那条路也只能从冷启动干起。等不到就返回空 desc，由调用方给出取内容的
+    命令 —— 降级的是"这一轮拿不拿得到"，不是"要不要开始"。
     """
     if not msg_id:
         return None
@@ -69,11 +73,12 @@ def resolve(conv_id, msg_id, media_wait=None):
     text, sender = got
     media = bool(_MEDIA_RE.match(text or ""))
     desc = ""
-    if media and media_wait:
+    if media:
         from custom import mediadesc
-        desc, _st = mediadesc.describe(conv_id, msg_id, text, wait=media_wait,
-                                       by="quoted")
-    return {"text": text, "sender": sender, "media": media, "desc": desc}
+        desc, _st = mediadesc.describe(conv_id, msg_id, text,
+                                       wait=media_wait or None, by="quoted")
+    return {"text": text, "sender": sender, "media": media, "desc": desc,
+            "msg_id": msg_id, "conv_id": conv_id}
 
 
 def build_prompt(user, text, quoted):
@@ -86,8 +91,14 @@ def build_prompt(user, text, quoted):
     if quoted.get("desc"):
         body = "（这是一张图片，以下是它的内容识别结果）\n" + quoted["desc"]
     elif quoted.get("media"):
-        body = ("（这是一张图片或一个文件，我目前还看不到它的内容 —— 如果用户的问题依赖"
-                "它的具体内容，请说明你需要对方直接把它发给你，不要猜测内容。）")
+        # 以前这里写的是「请说明你需要对方直接把它发给你」—— 那在有 convq 之后是**错误
+        # 建议**：内容拿得到，只是还没识别完。给命令，并明确禁止在拿到之前瞎猜。
+        from custom import convq
+        body = ("（这是一张图片或一个文件，内容还在识别中。**需要它的内容时先运行下面这条"
+                "命令**，它会等到识别完成再返回：\n  "
+                + convq.cmd_hint(quoted.get("conv_id") or "",
+                                 "image", quoted.get("msg_id") or "")
+                + "\n 在拿到结果之前，不要猜测里面是什么。）")
     else:
         body = (quoted.get("text") or "").strip() or "（空消息）"
     return "\n".join([

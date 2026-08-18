@@ -24,6 +24,12 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="quoted-test-")
         os.environ["AGENT_MSGSTORE_DIR"] = self.tmp
+        # resolve() 现在**恒发起**识别（wait 只决定等不等），没这层默认桩，任何存了
+        # 媒体消息的用例都会真的 shell 出去调 dws 下载。关心识别的用例自己再覆盖。
+        from custom import mediadesc
+        p = patch.object(mediadesc, "describe", return_value=("", "pending"))
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -86,22 +92,36 @@ class TestQuotedMedia(_Base):
         self.assertEqual(q["desc"], "图中是一张考勤表")
         self.assertIn("考勤表", quoted.build_prompt("张三", "看一下", q))
 
-    def test_without_wait_no_recognition(self):
-        """不等就不识别（调用方明确表示不想被视觉调用堵住）。"""
+    def test_without_wait_still_initiates_recognition(self):
+        """**wait 只决定等不等，不决定发不发起。**
+
+        写成 `if media and media_wait:` 会让 wait=0 的调用方（改造后的 context.py 就是）
+        连识别都不触发 —— 描述永远不会出现，convq 那条路也只能从冷启动干起。
+        """
         from custom import mediadesc
         self._store("mImg2", "[图片消息](mediaId=$abc)")
-        with patch.object(mediadesc, "describe") as d:
+        with patch.object(mediadesc, "describe", return_value=("", "pending")) as d:
             q = quoted.resolve(CONV, "mImg2")
-        d.assert_not_called()
+        d.assert_called_once()
+        self.assertIsNone(d.call_args.kwargs["wait"])       # 只发起、不等
         self.assertEqual(q["desc"], "")
 
-    def test_recognition_pending_falls_back_to_notice(self):
-        """识别没赶上 → 退回"我看不到图"的说法，而不是假装有内容。"""
-        from custom import mediadesc
+    def test_recognition_pending_points_at_convq(self):
+        """识别没赶上 → 给取内容的命令，并禁止在拿到之前瞎猜。
+
+        以前这里写的是「请说明你需要对方直接把它发给你」—— 有了 convq 之后那是**错误
+        建议**：内容拿得到，只是还没识别完。
+        """
+        from custom import convq, mediadesc
         self._store("mImg3", "[图片消息](mediaId=$abc)")
         with patch.object(mediadesc, "describe", return_value=("", "pending")):
             q = quoted.resolve(CONV, "mImg3", media_wait=1)
-        self.assertIn("看不到", quoted.build_prompt("张三", "看一下", q))
+        p = quoted.build_prompt("张三", "看一下", q)
+        self.assertIn(convq.CLI_PATH, p)
+        self.assertIn("'mImg3'", p)
+        self.assertIn(f"--conv '{CONV}'", p)
+        self.assertIn("不要猜测", p)
+        self.assertNotIn("直接把它发给你", p)      # 旧的投降话术不该回来
 
 
 class TestBuildPrompt(unittest.TestCase):
@@ -116,12 +136,12 @@ class TestBuildPrompt(unittest.TestCase):
         self.assertIn("看一下", p)
         self.assertLess(p.index("季度目标定了吗？"), p.index("看一下"))
 
-    def test_media_prompt_says_cannot_see(self):
-        """第一阶段不做识别，但要让大脑知道那是图片、且别瞎猜内容。"""
+    def test_media_prompt_gives_a_way_to_get_content(self):
+        """没有描述时给的是**一扇门**，不是死胡同 —— 只说"看不到"是在邀请模型编内容。"""
         p = quoted.build_prompt("张三", "看一下",
                                 {"text": "[图片消息](mediaId=x)", "sender": "hugozhu",
-                                 "media": True})
-        self.assertIn("看不到", p)
+                                 "media": True, "msg_id": "mQ", "conv_id": "cid群=="})
+        self.assertIn("convq.py image 'mQ'", p)
         self.assertNotIn("mediaId", p)      # mediaId 不该出现在 prompt 里
         self.assertIn("不要猜测", p)
 
