@@ -32,6 +32,9 @@ os.environ["ACK_PROGRESS_INTERVAL"] = "0"
 os.environ["SUPERVISOR_REACTION_POLL"] = "0"        # 本测不关心贴表情
 os.environ["SUPERVISOR_REVIEW_TIMEOUT"] = "0"       # 不起超时定时器
 os.environ["SUPERVISOR_REVIEW_JOURNAL"] = os.path.join(_TMP, "reviews.jsonl")
+# **必须隔离**：主管裁决会把 Q&A 沉淀进知识库，而知识库只注入最后 20 条 ——
+# 不隔离的话跑几遍 e2e 就能把生产知识库整个顶掉（已经发生过，31 条夹具）
+os.environ["AGENT_KNOWLEDGE_FILE"] = os.path.join(_TMP, "qa.jsonl")
 os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_TMP, "messages")
 
 import custom.capabilities                          # noqa: E402  注册全部能力
