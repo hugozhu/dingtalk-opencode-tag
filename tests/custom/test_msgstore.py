@@ -157,6 +157,24 @@ class TestPrune(_Base):
         self.assertEqual(msgstore.prune(keep_days=0, path=self.root), 0)
         self.assertTrue(os.path.exists(old))
 
+    def test_extraction_layer_survives_prune(self):
+        """**分层保留**（#113 P2）：raw 30 天可以过期，抽取出来的实体/关系要长期留。
+
+        prune 只删形如 `YYYY-MM-DD.jsonl` 的分片，所以抽取层放在存储根下也安全。
+        这条锁住这个契约 —— 哪天有人把 prune 改成按 mtime 扫目录，抽取结果就没了。
+        """
+        self._shard("2020-01-01")                       # 该被删的旧分片
+        ext = os.path.join(self.root, "extracted")
+        os.makedirs(ext, exist_ok=True)
+        for name in ("entities.jsonl", "relations.jsonl", "2020-01-01.json"):
+            with open(os.path.join(ext, name), "w", encoding="utf-8") as f:
+                f.write("{}\n")
+        os.utime(ext, (0, 0))                           # 故意做成"很旧"
+        msgstore.prune(keep_days=1, path=self.root)
+        self.assertTrue(os.path.isdir(ext))
+        for name in ("entities.jsonl", "relations.jsonl", "2020-01-01.json"):
+            self.assertTrue(os.path.exists(os.path.join(ext, name)), name)
+
     def test_prune_on_missing_dir_is_noop(self):
         self.assertEqual(msgstore.prune(keep_days=1, path=os.path.join(self.root, "无")), 0)
 

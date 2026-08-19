@@ -196,6 +196,11 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 - shell 单测：`bash -n` 语法检查 + 函数级断言，不依赖网络/钉钉/serve
 - Python 单测：`unittest` + `patch.object(<module>, "<func>", return_value=...)`
+- **测试必须把存储指到 tmpdir**（`AGENT_MSGSTORE_DIR` / `AGENT_KNOWLEDGE_FILE` /
+  `SUPERVISOR_REVIEW_JOURNAL` / `AGENT_OPENCODE_LOG`）。忘了就会把夹具写进生产
+  `knowledge/` —— 已经发生过**五次**，其中一次 31 条夹具把 system prompt 实际注入的
+  20 条挤掉了大半。改完跑一遍 `bash tests/custom/leak_check.sh`：它把 `PROJECT_DIR`
+  指到临时目录跑全套，谁漏了一目了然，且这一趟本身不会污染生产
 - 业务 handler 测试：mock `core.brain.generate_reply` 验证 prompt 拼装 + **ctx 带 conv_id**，不测大脑内部
 - e2e 通用范式：**实际触发 + 监控日志 + DWS 独立拉群消息**（两侧对照的双校验）
   - **基础文本 e2e（最底层冒烟）**：以真人身份发一条纯文本、断言数字员工回复。这条不碰合并转发/serve，只验"收→大脑→发"闭环——最快定位链路断在哪。**已脚本化：`bash tests/custom/e2e_text_reply_test.sh`**（opencode / Claude Code / Codex 通用；参数化身份不写死，SKIP 友好）。
