@@ -31,6 +31,9 @@ import urllib.request
 
 from core.agent_common import PROXY_URL, PROXY_KEY, find_serve_credentials, log, serve_request
 from core.brain import STATUS_OK, STATUS_EMPTY, STATUS_FAILED
+# 只用它的 cmd_hint / CLI_PATH（纯字符串拼接，不碰存储）。convq → mediadesc → msgstore
+# 这条链不回指 brain，不会成环；image 那层是 mediadesc 里的函数内延迟导入。
+from custom import convq
 
 # 大脑后端选择
 _BRAIN = os.environ.get("AGENT_BRAIN", "echo")
@@ -136,6 +139,104 @@ _SYSTEM_PROMPT = os.environ.get(
 # 回复总长度上限（外层 backstop，防跑飞刷屏）。超长回复由 replier 按此上限内的内容
 # 分片成多条钉钉消息发出（见 custom/replier.py _split_text），不再一刀切到千字。
 _MAX_REPLY_CHARS = int(os.environ.get("AGENT_MAX_REPLY_CHARS", "12000"))
+
+# --- 主管审核沉淀的知识注入（配合 capabilities/supervisor_review）---------------
+# 主管改写过的答案追加进 JSONL 知识库；这里读末 N 条拼到 system prompt 之后，
+# 让下次同类问题 AI 能自己答对。文件不存在/为空 → 与原 _SYSTEM_PROMPT 完全一致（零影响）。
+_KNOWLEDGE_FILE = os.environ.get("AGENT_KNOWLEDGE_FILE", "knowledge/supervisor_qa.jsonl")
+_KNOWLEDGE_MAX = int(os.environ.get("AGENT_KNOWLEDGE_MAX", "20"))
+# mtime 缓存：每条消息都读盘没必要，文件没变就复用上次拼好的字符串
+_knowledge_cache = {"mtime": None, "text": ""}
+_knowledge_lock = threading.Lock()
+
+
+def _knowledge_path():
+    base = os.environ.get("PROJECT_DIR", os.getcwd())
+    p = _KNOWLEDGE_FILE
+    return p if os.path.isabs(p) else os.path.join(base, p)
+
+
+def _load_knowledge():
+    """读知识库末 _KNOWLEDGE_MAX 条，渲染成 prompt 片段；无知识返回 ""。
+
+    读盘/解析失败一律返回 ""（知识注入是增强，绝不能拖垮正常回复链路）。
+    """
+    if _KNOWLEDGE_MAX <= 0:
+        return ""
+    path = _knowledge_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return ""   # 没有知识库文件 = 还没学到东西
+    with _knowledge_lock:
+        if _knowledge_cache["mtime"] == mtime:
+            return _knowledge_cache["text"]
+    items = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue          # 跳过坏行，不因一行脏数据丢掉整个知识库
+                q = (rec.get("question") or "").strip()
+                a = (rec.get("answer") or "").strip()
+                if q and a:
+                    items.append((q, a))
+    except OSError as e:
+        log(f"brain: 读知识库失败 {e}")
+        return ""
+    items = items[-_KNOWLEDGE_MAX:]
+    if not items:
+        text = ""
+    else:
+        lines = ["", "---", "以下是主管此前审核确认过的问答，遇到同类问题请优先参考其口径回答："]
+        for i, (q, a) in enumerate(items, 1):
+            lines.append(f"{i}. 问：{q}\n   答：{a}")
+        text = "\n".join(lines)
+    with _knowledge_lock:
+        _knowledge_cache["mtime"] = mtime
+        _knowledge_cache["text"] = text
+    return text
+
+
+def _convq_hint(conv_id):
+    """告诉大脑「这个会话的历史能查」以及怎么查。conv_id 为空返回 ""。
+
+    为什么放 system 而不是用户 prompt：用户 prompt 会被渲染进主管审核卡片、会被
+    _session_title() 摘要成会话标题 —— 往里塞命令行会污染这两个给人看的界面。
+
+    为什么放 brain.py 而不是 context.py：后者只被 supervisor_review._draft_and_forward
+    一处调用（它自己的 docstring 就承认这个缺口），而这里是所有能力（text_reply /
+    image / file / forward）的必经漏斗，且零 core 改动。
+
+    **conv_id 由 ctx 带进来、不让大脑自己填** —— 它因此天然只查得到"这一个会话"。
+    """
+    if not conv_id:
+        return ""
+    return "\n".join([
+        "",
+        "---",
+        f"本次对话所在的钉钉会话 conv_id = {conv_id}",
+        "这个会话此前的消息都已落盘（**包括群里没 @ 你的消息**、图片的识别结果、主管的"
+        "裁决口径）。需要时用下面的命令查，**不要直接读 knowledge/ 下的 jsonl** —— 裸读"
+        "拿到的是 epoch 秒和三种散落的记录类型，容易读错：",
+        "  " + convq.cmd_hint(conv_id, "recent"),
+        "  " + convq.cmd_hint(conv_id, "search", "关键词"),
+        "  " + convq.cmd_hint(conv_id, "image", "msg…==") + "   # 图片内容，会等识别完成",
+        "上下文不足以回答时**先查再答**；查不到就直说查不到，不要编。",
+    ])
+
+
+def _effective_system_prompt(conv_id=""):
+    """system prompt = 基础人设 + 主管沉淀的知识 + 本会话的查询入口。
+
+    conv_id 为空时**与加这个功能之前逐字节相同**（沿用 _load_knowledge 的零影响纪律）。
+    """
+    return _SYSTEM_PROMPT + _load_knowledge() + _convq_hint(conv_id)
 
 
 def _oc_log(transport, model, elapsed, prompt, reply, ok, err=""):
@@ -839,7 +940,7 @@ def cancel_inflight(conv_id):
     return True
 
 
-def _post_message(port, pwd, sid, prompt, provider, model_id):
+def _post_message(port, pwd, sid, prompt, provider, model_id, conv_id=""):
     """向 session 发一条 message，拼接 text parts 返回回复文本和统计信息。
 
     返回 (reply_text, usage_dict)，usage_dict 包含 input/output/reasoning/cache tokens。
@@ -855,7 +956,7 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
             "POST", port, pwd, f"/session/{sid}/message",
             {
                 "model": {"providerID": provider, "modelID": model_id},
-                "system": _SYSTEM_PROMPT,
+                "system": _effective_system_prompt(conv_id),
                 "parts": [{"type": "text", "text": prompt}],
             },
             timeout=_OPENCODE_SOCK_TIMEOUT,
@@ -935,7 +1036,7 @@ def _http_oneshot(port, pwd, prompt, ctx):
         sid = _create_session(port, pwd, title)
         _register_textreply_sid(sid, ctx)
         _mark_inflight(conv_id, sid, port, pwd, title)
-        reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+        reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id)
         _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
         _stash_task_stats(conv_id, usage, time.time() - t0)
         return reply
@@ -966,7 +1067,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
             _register_textreply_sid(sid, ctx)   # 刷新 conv ctx（回程路由用最新来源）
             _mark_inflight(conv_id, sid, port, pwd, title)
             try:
-                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id)
             except urllib.error.HTTPError as he:
                 # 复用的 session 已被 serve 清（重启/GC）→ 丢记录、重建一次重试
                 if reused and he.code == 404:
@@ -975,7 +1076,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                     sid = _create_session(port, pwd, title)
                     _register_textreply_sid(sid, ctx)
                     _mark_inflight(conv_id, sid, port, pwd, title)
-                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id)
                     reused = False  # 重建了，视为新会话
                 else:
                     raise
@@ -988,7 +1089,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                 sid = _create_session(port, pwd, title)
                 _register_textreply_sid(sid, ctx)
                 _mark_inflight(conv_id, sid, port, pwd, title)
-                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id)
                 reused = False  # 重建了，按新会话登记（下面 is_new=True）
             # 成功：登记/刷新 last，处理 LRU 逐出（删被挤掉会话的远端 session）
             for _cid, _sid in _remember_sid(conv_id, sid, is_new=(not reused)):
@@ -1021,14 +1122,14 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
             _clear_inflight(conv_id)
 
 
-def _brain_opencode_cli(prompt):
+def _brain_opencode_cli(prompt, conv_id=""):
     """回退路径：调 `opencode run <prompt> --model M --format json`，拼接 text 事件为回复。
 
     HTTP 不可用时的兜底。输出是 NDJSON 事件流，逐行取 type==text 的 part.text 拼接。
     失败（超时 / rc!=0 / opencode 不存在）**抛异常**，由调用方判为 failed（#59）——不再
     把失败伪装成空字符串，以便上层给用户兜底提示。
     """
-    full_prompt = f"{_SYSTEM_PROMPT}\n\n{prompt}"
+    full_prompt = f"{_effective_system_prompt(conv_id)}\n\n{prompt}"
     cmd = [_OPENCODE_BIN, "run", full_prompt,
            "--model", _OPENCODE_MODEL, "--format", "json"]
     t0 = time.time()
@@ -1064,7 +1165,8 @@ def _brain_proxy(user, text, ctx, raw=False):
     body = json.dumps({
         "model": _CHAT_MODEL,
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content":
+                _effective_system_prompt((ctx or {}).get("conv_id", ""))},
             {"role": "user", "content": user_content},
         ],
     }).encode()

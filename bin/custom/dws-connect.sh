@@ -10,9 +10,13 @@
 # config/constants.local.sh：
 #   DWS_EVENT_KEY        群消息事件类型（默认 user_im_message_receive_group）
 #   DWS_EVENT_GROUP      群 openConversationId（订阅群消息时必填）—— 敏感
+#   DWS_EVENT_O2O_ALL    订阅**所有单聊**：1/true/yes/on=开。事件类型
+#                        user_im_message_receive_o2o_all，rule_type=all 无需 --user
+#                        参数（个人级订阅），任何人私聊数字员工都会触发。
+#                        **优先级高于 DWS_EVENT_O2O_USERS**：开了它就忽略 USERS 列表。
 #   DWS_EVENT_O2O_USERS  订阅单聊时：对端 userId 列表（逗号分隔）。留空=不订阅单聊。
 #                        钉钉 o2o 事件只能按“对端 userId”订阅（每个对端一条订阅），
-#                        故这里为每个 userId 起一个 o2o consumer。
+#                        故这里为每个 userId 起一个 o2o consumer。仅在 O2O_ALL 关时生效。
 #   DWS_EVENT_AT         订阅“@我的消息”（当前数字员工账号被 @ 的消息，跨所有群）。
 #                        1/true/yes/on=开。事件类型 user_im_message_receive_at，
 #                        rule_type=at 无需 group/user 参数（个人级订阅）。用于只在被
@@ -41,8 +45,11 @@ fi
 
 : "${DWS_EVENT_KEY:=user_im_message_receive_group}"
 : "${DWS_EVENT_GROUP:=}"
+: "${DWS_EVENT_O2O_ALL:=}"
 : "${DWS_EVENT_O2O_USERS:=}"
 : "${DWS_EVENT_AT:=}"
+: "${AGENT_SUPERVISOR_USER_ID:=}"
+: "${CAP_SUPERVISOR_REVIEW_ENABLED:=}"
 : "${DWS_PROFILE:=}"
 : "${CONNECT_LOG:=$SCRIPT_DIR/agent-connect.log}"
 
@@ -63,9 +70,23 @@ _is_on() {
 _want_group=0
 [[ "$DWS_EVENT_KEY" == *group* && -n "$DWS_EVENT_GROUP" ]] && _want_group=1
 _want_o2o=0
-[[ -n "$DWS_EVENT_O2O_USERS" ]] && _want_o2o=1
+_o2o_mode=""
+# O2O_ALL 优先：开了就订阅所有单聊，忽略 USERS 列表（与 constants.sh 描述一致）。
+if _is_on "$DWS_EVENT_O2O_ALL"; then
+    _want_o2o=1
+    _o2o_mode="all"
+elif [[ -n "$DWS_EVENT_O2O_USERS" ]]; then
+    _want_o2o=1
+    _o2o_mode="users"
+fi
 _want_at=0
 _is_on "$DWS_EVENT_AT" && _want_at=1
+# 表情回应订阅（#108）：只在配了主管 **且** 开了审核能力时才起 —— 它是审核回路的输入，
+# 能力关着就是白占一条订阅。注意它**不算**"至少开一种订阅"的门槛（见下面的校验）。
+_want_reaction=0
+if [[ -n "${AGENT_SUPERVISOR_USER_ID:-}" ]] && _is_on "${CAP_SUPERVISOR_REVIEW_ENABLED:-}"; then
+    _want_reaction=1
+fi
 
 if [[ "$DWS_EVENT_KEY" == *group* && -z "$DWS_EVENT_GROUP" \
       && "$_want_o2o" -eq 0 && "$_want_at" -eq 0 ]]; then
@@ -95,9 +116,14 @@ _kill_subtree() {
 
 # consumer PID 登记表（子 shell 内全局）+ 统一收尾：所有 consumer 连子树一起清
 _consumer_pids=()
+# 可选 consumer（表情回应）：**不参与"任一退出即整体收尾"的存活检查**。
+# 下面那个循环的语义是"任一 consumer 死了就整体重启"，可选订阅若因权限/rule_type 起不来，
+# 会把整个数字员工打进重启循环 —— 一个锦上添花的功能不该有这种杀伤力。它挂了就只是
+# 贴表情裁决不可用，消息收发照常。
+_optional_pids=()
 _cleanup_consumers() {
     local p
-    for p in ${_consumer_pids[@]+"${_consumer_pids[@]}"}; do
+    for p in ${_consumer_pids[@]+"${_consumer_pids[@]}"} ${_optional_pids[@]+"${_optional_pids[@]}"}; do
         _kill_subtree "$p" TERM
     done
     return 0
@@ -116,8 +142,14 @@ _run_consumers() {
             --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
         _consumer_pids+=($!)
     fi
-    # 单聊 consumer：每个对端 userId 一个（o2o 只能按对端订阅）
-    if [[ "$_want_o2o" -eq 1 ]]; then
+    # 单聊 consumer：
+    #   all   —— 个人级订阅（rule_type=all，无需 --user），任何人私聊都触发，一个 consumer
+    #   users —— 每个对端 userId 一个（o2o 只能按对端订阅）
+    if [[ "$_o2o_mode" == "all" ]]; then
+        dws event consume user_im_message_receive_o2o_all \
+            --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
+        _consumer_pids+=($!)
+    elif [[ "$_o2o_mode" == "users" ]]; then
         local IFS=','
         local u
         for u in $DWS_EVENT_O2O_USERS; do
@@ -134,6 +166,16 @@ _run_consumers() {
         dws event consume user_im_message_receive_at \
             --profile "$DWS_PROFILE" -f ndjson --quiet 2>>"$CONNECT_LOG" &
         _consumer_pids+=($!)
+    fi
+    # 表情回应 consumer（#108）：主管给待审消息贴 👍/❌ 即完成裁决，替代原来每 5s 一次的
+    # list-emotion-replies 轮询。只订阅**主管一个人**的单聊（rule_type=singleChat，必须带
+    # --user），所以不需要该事件的 _all 变体。用 --flatten 拿稳定的顶层字段
+    # （operator/reaction_name/message_id/event_id）；每个 event_key 本来就各起一个进程，
+    # 单独给它加 --flatten 不影响其它流。
+    if [[ "$_want_reaction" -eq 1 ]]; then
+        dws event consume user_im_message_reaction_o2o --user "$AGENT_SUPERVISOR_USER_ID" \
+            --profile "$DWS_PROFILE" -f ndjson --flatten --quiet 2>>"$CONNECT_LOG" &
+        _optional_pids+=($!)
     fi
     # 任一 consumer 退出即整体结束，让 monitor 兜底重启（bash 3.2 无 `wait -n`，用轮询：
     # 任一子进程不再存活就清掉其余（含子树）并返回）。
@@ -155,9 +197,13 @@ _run_consumers() {
 
 # DWS_CONNECT_DRY_RUN：只打印订阅计划（脱敏）并退出，不连 bus。供单测校验订阅选择逻辑。
 if _is_on "${DWS_CONNECT_DRY_RUN:-}"; then
-    echo "plan: group=$_want_group o2o=$_want_o2o at=$_want_at"
+    # 新字段只能**追加在行尾**：tests/core/unit_test.sh 用子串断言这一行，且期望串里
+    # o2o_mode 已经在末尾，插中间会同时打红 4 条断言。
+    echo "plan: group=$_want_group o2o=$_want_o2o at=$_want_at${_o2o_mode:+ o2o_mode=$_o2o_mode}$([[ "$_want_reaction" -eq 1 ]] && echo " reaction=1")"
     [[ "$_want_group" -eq 1 ]] && echo "consumer: $DWS_EVENT_KEY --group <len:${#DWS_EVENT_GROUP}>"
-    if [[ "$_want_o2o" -eq 1 ]]; then
+    if [[ "$_o2o_mode" == "all" ]]; then
+        echo "consumer: user_im_message_receive_o2o_all"
+    elif [[ "$_o2o_mode" == "users" ]]; then
         IFS=',' read -ra _users <<< "$DWS_EVENT_O2O_USERS"
         for _u in "${_users[@]}"; do
             _u="${_u// /}"; [[ -z "$_u" ]] && continue
@@ -165,6 +211,8 @@ if _is_on "${DWS_CONNECT_DRY_RUN:-}"; then
         done
     fi
     [[ "$_want_at" -eq 1 ]] && echo "consumer: user_im_message_receive_at"
+    [[ "$_want_reaction" -eq 1 ]] && \
+        echo "consumer: user_im_message_reaction_o2o --user <len:${#AGENT_SUPERVISOR_USER_ID}>"
     exit 0
 fi
 

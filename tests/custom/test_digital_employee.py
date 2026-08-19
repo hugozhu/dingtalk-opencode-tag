@@ -17,6 +17,15 @@ import unittest
 import urllib.error
 from unittest.mock import patch, MagicMock
 
+# 消息存储指到临时目录：本测走真实 dispatch_inbound，msgstore 会落盘，
+# 不隔离就会把夹具数据写进真实的 knowledge/messages（踩过一次）
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+_MS_TMP = _tempfile.mkdtemp(prefix="test-de-ms-")
+_atexit.register(_shutil.rmtree, _MS_TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_MS_TMP, "messages")
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
@@ -133,9 +142,12 @@ class TestBrainOpencodeHttp(unittest.TestCase):
 
     def test_http_body_has_nested_model_and_system(self):
         calls = []
+        # _KNOWLEDGE_MAX=0 关掉主管知识注入：否则本用例会读到仓库里真实的
+        # knowledge/supervisor_qa.jsonl，断言随线上沉淀的内容漂移。
         with patch.object(brain, "_BRAIN", "opencode"), \
              patch.object(brain, "_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free"), \
              patch.object(brain, "_SYSTEM_PROMPT", "SYS"), \
+             patch.object(brain, "_KNOWLEDGE_MAX", 0), \
              patch.object(brain, "find_serve_credentials", return_value=(1, 4096, "pw")), \
              patch.object(brain, "_serve_request", side_effect=self._serve_side_effect(calls)):
             brain.generate_reply("hugozhu", "1+1")
@@ -448,6 +460,20 @@ class TestReplierLogMode(unittest.TestCase):
             self.assertFalse(replier.send_reply("cid", 2, "hi"))
             mock_run.assert_not_called()
 
+    def test_user_mode_disables_ai_tag(self):
+        """回复必须带 --ai-tag=false 去掉「AI」角标（拟人化）。
+
+        dws chat message send 的 --ai-tag 默认 **true**，不显式关掉就会在消息右上角
+        常驻一个「AI」标，时刻提示对方"这是机器人"。
+        """
+        with patch.object(replier, "_REPLY_MODE", "user"), \
+             patch.object(replier, "PROFILE", "real-profile"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = type("R", (), {"returncode": 0, "stderr": ""})()
+            replier.send_reply("cid", 2, "hi")
+        cmd = mock_run.call_args[0][0]
+        self.assertIn("--ai-tag=false", cmd)
+
 
 class TestTextReplyCapability(unittest.TestCase):
     """text_reply 能力：InboundMessage(kind=text) → 提交大脑（防回环+去重由 core 声明式处理）。"""
@@ -506,11 +532,17 @@ class TestTextReplyCapability(unittest.TestCase):
             s.assert_not_called()
 
     def test_route_reply_shim_still_works(self):
-        """兼容垫片 routes.route_reply 仍能派发（走 InboundMessage → 能力）。"""
+        """兼容垫片 routes.route_reply 仍能派发（走 InboundMessage → 能力）。
+
+        用**被 @ 的**群消息：group_gate(priority=2) 会把群里没 @ 数字员工的消息截住，
+        走整条注册表的用例必须带 atMention，否则测的是"被闸门吞掉"而不是派发。
+        """
         calls = []
+        line = ("[connect] 收到 @张三: 你好 "
+                "(convType=2 convId=cidXYZ== msgId=msg1== atMention=1)")
         with patch.object(text_reply, "submit_reply",
                           side_effect=lambda fn, *a: calls.append(a)):
-            routes.route_reply("张三", "你好", "2", self._msg("张三", "你好").raw_line)
+            routes.route_reply("张三", "你好", "2", line)
         self.assertEqual(len(calls), 1)
 
 

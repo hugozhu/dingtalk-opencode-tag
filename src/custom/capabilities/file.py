@@ -121,9 +121,29 @@ _VISION_PROMPT = os.environ.get(
 )
 
 
+# 下载临时目录前缀。清理时按它判断"这个目录是不是我们自己建的"。
+_TMP_PREFIX = "agent_file_"
+
+
+def _cleanup_tmp(tmp_dir):
+    """删掉下载用的临时目录，**只删我们自己建的那种**（前缀匹配）。
+
+    调用方拿的是 os.path.dirname(下载到的文件路径)。这个路径一旦不是
+    _download_file 建的私有目录（测试替身返回 "/tmp/x.zip"、或将来换了下载实现），
+    dirname 就可能是 /tmp 本身 —— 无脑 rmtree 会把整个系统临时目录端掉，
+    连带别的进程正在用的文件。宁可漏删一个临时目录，也不能删错。
+    """
+    base = os.path.basename(os.path.normpath(tmp_dir or ""))
+    if not base.startswith(_TMP_PREFIX):
+        log(f"file: 跳过清理非下载临时目录 {tmp_dir!r}")
+        return False
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return True
+
+
 def _download_file(file_id):
     """drive download 到临时目录（**非项目目录**），返回本地路径或 None。"""
-    tmp_dir = tempfile.mkdtemp(prefix="agent_file_")
+    tmp_dir = tempfile.mkdtemp(prefix=_TMP_PREFIX)
     rc, _ = _run_cli([
         "drive", "download",
         "--node", file_id,
@@ -472,13 +492,21 @@ def handle_file(user, text, msg_id, conv_id, conv_type):
                        f"我可以处理：文本文件（txt/md/csv/json/日志/代码等）、图片、PDF、Office 文档（docx/xlsx/pptx）、视频。")
             return
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)  # 用完即删，不留临时文件
+        _cleanup_tmp(tmp_dir)   # 用完即删，不留临时文件（只删自己建的目录）
 
     if not success or not content:
         send_reply(conv_id, conv_type, f"抱歉，文件「{filename}」的内容我解析失败了。")
         return
 
     log(f"file: msgId={msg_id[:24]} 解析成功 type={file_type} content_len={len(content)}")
+    # 解析出的正文落盘（#113）：以前只进 prompt、回完就丢，而文档是事实密度最高的
+    # 地方（OKR、名单、流程）。best-effort，写失败不影响回复。
+    try:
+        from custom import msgstore
+        msgstore.record_description(conv_id, msg_id, content, by="file", ok=True,
+                                    kind="file")
+    except Exception as e:      # noqa: BLE001
+        log(f"file: 解析结果落盘失败 {e}")
 
     # 参考 image 能力：结构化呈现文件信息（用户+文件名+内容+任务指令）
     parts = [

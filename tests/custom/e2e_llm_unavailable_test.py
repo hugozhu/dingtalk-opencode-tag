@@ -12,8 +12,11 @@
 
 对照旧行为：failed 时 text_reply 直接 return，send_reply 不触发，ack 永远停在「处理中」。
 """
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import time
 import threading
 from unittest.mock import patch, MagicMock
@@ -21,6 +24,13 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 
+_TMP = tempfile.mkdtemp(prefix="e2e-ms-")
+atexit.register(shutil.rmtree, _TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_TMP, "messages")
+# 本用例故意制造大脑失败，会往 opencode.log 记 ok=False —— **必须指到 tmpdir**：
+# healthcheck 的 check_brain 靠统计该文件里「距上次检查以来」新增的 ok=False 条数
+# 决定要不要真发一次模型探测（阈值 3），写进生产日志会触发误探测、抬高熔断计数。
+os.environ["AGENT_OPENCODE_LOG"] = os.path.join(_TMP, "opencode.log")
 os.environ["AGENT_BRAIN"] = "opencode"
 os.environ["AGENT_FALLBACK_REPLY"] = "⚠️ 暂时无法处理你的消息，请稍后再试。"
 os.environ["ACK_STAGES"] = "0:稍等:已收到，正在处理…"   # 立即贴处理中
@@ -52,10 +62,12 @@ def fake_remove(conv_id, msg_id, emoji, text):
     emotions.append(("remove", emoji, text))
     return True
 
-def fake_update(conv_id, msg_id, old, new):
-    # 原地更新（#85）：记为显示出 new 状态（沿用 "add" 语义，兼容下方断言）
-    emotions.append(("add", new[0], new[1]))
-    print(f"  [ack表情↻] {old[0]}｜{old[1]} → {new[0]}｜{new[1]}")
+def fake_update(conv_id, msg_id, old_eid, old_bid, new_emoji, new_text, new_eid, new_bid):
+    # 原地更新：记为显示出 new 状态（沿用 "add" 语义，兼容下方断言）。
+    # 签名必须跟 ack._update_text_emotion 一致 —— #95 给它加了 emotionId/backgroundId
+    # 参数（从 4 个变 8 个），这个替身当时没跟上，导致 worker 抛 TypeError、V3 恒 ❌。
+    emotions.append(("add", new_emoji, new_text))
+    print(f"  [ack表情↻] {old_eid} → {new_emoji}｜{new_text}")
     return True
 
 CR.register_replier(fake_send_impl)     # 真 send_reply 协议，仅换平台实现

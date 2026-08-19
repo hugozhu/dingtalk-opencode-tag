@@ -90,7 +90,17 @@ start_connect() {
 # 按 DWS_PROFILE 精确匹配 cmdline，不误伤其他项目/账号的 dws 进程。
 # ---------------------------------------------------------------------------
 stop_extra_cleanup() {
-    local sig="${1:-TERM}" pid cmd
+    local sig="${1:-TERM}" pid cmd locks
+
+    # 图片识别的跨进程锁（src/custom/mediadesc.py）。锁挂在 msgstore 根下而不是仓库根，
+    # 所以 core 的 clean_runtime_state() 够不着它。mediadesc 自带 pid 存活判定 + TTL
+    # 兜底，不扫也能自愈；扫一下只是让重启后第一次识别不用先判一遍遗骸。
+    locks="${AGENT_MSGSTORE_DIR:-$SCRIPT_DIR/knowledge/messages}/.locks"
+    if [[ -d "$locks" ]]; then
+        log "  stop_extra_cleanup: 清扫图片识别锁 $locks"
+        rm -rf "$locks" 2>/dev/null || true
+    fi
+
     [[ -z "${DWS_PROFILE:-}" ]] && return 0
     for pid in $(pgrep -f "dws event" 2>/dev/null); do
         cmd=$(ps -p "$pid" -o command= 2>/dev/null) || continue
@@ -138,6 +148,7 @@ notify_alert_handler() {
 - 主机: $(hostname)
 - 时间: $(date '+%Y-%m-%d %H:%M:%S')
 - 恢复: \`bash bin/core/start.sh\`" \
+        --ai-tag=false \
         --profile "$AGENT_PROFILE" -y >/dev/null 2>&1 || true
     return 0
 }

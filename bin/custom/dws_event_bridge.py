@@ -18,16 +18,29 @@ start_connect 重定向到 CONNECT_LOG）。
 """
 
 import json
+import re
 import os
 import sys
 import time
 
 # convType 约定：1=单聊 o2o，2=群聊 group（event_watcher REPLY_RE 提取 convType=\d+）
+# **新增 o2o 事件类型必须登记在此**：未知类型 .get 默认回 2(群聊)，单聊消息会被误判成
+# 群聊，路由/ack 全走错路且不报错——静默失效，比收不到消息更难查。
 _CONV_TYPE_BY_EVENT = {
     "user_im_message_receive_o2o": 1,
+    "user_im_message_receive_o2o_all": 1,   # rule_type=all 的全量单聊订阅
     "user_im_message_receive_at": 2,
     "user_im_message_receive_group": 2,
+    "user_im_message_reaction_o2o": 1,      # 主管给消息贴表情（#108）
 }
+
+# 表情回应事件：主管给数字员工发的消息贴 👍/❌ 即完成裁决（#108）
+_REACTION_EVENT = "user_im_message_reaction_o2o"
+# 数字员工自己的显示名 —— **必须过滤自己贴的表情**：ack 会给主管的每条消息贴
+# 「收到/处理中/完成」文字表情，每一次都会回声成一条 reaction 事件（实测确认）。
+# 不在这里挡掉，每条主管消息就会有 3-N 条无用事件涌进 connect log。
+_SELF_NAMES = {n.strip() for n in os.environ.get(
+    "AGENT_SELF_NAMES", "数字员工,Claude Code").split(",") if n.strip()}
 
 # 格式健康检查阈值：收到 >= 该条数原始事件却成功解析 0 条 → 大概率 dws 输出格式与
 # bridge 解析不匹配（如 dws 升级改了格式），此时数字员工收不到任何消息但进程/连接全绿，
@@ -65,6 +78,93 @@ def _should_warn_format(raw_count, parsed_count, already_warned):
             and parsed_count == 0)
 
 
+
+# 「待审 #N」——数字员工发给主管的每条消息（卡片/完整草稿/各种回执）正文开头都带它。
+# **锚在开头**：卡片正文里的【问题】【AI 草稿】是外部可控文本，提问者发一句
+# 「待审 #7 同意」就能往里注入一个假编号；只认开头的那个就注不进来。
+_REVIEW_SEQ_RE = re.compile(r"^\s*[^\w\s]*\s*\**待审\s*#(\d+)")
+
+
+def _quoted_seq(src):
+    """被引用消息属于哪次审核（第几号）；不是审核消息返回 ""。
+
+    主管引用**任意一条**与某次审核相关的消息（不只是卡片）都能定位到那次会话 —— 这些
+    消息正文开头本来就带「待审 #N」，等于结构化标记已经存在，不必再给每条消息加新标记。
+    """
+    for key in ("quoted_message", "quotedMessage", "quoteMessage"):
+        q = src.get(key)
+        if isinstance(q, dict):
+            m = _REVIEW_SEQ_RE.match(str(q.get("content") or ""))
+            if m:
+                return m.group(1)
+    return ""
+
+
+def _sender_id(src):
+    """发送人的稳定标识（`sender_open_dingtalk_id`）；取不到返回 ""。
+
+    字段名来自 `dws event schema user_im_message_receive_{group,o2o_all,at} --flatten`
+    —— 三种事件都有它。**这是全链路唯一稳定的人标识**：`sender` 只是展示名，同一个人
+    在不同地方会是「可菡」/「Cania Chen(可菡)」，主管更是「hugozhu」和「朱鸿」两个名字，
+    靠它建实体必然对不齐（#113）。嵌套格式的字段名未文档化，几种写法都试。
+    """
+    for key in ("sender_open_dingtalk_id", "senderOpenDingTalkId", "senderId"):
+        v = src.get(key)
+        if v:
+            return str(v)
+    return ""
+
+
+def _quoted_sender_id(src):
+    """被引用那条消息的发送人 id；取不到返回 ""。
+
+    有了它，「A 引用 B 的话回复」这条边的两端都是稳定 id，不用回头去查被引用消息。
+    """
+    for key in ("quoted_message", "quotedMessage", "quoteMessage"):
+        q = src.get(key)
+        if isinstance(q, dict):
+            return _sender_id(q)
+    return ""
+
+
+def _quoted_msg_id(src):
+    """引用回复所引用的那条原消息 id；不是引用回复返回 ""。
+
+    扁平格式的字段名来自 `dws event schema user_im_message_receive_o2o --flatten`：
+    `quoted_message.message_id`（"引用回复所引用的原消息；非引用回复时不输出"）。
+    嵌套格式里对应字段名未文档化，故把几种可能的写法都试一遍——取不到就当没有，
+    调用方只是少一个可选标记，不影响正常消息解析。
+    用途：主管引用待审卡片直接回答案，不用敲 #N（见 capabilities/supervisor_review）。
+    """
+    for key in ("quoted_message", "quotedMessage", "quoteMessage"):
+        q = src.get(key)
+        if isinstance(q, dict):
+            mid = q.get("message_id") or q.get("openMessageId") or q.get("messageId")
+            if mid:
+                return str(mid)
+    return ""
+
+
+def _reaction_line(evt, conv_type):
+    """表情回应事件 → 专用 connect 行；不是表情事件/该忽略则返回 None。
+
+    这条行**故意不匹配 core.inbound 的 _REPLY_RE**（它要求 "收到 @"）—— 于是
+    supervisor_review 关掉时，它只是 connect log 里一条惰性日志，不会被当成普通消息
+    喂给大脑。认领它的是 supervisor_review.classify_line。
+    """
+    operator = str(evt.get("operator") or "")
+    if operator in _SELF_NAMES:
+        return None          # 自己贴的（ack 的状态表情）—— 回声，丢掉
+    name = str(evt.get("reaction_name") or evt.get("reaction_text") or "").strip()
+    reacted = evt.get("message_id") or ""
+    if not name or not reacted:
+        return None
+    tail = (f"convType={conv_type} convId={evt.get('conversation_id','')} "
+            f"reactedMsgId={reacted} reactionOp={evt.get('operation_type','add')} "
+            f"eventId={evt.get('event_id','')}")
+    return f"[connect] 表情回应 @{operator}: {name} ({tail})"
+
+
 def _to_connect_line(evt):
     """把一个 dws 事件对象转成 connect-log 行；无法解析返回 None。
 
@@ -90,6 +190,10 @@ def _to_connect_line(evt):
         content = (body.get("content", "") or "").replace("\n", " ").strip()
         conv_id = body.get("openConversationId", "")
         msg_id = body.get("openMessageId", "")
+        quoted_msg_id = _quoted_msg_id(body)
+        quoted_seq = _quoted_seq(body)
+        sender_id = _sender_id(body)
+        quoted_sender_id = _quoted_sender_id(body)
     else:
         # 新版扁平格式：字段直接在事件顶层（dws CLI 升级后的输出）
         etype = etype or evt.get("type") or ""
@@ -97,18 +201,40 @@ def _to_connect_line(evt):
         content = (evt.get("content", "") or "").replace("\n", " ").strip()
         conv_id = evt.get("conversation_id", "")
         msg_id = evt.get("message_id", "")
+        quoted_msg_id = _quoted_msg_id(evt)
+        quoted_seq = _quoted_seq(evt)
+        sender_id = _sender_id(evt)
+        quoted_sender_id = _quoted_sender_id(evt)
     conv_type = _CONV_TYPE_BY_EVENT.get(etype, 2)
     # @我(at) 事件天然是“被 @ 的消息”（payload 无显式 atUsers 字段，唯一可靠信号是事件类型）。
     # 打标 atMention=1 让 core.inbound.parse_line 解析进 extra['at_mention']，供 ack 回执判定
     # “群里被 @”这一路（#46）。放在 msgId 之后、) 之前——_CONVID_RE/_MSGID_RE 止于空白/)，不受影响。
     at_mention = etype == "user_im_message_receive_at"
 
+    # 表情事件没有 content，必须在下面那道 `if not content` 之前分支出去，否则被静默丢掉
+    if etype == _REACTION_EVENT:
+        return _reaction_line(evt, conv_type)
+
     if not content:
         return None
     # 格式对齐 event_watcher.REPLY_RE：'\[connect\] 收到 @(.+?):\s*(.+?)\s+\(convType=(\d+)'
     tail = f"convType={conv_type} convId={conv_id} msgId={msg_id}"
+    if sender_id:
+        # 发送人的稳定 id（#113）。展示名建不了实体，这个才行。同样追加在尾部，由
+        # custom/connline 从**最后一个** `(convType=` 之后解析 —— 正文里出现同名字面量
+        # 伪造不了。
+        tail += f" senderId={sender_id}"
     if at_mention:
         tail += " atMention=1"
+    if quoted_msg_id:
+        # 同样追加在尾部（理由同 atMention）。由 supervisor_review.classify_line 解析进
+        # extra['quoted_msg_id'] —— core 的 parse_line 只认 atMention，不动它。
+        tail += f" quotedMsgId={quoted_msg_id}"
+        # 解析不出编号也要打标（`?`），让能力能区分"引用了审核消息但认不出号"和
+        # "引用了完全无关的消息" —— 前者该追问，后者绝不能改判到别的待审上。
+        tail += f" quotedSeq={quoted_seq or '?'}"
+        if quoted_sender_id:
+            tail += f" quotedSenderId={quoted_sender_id}"
     return f"[connect] 收到 @{sender}: {content} ({tail})"
 
 

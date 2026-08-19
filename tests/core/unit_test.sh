@@ -135,6 +135,32 @@ assert_eq "全开: 含 at consumer" "1" "$(echo "$ALL" | grep -c 'consumer: user
 OFF="$(_dwsplan DWS_PROFILE=p DWS_EVENT_GROUP=cidY== DWS_EVENT_AT=0)"
 assert_eq "AT=0 不起 at consumer" "0" "$(echo "$OFF" | grep -c 'consumer: user_im_message_receive_at')"
 
+# O2O_ALL：订阅所有单聊，起 o2o_all consumer（rule_type=all，无 --user）
+O2O_ALL="$(_dwsplan DWS_PROFILE=p DWS_EVENT_O2O_ALL=1)"
+assert_eq "O2O_ALL: plan o2o=1 mode=all" "1" \
+    "$(echo "$O2O_ALL" | grep -c 'plan: group=0 o2o=1 at=0 o2o_mode=all')"
+assert_eq "O2O_ALL: 起 o2o_all consumer" "1" \
+    "$(echo "$O2O_ALL" | grep -c 'consumer: user_im_message_receive_o2o_all')"
+
+# O2O_ALL 优先于 USERS：开了 ALL 就不再按对端逐个订阅
+O2O_BOTH="$(_dwsplan DWS_PROFILE=p DWS_EVENT_O2O_ALL=1 DWS_EVENT_O2O_USERS=u1,u2)"
+assert_eq "O2O_ALL 优先: 起 o2o_all" "1" \
+    "$(echo "$O2O_BOTH" | grep -c 'consumer: user_im_message_receive_o2o_all')"
+assert_eq "O2O_ALL 优先: 不起 per-user consumer" "0" \
+    "$(echo "$O2O_BOTH" | grep -c 'consumer: user_im_message_receive_o2o --user')"
+
+# O2O_ALL 关（0）时回退 per-user 列表
+O2O_FB="$(_dwsplan DWS_PROFILE=p DWS_EVENT_O2O_ALL=0 DWS_EVENT_O2O_USERS=u1,u2)"
+assert_eq "O2O_ALL=0: 回退 per-user 两个 consumer" "2" \
+    "$(echo "$O2O_FB" | grep -c 'consumer: user_im_message_receive_o2o --user')"
+assert_eq "O2O_ALL=0: 不起 o2o_all" "0" \
+    "$(echo "$O2O_FB" | grep -c 'consumer: user_im_message_receive_o2o_all')"
+
+# 仅开 O2O_ALL 也算"配了订阅"，不该走无订阅报错分支
+O2O_ONLY_RC="$(env DWS_CONNECT_SKIP_LOCAL=1 DWS_CONNECT_DRY_RUN=1 CONNECT_LOG=/dev/null \
+    DWS_PROFILE=p DWS_EVENT_O2O_ALL=1 bash "$DWS_CONNECT" >/dev/null 2>&1; echo $?)"
+assert_eq "仅 O2O_ALL → 退出 0" "0" "$O2O_ONLY_RC"
+
 # 什么都不配 → 报错退出非 0（at 也没开）
 NONE_RC="$(env DWS_CONNECT_SKIP_LOCAL=1 DWS_CONNECT_DRY_RUN=1 CONNECT_LOG=/dev/null \
     DWS_PROFILE=p bash "$DWS_CONNECT" >/dev/null 2>&1; echo $?)"
@@ -285,6 +311,101 @@ assert_eq "custom 定义 brain_probe 钩子" "0" \
     "$(declare -F brain_probe >/dev/null 2>&1 && echo 0 || echo 1)"
 assert_eq "custom 定义 notify_alert_handler 钩子（熔断告警不再静默）" "0" \
     "$(declare -F notify_alert_handler >/dev/null 2>&1 && echo 0 || echo 1)"
+
+# 主管审核回路：模板必须默认关（它改变默认回复行为——提问者不再立即拿到答案），
+# 且开关/超时/知识库三项齐全，否则 fork 的人升级后行为会被动改变。
+echo ""
+echo "Testing supervisor_review config contract..."
+CONST="$SCRIPT_DIR/config/constants.sh"
+# 断言锚定 `^export VAR=` 而不是裸变量名：注释里提到同名变量（如 ACK_SUPERVISOR_ONLY
+# 的说明引用了 CAP_SUPERVISOR_REVIEW_ENABLED）会让计数漂移，与定义本身无关。
+assert_eq "constants.sh 定义 CAP_SUPERVISOR_REVIEW_ENABLED" "1" \
+    "$(grep -c '^export CAP_SUPERVISOR_REVIEW_ENABLED=' "$CONST")"
+assert_eq "模板默认关（:-0）" "1" \
+    "$(grep -c '^export CAP_SUPERVISOR_REVIEW_ENABLED="${CAP_SUPERVISOR_REVIEW_ENABLED:-0}"' "$CONST")"
+assert_eq "constants.sh 定义 SUPERVISOR_REVIEW_TIMEOUT" "1" \
+    "$(grep -c '^export SUPERVISOR_REVIEW_TIMEOUT=' "$CONST")"
+assert_eq "constants.sh 定义 AGENT_KNOWLEDGE_FILE" "1" \
+    "$(grep -c '^export AGENT_KNOWLEDGE_FILE=' "$CONST")"
+# #107：群聊也送审 —— 群里的回答是公开发言，比单聊更该先过主管。O2O_ONLY=1 是退回老行为的逃生门。
+assert_eq "SUPERVISOR_REVIEW_O2O_ONLY 默认 0（群聊也审）" "1" \
+    "$(grep -c '^export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-0}"' "$CONST")"
+assert_eq "能力已在 capabilities/__init__ 注册" "1" \
+    "$(grep -q 'from custom.capabilities import supervisor_review' "$SCRIPT_DIR/src/custom/capabilities/__init__.py" && echo 1 || echo 0)"
+# 知识库含真实对话内容，绝不能提交
+assert_eq "knowledge/ 已 gitignore" "1" \
+    "$(grep -c '^knowledge/' "$SCRIPT_DIR/.gitignore")"
+
+# ack 主管闸门（#106）：只给主管贴状态表情。默认开，但必须有 has_supervisor() 兜底——
+# 否则未配主管的部署会一个表情都不贴（CAP_ACK_ENABLED 默认开，属无声行为回退）。
+# 群消息闸门（group_gate）：订阅整群后，没 @ 我的群消息不进大脑；并合并"群流+@流"双投递。
+assert_eq "constants.sh 定义 CAP_GROUP_GATE_ENABLED" "1" \
+    "$(grep -c '^export CAP_GROUP_GATE_ENABLED=' "$CONST")"
+assert_eq "group_gate 默认开（:-1）" "1" \
+    "$(grep -c '^export CAP_GROUP_GATE_ENABLED="${CAP_GROUP_GATE_ENABLED:-1}"' "$CONST")"
+assert_eq "group_gate 已在 capabilities/__init__ 注册" "1" \
+    "$(grep -q 'from custom.capabilities import group_gate' "$SCRIPT_DIR/src/custom/capabilities/__init__.py" && echo 1 || echo 0)"
+# 订阅相关的 export 必须用直引号：曾把 " 写成中文引号 ”，DWS_EVENT_GROUP 会得到字面值
+# ”” —— 非空，于是 dws-connect 误判"要订阅群"并拿垃圾 conversationId 去 consume。
+assert_eq "constants.sh 无中文引号赋值" "0" \
+    "$(grep -c '^export [A-Z_]*=”' "$CONST")"
+
+assert_eq "constants.sh 定义 ACK_SUPERVISOR_ONLY" "1" \
+    "$(grep -c '^export ACK_SUPERVISOR_ONLY=' "$CONST")"
+assert_eq "ACK_SUPERVISOR_ONLY 默认开（:-1）" "1" \
+    "$(grep -c '^export ACK_SUPERVISOR_ONLY="${ACK_SUPERVISOR_ONLY:-1}"' "$CONST")"
+assert_eq "ack 主管闸门带 has_supervisor 兜底" "1" \
+    "$(grep -c 'has_supervisor() and not is_supervisor' "$SCRIPT_DIR/src/custom/capabilities/ack.py")"
+# 身份判定收敛到 custom/identity.py，能力之间不互相 import（ack 常开 / supervisor_review 默认关）
+assert_eq "identity 模块存在" "0" \
+    "$([ -f "$SCRIPT_DIR/src/custom/identity.py" ] && echo 0 || echo 1)"
+assert_eq "ack 不 import supervisor_review 能力" "0" \
+    "$(grep -c 'import supervisor_review' "$SCRIPT_DIR/src/custom/capabilities/ack.py")"
+
+# 「AI」角标：dws chat message send 的 --ai-tag 默认 true，不显式关掉消息右上角会常驻
+# 一个 AI 标（拟人化的反面）。每个 send 调用点都必须带 --ai-tag=false。
+# 注：send-by-bot 无此参数，机器人身份本就不伪装成真人，不在范围内。
+echo ""
+echo "Testing ai-tag suppression on dws send call sites..."
+_ai_tag_missing=0
+# 只数**真实调用/真实参数**，不数注释：
+#   Python 调用 = 列表形式 `"message", "send"`（"send-by-bot" 不命中，模式含右引号）
+#   Python 参数 = 带引号的字符串字面量 `"--ai-tag=false"`
+# 两个坑都已用变异测试验证过：
+#   1) 若数裸 `ai-tag=false`，注释里那句说明会把计数顶上去 → 真漏传也检不出（假阴性）
+#   2) `grep -c` 零匹配时**自己就打印 0** 且退出码 1，再接 `|| echo 0` 会得到 "0\n0"
+#      多行值，令 -gt 数值比较失效 → 恒通过。故用 `|| true` + 数字校验（同 lib.sh 写法）
+_count() {
+    local n
+    n=$(grep -c "$1" "$2" 2>/dev/null || true)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    printf '%s' "$n"
+}
+_count_re() {
+    local n
+    n=$(grep -cE "$1" "$2" 2>/dev/null || true)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    printf '%s' "$n"
+}
+for f in "$SCRIPT_DIR/src/custom/replier.py" \
+         "$SCRIPT_DIR/src/custom/capabilities/supervisor_review.py" \
+         "$SCRIPT_DIR/src/custom/capabilities/startup_report.py"; do
+    sends=$(_count '"message", "send"' "$f")
+    tags=$(_count '"--ai-tag=false"' "$f")
+    if [[ "$sends" -gt "$tags" ]]; then
+        echo "    ${f##*/}: send=$sends ai-tag=$tags"
+        _ai_tag_missing=$((_ai_tag_missing + 1))
+    fi
+done
+for f in "$SCRIPT_DIR/bin/custom/start_funcs.sh"; do
+    sends=$(_count_re '^[[:space:]]*dws chat message send' "$f")
+    tags=$(_count_re '^[[:space:]]*--ai-tag=false' "$f")
+    if [[ "$sends" -gt "$tags" ]]; then
+        echo "    ${f##*/}: send=$sends ai-tag=$tags"
+        _ai_tag_missing=$((_ai_tag_missing + 1))
+    fi
+done
+assert_eq "所有 dws send 调用点都带 --ai-tag=false" "0" "$_ai_tag_missing"
 
 # 报告
 echo ""

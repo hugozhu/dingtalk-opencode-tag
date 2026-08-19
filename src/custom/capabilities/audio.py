@@ -92,6 +92,20 @@ def _transcribe_whisper(audio_path, tmp_dir):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _keep(conv_id, msg_id, content, kind):
+    """把转写结果落进 msgstore（#113）。
+
+    以前转写内容只进 prompt，回完就丢 —— 而语音/文档往往是事实密度最高的地方。
+    落盘之后 convq 查得到、知识抽取也有料。best-effort：写失败绝不影响回复。
+    """
+    try:
+        from custom import msgstore
+        msgstore.record_description(conv_id, msg_id, content, by=kind, ok=True,
+                                    kind=kind)
+    except Exception as e:      # noqa: BLE001
+        log(f"{kind}: 转写落盘失败 {e}")
+
+
 def handle_audio(user, text, msg_id, conv_id, conv_type):
     """提取 mediaId → 下载 → Whisper 转录 → 组 prompt → brain 回复 → 发回来源群。"""
     mid_m = _RE_MEDIA_ID.search(text or "")
@@ -114,6 +128,7 @@ def handle_audio(user, text, msg_id, conv_id, conv_type):
         return
 
     log(f"audio: msgId={msg_id[:24]} 转录成功 text_len={len(transcription)}")
+    _keep(conv_id, msg_id, transcription, "audio")
 
     # 结构化呈现语音转录结果（用户+语音标识+转录内容代码块+任务指令）
     parts = [

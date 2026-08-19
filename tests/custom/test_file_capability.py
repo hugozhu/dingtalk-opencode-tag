@@ -8,6 +8,7 @@ mock _run_cli + 文件系统 + vision 识别。
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
+
+# 解析出的文件正文现在会落进 msgstore（#113）—— 指到 tmpdir，否则夹具会写进真实的
+# knowledge/messages（这个仓库已经漏进去过四次）
+import atexit as _atexit
+_MS_TMP = tempfile.mkdtemp(prefix="test-file-ms-")
+_atexit.register(shutil.rmtree, _MS_TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = _MS_TMP
 
 from custom.capabilities import file as F
 from core.inbound import InboundMessage, KIND_FILE, parse_line
@@ -176,9 +184,15 @@ class TestHandleFile(unittest.TestCase):
         snd.assert_called_once()
 
     def test_unknown_type_notifies(self):
-        """未知类型：不下载，明确告知用户。"""
+        """未知类型：不下载，明确告知用户。
+
+        路径用 _fake_download 的私有临时目录，**别用 "/tmp/archive.zip"** —— handle_file
+        收尾会清 os.path.dirname(path)，那样等于让测试去删整个 /tmp（见
+        test_cleanup_tmp_refuses_shared_dir）。
+        """
         content = "[文件] archive.zip fileId: ZIP111 注意：如需下载"
-        with patch.object(F, "_download_file", return_value="/tmp/archive.zip"), \
+        path = self._fake_download("PK\x03\x04", "archive.zip")
+        with patch.object(F, "_download_file", return_value=path), \
              patch.object(F, "generate_reply") as gen, \
              patch.object(F, "send_reply") as snd:
             F.handle_file("u", content, "m==", "c==", "2")
@@ -215,6 +229,29 @@ class TestHandleFile(unittest.TestCase):
             F.handle_file("u", "[文件] noid.txt 注意：如需下载", "m==", "c==", "2")
         dl.assert_not_called()
         snd.assert_not_called()
+
+
+class TestCleanupTmp(unittest.TestCase):
+    """收尾清理只能删自己建的下载目录 —— 删错一次代价是整个 /tmp。"""
+
+    def test_cleanup_tmp_removes_own_dir(self):
+        d = tempfile.mkdtemp(prefix=F._TMP_PREFIX)
+        self.assertTrue(F._cleanup_tmp(d))
+        self.assertFalse(os.path.exists(d))
+
+    def test_cleanup_tmp_refuses_shared_dir(self):
+        """dirname 落到 /tmp（下载替身返回裸路径时会这样）→ 拒绝，且一个字节都不能删。"""
+        probe = tempfile.mkdtemp(prefix="not_ours_")
+        try:
+            with patch.object(F.shutil, "rmtree") as rm:
+                self.assertFalse(F._cleanup_tmp(tempfile.gettempdir()))
+                self.assertFalse(F._cleanup_tmp("/tmp/"))
+                self.assertFalse(F._cleanup_tmp(""))
+                self.assertFalse(F._cleanup_tmp(probe))
+            rm.assert_not_called()
+            self.assertTrue(os.path.exists(probe))
+        finally:
+            shutil.rmtree(probe, ignore_errors=True)
 
 
 class TestParsers(unittest.TestCase):

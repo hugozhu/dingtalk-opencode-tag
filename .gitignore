@@ -236,6 +236,9 @@ start-digital-employee.sh
 # monitor 运行时状态（下次健康检查时间戳）
 .next-check
 
+# 主管审核沉淀的知识库（含真实对话问答内容，勿提交）
+knowledge/
+
 # firecrawl 抓取的中间产物（报告数据缓存，勿提交）
 .firecrawl/
 

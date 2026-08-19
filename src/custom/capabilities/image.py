@@ -29,6 +29,9 @@ from core.brain import generate_reply, register_session as _register_textreply_s
 from core.replier import send_reply
 
 # 图片 mediaId 提取（content 形如 "[图片消息](mediaId=$xxx)"，ID 含 $@/_- 等，止于 )）
+# 识别等待上限（秒）：handle_image 跑在 task 池，等太久会占着 worker 不放
+_VISION_WAIT = int(os.environ.get("AGENT_MEDIA_WAIT_SEC", "120") or 120)
+
 _RE_MEDIA_ID = re.compile(r"mediaId=([^\s)]+)")
 # 去掉 content 里的图片标记，剩下的当用户 caption（"[图片消息](mediaId=x)看标红处" → "看标红处"）
 _RE_IMAGE_TAG = re.compile(r"\[图片消息\]\(mediaId=[^\s)]+\)")
@@ -138,11 +141,17 @@ def _recognize_via_serve(img_bytes, mime="image/png"):
                 pass
 
 
-def _recognize(image_path, tmp_dir):
+def _recognize(image_path, tmp_dir=None):
     """读图片字节 → vision 识别，返回描述文本（失败返回 ""）。用完删临时目录。
 
     优先经 opencode serve 用 AGENT_VISION_MODEL 识别（免外部 proxy）；空则回退
     agent_common._proxy_vision（外部 PROXY_URL）。
+
+    tmp_dir 可省：省略时清理图片自身所在的目录。**这个默认值是必须的** —— handler.py
+    的两个调用点（合并转发内层图片、以文件形式发来的图片）一直是按单参数调的，两个
+    必填参数时它们每次都抛 TypeError，被外层 `except Exception` 吞成 desc=""，于是那
+    两条路的识别**一直是 100% 失败**、只吐「[图片，识别失败]」。单测没发现是因为
+    patch 时没带 autospec，替身能接受任意参数。
     """
     mime = "image/jpeg" if image_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
     try:
@@ -156,7 +165,7 @@ def _recognize(image_path, tmp_dir):
         log(f"image: 识别读文件失败 {e}")
         return ""
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(tmp_dir or os.path.dirname(image_path), ignore_errors=True)
 
 
 def handle_image(user, text, msg_id, conv_id, conv_type):
@@ -168,12 +177,13 @@ def handle_image(user, text, msg_id, conv_id, conv_type):
     media_id = mid_m.group(1)
     caption = _RE_IMAGE_TAG.sub("", text or "").strip()  # 图外的说明文字
 
-    image_path, tmp_dir = _download_image(media_id, msg_id, conv_id)
-    if not image_path:
+    # 走单飞：同一张图可能同时被预识别/追问回看要到，谁先到谁真跑，别重复下载+识别
+    # （at_mention 是每份投递的属性，靠它分流必然重复，见 custom/mediadesc）
+    from custom import mediadesc
+    desc, st = mediadesc.describe(conv_id, msg_id, text, wait=_VISION_WAIT, by="image")
+    if st == "download":
         send_reply(conv_id, conv_type, "抱歉，这张图片我没能下载下来，能再发一次吗？")
         return
-
-    desc = _recognize(image_path, tmp_dir)
     if not desc:
         send_reply(conv_id, conv_type,
                    "抱歉，图片内容识别失败了（可能是识别服务不可达）。你可以把关键内容用文字发我。")

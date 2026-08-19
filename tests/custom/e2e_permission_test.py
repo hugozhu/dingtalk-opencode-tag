@@ -9,8 +9,11 @@ SSE → dispatch_sse → permission.on_sse_event 渲染（send_reply 被捕获�
 """
 import base64
 import json
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -19,6 +22,9 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
 
 # 关键：import 前设 per-session 权限规则，让 brain 建 session 时下传 bash:ask
+_TMP = tempfile.mkdtemp(prefix="e2e-ms-")
+atexit.register(shutil.rmtree, _TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_TMP, "messages")
 os.environ["AGENT_OPENCODE_PERMISSION"] = '[{"permission":"bash","pattern":"*","action":"ask"}]'
 
 import custom.capabilities            # noqa: 注册全部能力（含 permission）

@@ -100,6 +100,76 @@ class TestShouldAck(unittest.TestCase):
         self.assertTrue(ack._should_ack(_msg(kind=KIND_IMAGE)))
 
 
+class TestShouldAckSupervisorOnly(unittest.TestCase):
+    """只给主管贴状态表情（#106）。
+
+    注意：上面 TestShouldAck 的用例跑在「未配主管」环境下（裸测试环境无
+    AGENT_SUPERVISOR_* env），走的正是兜底那条路 —— 那些用例继续全绿本身就验证了
+    「没配主管 → 保持原行为」。本类显式设置 env 覆盖新行为。
+    """
+
+    _KEYS = ("AGENT_SUPERVISOR_NAME", "AGENT_SUPERVISOR_ALIASES", "AGENT_SUPERVISOR_USER_ID")
+
+    def setUp(self):
+        self._orig = {k: os.environ.get(k) for k in self._KEYS}
+        os.environ["AGENT_SUPERVISOR_NAME"] = "hugozhu"
+        os.environ["AGENT_SUPERVISOR_ALIASES"] = "朱鸿"
+        os.environ["AGENT_SUPERVISOR_USER_ID"] = "024083"
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_supervisor_gets_status_emoji(self):
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertTrue(ack._should_ack(_msg(user="hugozhu")))
+
+    def test_supervisor_alias_gets_status_emoji(self):
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertTrue(ack._should_ack(_msg(user="朱鸿")))
+
+    def test_other_user_gets_no_status_emoji(self):
+        """本 issue 的核心诉求：非主管的单聊不贴状态表情。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertFalse(ack._should_ack(_msg(user="张三")))
+
+    def test_other_user_in_group_at_mention_also_gated(self):
+        """群里被 @ 的那一路（#46）同样只限主管。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", True), \
+             patch.object(ack, "_O2O_ONLY", True), patch.object(ack, "_AT_MENTION", True):
+            self.assertFalse(ack._should_ack(
+                _msg(user="张三", conv_type="2", extra={"at_mention": True})))
+            self.assertTrue(ack._should_ack(
+                _msg(user="hugozhu", conv_type="2", extra={"at_mention": True})))
+
+    def test_switch_off_restores_ack_for_all(self):
+        """ACK_SUPERVISOR_ONLY=0 → 逃生口，回到所有人都贴。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", False):
+            self.assertTrue(ack._should_ack(_msg(user="张三")))
+
+    def test_unconfigured_supervisor_falls_back_to_ack_all(self):
+        """未配主管 + 开关开 → 退化为原行为（都贴）。
+
+        这条守着一个无声回退：若少了 has_supervisor() 前置，没配主管的部署会
+        **谁都不贴表情**，而 CAP_ACK_ENABLED 默认是开的。
+        """
+        for k in self._KEYS:
+            os.environ.pop(k, None)
+        with patch.object(ack, "_SUPERVISOR_ONLY", True):
+            self.assertTrue(ack._should_ack(_msg(user="张三")))
+            self.assertTrue(ack._should_ack(_msg(user="hugozhu")))
+
+    def test_mark_read_unaffected_by_supervisor_gate(self):
+        """已读不受主管闸门影响：非主管的消息照常标已读（真人也会已读）。"""
+        with patch.object(ack, "_SUPERVISOR_ONLY", True), \
+             patch.object(ack, "_MARK_READ", True):
+            self.assertTrue(ack._should_mark_read(_msg(user="张三")))
+            self.assertTrue(ack._should_mark_read(_msg(user="张三", conv_type="2")))
+
+
 class TestOnInbound(unittest.TestCase):
     def setUp(self):
         ack._seen.clear()
@@ -115,6 +185,20 @@ class TestOnInbound(unittest.TestCase):
         with patch.object(ack, "_SELF_NAMES", {"数字员工"}), patch.object(ack, "_begin") as beg:
             self.assertFalse(ack.on_inbound(_msg(user="数字员工")))
             beg.assert_not_called()
+
+    def test_reaction_kind_is_ignored(self):
+        """表情回应事件不能起 ack worker（#108）。
+
+        不早退的话它满足 _should_ack 的全部条件（主管发的、单聊、id 齐），_begin 会顶掉
+        _pending[主管conv] —— 把主管**正在处理的那条裁决消息**的 worker 提前收尾，再给
+        一个不存在的 msgId 反复贴表情，最后等满 65 分钟、每 5 分钟发一条「仍在处理中」。
+        主管贴一次表情 = 被打扰 13 次。
+        """
+        with patch.object(ack, "_begin") as beg:
+            self.assertFalse(ack.on_inbound(_msg(kind="reaction")))
+            beg.assert_not_called()
+        with ack._pending_lock:
+            self.assertEqual(len(ack._pending), 0)
 
     def test_dedup(self):
         with patch.object(ack, "_begin") as beg:
@@ -530,6 +614,31 @@ class TestLifecycleWorker(unittest.TestCase):
         cli_calls = [c for c in calls if c[0] == "cli"]
         remove_calls = [c for c in cli_calls if "remove-text-emotion" in c[1]]
         self.assertEqual(len(remove_calls), 1, "超时收尾应调用 remove")
+
+    def test_reply_sent_none_closes_silently(self):
+        """ok=None → 静默收尾：移除「处理中」但不贴完成/失败（#109 忽略场景）。
+
+        贴「完成」= 骗提问者（他并没收到回复），贴「未完成」= 看着像故障。
+        """
+        calls, m = self._record()
+        with patch.object(ack, "_mark_read", m["_mark_read"]), \
+             patch.object(ack, "_add_text_emotion", m["_add_text_emotion"]), \
+             patch.object(ack, "_emotion_id", m["_emotion_id"]), \
+             patch.object(ack, "_update_text_emotion", m["_update_text_emotion"]), \
+             patch.object(ack, "_run_cli", m["_run_cli"]), \
+             patch.object(ack, "_STAGES", [(0.0, "收到", "t0")]), \
+             patch.object(ack, "_DONE_TIMEOUT", 30), \
+             patch.object(ack, "_DONE", ("OK", "done")), \
+             patch.object(ack, "_ERROR", ("疑问", "fail")):
+            ack._begin(_msg(conv_id="cN==", msg_id="mN=="))
+            time.sleep(0.05)
+            ack.on_reply_sent("cN==", "1", None)
+            self.assertTrue(_wait_gone("cN=="), "None 必须唤醒 worker，不能等到 DONE_TIMEOUT")
+        shown = self._shown(calls)
+        self.assertNotIn(("OK", "done"), shown)
+        self.assertNotIn(("疑问", "fail"), shown)
+        remove_calls = [c for c in calls if c[0] == "cli" and "remove-text-emotion" in c[1]]
+        self.assertEqual(len(remove_calls), 1, "静默收尾应只移除进度表情")
 
     def test_best_effort_no_raise(self):
         def boom(*a, **k):

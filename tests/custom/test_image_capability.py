@@ -15,6 +15,15 @@ SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+# 图片识别现在会把描述写进 msgstore（单飞缓存）—— 指到 tmpdir，否则既污染真实
+# knowledge/，又让用例之间通过"失败缓存"互相串味（下载失败被缓存成识别失败）
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+_MS_TMP = _tempfile.mkdtemp(prefix="test-img-ms-")
+_atexit.register(_shutil.rmtree, _MS_TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = _MS_TMP
+
 from custom.capabilities import image
 from core.inbound import InboundMessage, KIND_IMAGE, parse_line
 
@@ -49,9 +58,17 @@ class TestImageRouting(unittest.TestCase):
 
 
 class TestHandleImage(unittest.TestCase):
+    def setUp(self):
+        # 每个用例一份干净的描述缓存：单飞会把"识别失败/下载失败"按 msgId 缓存 60s，
+        # 用例之间复用同一个 msgId 就会串味（前一个用例的失败被下一个读到）
+        from custom import mediadesc
+        self._dir = _tempfile.mkdtemp(prefix="test-img-case-", dir=_MS_TMP)
+        os.environ["AGENT_MSGSTORE_DIR"] = self._dir
+        mediadesc._reset()
+
     def test_full_pipeline_replies_to_group(self):
         with patch.object(image, "_download_image", return_value=("/tmp/fake.png", "/tmp/dir")), \
-             patch.object(image, "_recognize", return_value="图中是等式 1 + 1 = 2"), \
+             patch.object(image, "_recognize", autospec=True, side_effect=lambda *a, **k: "图中是等式 1 + 1 = 2"), \
              patch.object(image, "generate_reply", return_value="这张图是 1+1=2，正确。") as gen, \
              patch.object(image, "send_reply", return_value=True) as snd:
             image.handle_image("hugozhu", "[图片消息](mediaId=$x)这题对吗",
@@ -78,7 +95,7 @@ class TestHandleImage(unittest.TestCase):
 
     def test_recognize_failure_notifies(self):
         with patch.object(image, "_download_image", return_value=("/tmp/f.png", "/tmp/dir")), \
-             patch.object(image, "_recognize", return_value=""), \
+             patch.object(image, "_recognize", autospec=True, side_effect=lambda *a, **k: ""), \
              patch.object(image, "generate_reply") as gen, \
              patch.object(image, "send_reply") as snd:
             image.handle_image("u", "[图片消息](mediaId=$x)", "m==", "c==", "2")

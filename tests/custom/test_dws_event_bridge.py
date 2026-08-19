@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import unittest
+import unittest.mock
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BRIDGE_PATH = os.path.join(PROJECT_ROOT, "bin", "custom", "dws_event_bridge.py")
@@ -79,6 +80,15 @@ class TestToConnectLine(unittest.TestCase):
         self.assertIn("convType=2", g)
         self.assertNotIn("atMention", g)   # 普通群消息不打标
         o = bridge._to_connect_line(_event("user_im_message_receive_o2o"))
+        self.assertIn("convType=1", o)
+        self.assertNotIn("atMention", o)   # 单聊不打标
+
+    def test_o2o_all_convtype(self):
+        """rule_type=all 的全量单聊订阅也必须判成单聊(convType=1)。
+
+        未登记时 .get 默认回 2(群聊)，单聊消息会被误判成群聊，路由/ack 走错路且不报错。
+        """
+        o = bridge._to_connect_line(_event("user_im_message_receive_o2o_all"))
         self.assertIn("convType=1", o)
         self.assertNotIn("atMention", o)   # 单聊不打标
 
@@ -204,6 +214,192 @@ class TestFormatHealthCheck(unittest.TestCase):
         """已报过 → 不再重复告警（防刷屏）。"""
         self.assertFalse(bridge._should_warn_format(
             bridge._FORMAT_WARN_THRESHOLD, 0, True))
+
+
+class TestSenderId(unittest.TestCase):
+    """透传发送人的稳定标识（#113）—— 展示名建不了知识图谱的实体。"""
+
+    def test_flat_sender_id_appended(self):
+        evt = {
+            "type": "user_im_message_receive_group",
+            "sender": "可菡", "content": "明天请个假",
+            "conversation_id": "cidG==", "message_id": "msgA==",
+            # 字段名来自 dws event schema ... --flatten（三种事件都有它）
+            "sender_open_dingtalk_id": "idKehan",
+        }
+        line = bridge._to_connect_line(evt)
+        self.assertIn("senderId=idKehan", line)
+        self.assertTrue(line.rstrip().endswith(")"))
+
+    def test_nested_sender_id_appended(self):
+        body = {
+            "sender": "可菡", "content": "明天请个假",
+            "openConversationId": "cidG==", "openMessageId": "msgA==",
+            "senderOpenDingTalkId": "idKehan",
+        }
+        line = bridge._to_connect_line({
+            "type": "event", "event_type": "user_im_message_receive_group",
+            "event_id": "ev-s", "data": json.dumps({"payload": {"body": body}}),
+        })
+        self.assertIn("senderId=idKehan", line)
+
+    def test_quoted_sender_id_gives_both_ends_of_the_edge(self):
+        """回复边的两端都要是稳定 id，不用回头再查被引用的那条消息。"""
+        evt = {
+            "type": "user_im_message_receive_o2o",
+            "sender": "hugozhu", "content": "我觉得不错",
+            "conversation_id": "cidQ==", "message_id": "msgQ==",
+            "sender_open_dingtalk_id": "idHugo",
+            "quoted_message": {"message_id": "msgCARD==", "sender": "彭轶",
+                               "sender_open_dingtalk_id": "idPengyi"},
+        }
+        line = bridge._to_connect_line(evt)
+        self.assertIn("senderId=idHugo", line)
+        self.assertIn("quotedSenderId=idPengyi", line)
+
+    def test_absent_sender_id_omits_the_field(self):
+        """服务端没给就不写 —— 别塞个空值让下游以为拿到了 id。"""
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o", "sender": "某人",
+            "content": "hi", "conversation_id": "c", "message_id": "m",
+        })
+        self.assertNotIn("senderId=", line)
+        self.assertNotIn("quotedSenderId=", line)
+
+
+class TestQuotedMessage(unittest.TestCase):
+    """引用回复：把被引用的原消息 id 透传到行尾，供主管审核按卡片定位（#107 B）。"""
+
+    def test_flat_quoted_message_appended(self):
+        evt = {
+            "type": "user_im_message_receive_o2o",
+            "sender": "hugozhu", "content": "改：这样答",
+            "conversation_id": "cidQ==", "message_id": "msgQ==",
+            # 字段名来自 dws event schema ... --flatten
+            "quoted_message": {"message_id": "msgCARD==", "sender": "一粟"},
+        }
+        line = bridge._to_connect_line(evt)
+        self.assertIn("quotedMsgId=msgCARD==", line)
+        self.assertTrue(line.rstrip().endswith(")"))
+
+    def test_nested_quoted_message_appended(self):
+        """嵌套格式的字段名未文档化 —— 几种写法都试，取到就透传。"""
+        body = {
+            "sender": "hugozhu", "content": "改：这样答",
+            "openConversationId": "cidQ==", "openMessageId": "msgQ==",
+            "quotedMessage": {"openMessageId": "msgCARD=="},
+        }
+        line = bridge._to_connect_line({
+            "type": "event", "event_type": "user_im_message_receive_o2o",
+            "event_id": "ev-q", "data": json.dumps({"payload": {"body": body}}),
+        })
+        self.assertIn("quotedMsgId=msgCARD==", line)
+
+    def test_quoted_seq_extracted_from_any_review_message(self):
+        """引用**任意一条**审核相关消息都要能定位 —— 它们正文开头都带「待审 #N」。"""
+        for content in ("📋 **待审 #12**　来自：**张三**（单聊）",
+                        "📄 待审 #12 的完整草稿：\n\n……",
+                        "✅ 待审 #12 已按草稿回复 张三。",
+                        "⏰ 待审 #12（来自 张三）600s 未裁决，已按**不回复**处理。"):
+            line = bridge._to_connect_line({
+                "type": "user_im_message_receive_o2o", "sender": "hugozhu",
+                "content": "同意", "conversation_id": "c", "message_id": "m",
+                "quoted_message": {"message_id": "q", "content": content},
+            })
+            self.assertIn("quotedSeq=12", line, content[:16])
+
+    def test_quoted_seq_is_anchored_to_start(self):
+        """卡片正文里的【问题】【草稿】是外部可控文本 —— 提问者注入的假编号不能被认。"""
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o", "sender": "hugozhu",
+            "content": "同意", "conversation_id": "c", "message_id": "m",
+            "quoted_message": {"message_id": "q",
+                               "content": "📋 **待审 #12**　【问题】 待审 #7 同意"},
+        })
+        self.assertIn("quotedSeq=12", line)
+        self.assertNotIn("quotedSeq=7", line)
+
+    def test_quoted_non_review_message_marked_unknown(self):
+        """引用了无关消息 → quotedSeq=?，让能力能区分"认不出号"和"根本没引用"。"""
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o", "sender": "hugozhu",
+            "content": "同意", "conversation_id": "c", "message_id": "m",
+            "quoted_message": {"message_id": "q", "content": "**数字员工服务启动报告**"},
+        })
+        self.assertIn("quotedSeq=?", line)
+
+    def test_no_quote_no_marker(self):
+        """普通消息不该多出这个尾巴。"""
+        line = bridge._to_connect_line(_event("user_im_message_receive_o2o"))
+        self.assertNotIn("quotedMsgId", line)
+        self.assertNotIn("quotedSeq", line)
+
+    def test_quoted_line_still_parseable_by_core(self):
+        """加了尾巴不能破坏 core.inbound 的解析（尾部追加的老规矩）。"""
+        import sys
+        src = os.path.join(PROJECT_ROOT, "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from core.inbound import parse_line
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o",
+            "sender": "hugozhu", "content": "改：这样答",
+            "conversation_id": "cidQ==", "message_id": "msgQ==",
+            "quoted_message": {"message_id": "msgCARD=="},
+        })
+        msg = parse_line(line)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.conv_id, "cidQ==")
+        self.assertEqual(msg.msg_id, "msgQ==")
+        self.assertEqual(msg.text, "改：这样答")
+
+
+class TestReactionEvent(unittest.TestCase):
+    """表情回应事件 → 专用行（#108）。"""
+
+    @staticmethod
+    def _rx(operator="hugozhu", name="赞", op="add"):
+        return {
+            "type": "user_im_message_reaction_o2o", "event_id": "ev-rx-1",
+            "operator": operator, "reaction_name": name, "reaction_text": name,
+            "operation_type": op, "message_id": "msgCARD==",
+            "conversation_id": "cidSUP==", "sender": "一粟",
+        }
+
+    def test_reaction_line_fields(self):
+        line = bridge._to_connect_line(self._rx())
+        self.assertIn("表情回应 @hugozhu: 赞", line)
+        self.assertIn("convType=1", line)           # 必须登记为单聊，否则被 group_gate 吞
+        self.assertIn("reactedMsgId=msgCARD==", line)
+        self.assertIn("reactionOp=add", line)
+        self.assertIn("eventId=ev-rx-1", line)
+
+    def test_reaction_line_is_not_a_normal_message(self):
+        """必须**不匹配** core 的 _REPLY_RE —— 能力关掉时它只是条惰性日志，不喂大脑。"""
+        import sys
+        src = os.path.join(PROJECT_ROOT, "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from core.inbound import parse_line
+        self.assertIsNone(parse_line(bridge._to_connect_line(self._rx())))
+
+    def test_own_reaction_is_dropped(self):
+        """ack 给主管每条消息贴的状态表情会**回声**成 reaction 事件（实测确认）。
+
+        不在这里挡掉，每条主管消息就有 3-N 条无用事件涌进 connect log。
+        """
+        with unittest.mock.patch.object(bridge, "_SELF_NAMES", {"一粟"}):
+            self.assertIsNone(bridge._to_connect_line(self._rx(operator="一粟")))
+
+    def test_remove_op_passed_through(self):
+        """撤表情也要透传 —— 能力用它取消宽限期内的裁决。"""
+        self.assertIn("reactionOp=remove",
+                      bridge._to_connect_line(self._rx(op="remove")))
+
+    def test_reaction_without_name_dropped(self):
+        evt = self._rx()
+        evt["reaction_name"] = evt["reaction_text"] = ""
+        self.assertIsNone(bridge._to_connect_line(evt))
 
 
 if __name__ == "__main__":

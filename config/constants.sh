@@ -12,6 +12,14 @@
 #      **必须**与 DWS_PROFILE 填成同一个真实 profile。留占位 'your-profile' 会导致
 #      dws 用不存在的 profile → "未登录，请先执行 dws auth login"。
 
+# --- 时区 ---
+# reboot.sh 用 `env -i` 起服务（#71，为了让改过的 config 真生效），它保留了 LANG 却
+# **没保留 TZ** —— 守护进程于是跑在 UTC，而钉钉给的时间戳是本地时区。后果：
+#   · monitor.log 的时间和钉钉会话里的时间差 8 小时，排查时对不上号；
+#   · 任何"按时间窗口查消息"的代码锚点偏 8 小时（曾导致贴表情裁决静默失效）。
+# 显式设死，别指望继承。非中国区改成自己的时区。
+export TZ="${TZ:-Asia/Shanghai}"
+
 # --- 数字员工身份 ---
 export AGENT_ROBOT_CODE="${AGENT_ROBOT_CODE:-your-robot-code}"
 export AGENT_USER_ID="${AGENT_USER_ID:-your-user-id}"
@@ -64,23 +72,64 @@ export VISION_MODEL="${VISION_MODEL:-gemini-3.1-flash-image}"
 # 留空则只用外部 proxy (PROXY_URL + VISION_MODEL)。
 export AGENT_VISION_MODEL="${AGENT_VISION_MODEL:-}"
 
+# 图片描述的单飞识别（src/custom/mediadesc.py，#112）。同一张图只识别一次：at_mention
+# 是**每份投递**的属性，群订阅 + DWS_EVENT_AT 同开时一条被 @ 的图会进来两份且群流那份
+# 没有 @ 标记，靠标记分流必然重复下载 + 重复视觉调用。
+# 同时最多几个识别在跑。task 池默认才 8 个 worker 且与 file/forward/audio 共用 ——
+# 群里有人贴 20 张截图时不设上限会把池占满，真正被 @ 的重活反而排不上。
+export AGENT_MEDIA_MAX_INFLIGHT="${AGENT_MEDIA_MAX_INFLIGHT:-2}"
+# 识别失败后多久允许重试（秒）。坏 mediaId 不该被窗口内每条追问反复重试（每次都是
+# 一轮下载 + 视觉超时）。
+export AGENT_MEDIA_FAIL_TTL="${AGENT_MEDIA_FAIL_TTL:-60}"
+# 拼上下文时最多等识别多久（秒）。调用方跑在 reply 池（默认 4 个 worker），**绝不无限
+# 等** —— 等下去会让所有会话的回复一起排队饿死。等不到就降级（prompt 里说"识别中"）。
+export AGENT_MEDIA_WAIT_SEC="${AGENT_MEDIA_WAIT_SEC:-20}"
+# 跨进程单飞的锁参数：in-flight 表是进程内的，而 bin/custom/convq.py 是独立进程 ——
+# daemon 正在识别时 agent 查一次就是第二次下载 + 第二次视觉调用。锁 TTL 必须大于
+# 「下载 30s + 视觉 90s」，否则正常的慢识别会被别人抢走。
+export AGENT_MEDIA_LOCK_TTL="${AGENT_MEDIA_LOCK_TTL:-180}"
+export AGENT_MEDIA_PEER_WAIT="${AGENT_MEDIA_PEER_WAIT:-150}"
+
+# 追问时回看最近的图（src/custom/context.py，#112）：群里先发图（不 @）、紧接着 @ 提问，
+# 那张图会被 group_gate 吞掉，大脑什么也看不到。回看一眼同会话最近的图补进 prompt。
+# 窗口刻意短：越长越容易把无关的旧图挂到新问题上。措辞是推测语气 + 明确授权模型忽略。
+export AGENT_MEDIA_LOOKBACK_SEC="${AGENT_MEDIA_LOOKBACK_SEC:-120}"
+# 拼上下文时等识别多久（秒）。**默认 0 = 不等**：识别照常发起，但这一轮不为它堵住
+# reply 池；没赶上就在 prompt 里给出 convq 命令，让大脑自己去取（它有 300s 预算，
+# 比这里宽裕得多）。设成 20 就回到 2026-08-18 之前"堵着等"的行为 —— 回滚闸门。
+export AGENT_CONTEXT_WAIT_SEC="${AGENT_CONTEXT_WAIT_SEC:-0}"
+export AGENT_MEDIA_LOOKBACK_MAX="${AGENT_MEDIA_LOOKBACK_MAX:-3}"
+
+# 群图预识别（src/custom/capabilities/premedia.py，#112）：图一发出来就先识别好放着，
+# 追问到达时直接命中缓存、零等待。**默认关** —— 这是全仓唯一"为没人跟它说话的消息
+# 花钱"的能力，与 group_gate「没 @ 我就不动」的哲学相反：活跃群一天几百张截图全识别
+# 一遍是真金白银的视觉调用，而绝大多数永远不会有人追问。想开在 local 里显式设 1。
+export CAP_PREMEDIA_ENABLED="${CAP_PREMEDIA_ENABLED:-0}"
+# 每会话每 5 分钟最多预识别几张（有人一口气贴 20 张截图不该打爆视觉模型）
+export PREMEDIA_RATE_PER_5MIN="${PREMEDIA_RATE_PER_5MIN:-6}"
+
 # --- 业务特定（用户扩展）---
 # 在这里加自己的业务常量
 
 # --- dws event connect（bin/custom/dws-connect.sh）---
 # 敏感值：真实的群 conversationId / profile 填在 config/constants.local.sh（gitignored），
 # 不要写进本模板文件。群订阅 + 单聊(o2o)订阅 + @我(at)订阅可任意组合，至少开一种。
-export DWS_EVENT_KEY=”${DWS_EVENT_KEY:-user_im_message_receive_group}”
-export DWS_EVENT_GROUP=”${DWS_EVENT_GROUP:-}”   # 群 openConversationId（订阅群消息必填，敏感）
-export DWS_EVENT_GROUP_NAME=”${DWS_EVENT_GROUP_NAME:-}”  # 群聊名称（可选，用于启动报告显示）
+export DWS_EVENT_KEY="${DWS_EVENT_KEY:-user_im_message_receive_group}"
+export DWS_EVENT_GROUP="${DWS_EVENT_GROUP:-}"   # 群 openConversationId（订阅群消息必填，敏感）
+export DWS_EVENT_GROUP_NAME="${DWS_EVENT_GROUP_NAME:-}"  # 群聊名称（可选，用于启动报告显示）
 # 单聊(o2o)订阅：对端 userId 列表（逗号分隔）。钉钉 o2o 事件只能按”对端 userId”订阅，
 # 每个对端起一个 consumer。留空=不订阅单聊。例：给数字员工发单聊的真人 userId。
-export DWS_EVENT_O2O_USERS=”${DWS_EVENT_O2O_USERS:-}”  # 敏感，勿提交
+export DWS_EVENT_O2O_USERS="${DWS_EVENT_O2O_USERS:-}"  # 敏感，勿提交
 # @我订阅：数字员工账号在**任意群**被 @ 时收到消息（事件 user_im_message_receive_at，
 # rule_type=at 个人级订阅，无需 group/user 参数）。1/true/yes/on=开，留空/0=不订阅。
-# 适合“只在被 @ 时才响应、又不想逐个配置群 conversationId”的场景。与群/单聊订阅可并存，
-# 同一条消息即便被多个订阅命中，能力层按 msgId 去重不会重复处理。
+# 适合“只在被 @ 时才响应、又不想逐个配置群 conversationId”的场景。与群/单聊订阅可并存 ——
+# 但群里被 @ 的消息会被**投递两次**（群流一份、@ 流一份，且只有 @ 流那份带 atMention 标记），
+# 由 capabilities/group_gate 合并成一份（core 的“按能力”dedup 挡不住，见该模块头注释）。
 export DWS_EVENT_AT="${DWS_EVENT_AT:-}"
+# 群消息闸门（capabilities/group_gate，默认开）：订阅整群时，群里**没 @ 数字员工**的消息
+# 只记账/标已读，不进大脑、不回复（真人同事也不会插嘴每条群聊）；同时合并上面说的双流
+# 重复投递。设 0 = 群里每条都回，且失去双流去重（订阅整群 + DWS_EVENT_AT 时会重复回复）。
+export CAP_GROUP_GATE_ENABLED="${CAP_GROUP_GATE_ENABLED:-1}"
 export DWS_PROFILE="${DWS_PROFILE:-}"           # 组织 profile（敏感，勿提交）
 
 # --- 数字员工大脑 / 回复（src/custom/brain.py + replier.py）---
@@ -140,6 +189,79 @@ export AGENT_FALLBACK_REPLY="${AGENT_FALLBACK_REPLY:-⚠️ 暂时无法处理�
 # 启动报告：服务启动后向订阅单聊用户的主管发送详细服务状态报告（默认开）。
 # 报告包含数字员工身份、订阅配置、组件状态、健康检查、配置概要等。设 0 关闭。
 export CAP_STARTUP_REPORT_ENABLED="${CAP_STARTUP_REPORT_ENABLED:-1}"
+# 主管兜底：报告收件人优先取通讯录 orgMasterUserId/orgMasterDisplayName；数字员工账号
+# 常常没挂组织汇报线（两个字段都是 null），此时报告会整份发不出去。配上这两项即可兜底，
+# 通讯录查得到时以通讯录为准。留空 = 保持原行为（查不到就不发）。
+export AGENT_SUPERVISOR_USER_ID="${AGENT_SUPERVISOR_USER_ID:-}"
+export AGENT_SUPERVISOR_NAME="${AGENT_SUPERVISOR_NAME:-}"
+
+# 主管审核回路（capabilities/supervisor_review）：数字员工不直接回复提问者，改为
+# AI 先出草稿 → 转交主管审核 → 主管回「#N 同意」放行 / 「#N <答案>」改写 / 「#N 忽略」
+# 不回。主管改写过的答案存入知识库并注入后续 system prompt（AI 下次能自己答对）。
+# 单聊和群聊都审（群里是公开发言，更该先过一遍）；连主管自己在群里的提问也审 —— 闸门管的
+# 是"数字员工说什么"而不是"谁在问"。**裁决只认主管单聊**，群里主管的话一律当新提问。
+# **默认关**：它改变默认回复行为（提问者不再立即拿到答案），必须显式开。
+# 依赖 AGENT_SUPERVISOR_USER_ID（发卡片）+ AGENT_SUPERVISOR_NAME（认主管入站消息）。
+export CAP_SUPERVISOR_REVIEW_ENABLED="${CAP_SUPERVISOR_REVIEW_ENABLED:-0}"
+# 超时未裁决(秒) → **按不回复处理**（不是放行草稿！没人管不等于默认同意，自动放行
+# 等于把一条从没被人看过的草稿发出去，群里还是公开发言）。超时的待审会归档，主管
+# 事后**引用那张卡片**回一句仍能补裁。0=永不超时（待审一直挂着，提问者也一直等）。
+export SUPERVISOR_REVIEW_TIMEOUT="${SUPERVISOR_REVIEW_TIMEOUT:-600}"
+# 1=只审单聊（群聊直接回，不经主管）。默认 0=群聊也审。群里被审的范围与 text_reply 一致：
+# 数字员工本来会回的那些（整群订阅=每条；只订阅 DWS_EVENT_AT=只有被 @ 的）。
+export SUPERVISOR_REVIEW_O2O_ONLY="${SUPERVISOR_REVIEW_O2O_ONLY:-0}"
+# 主管显示名别名（逗号分隔）。bridge 只传显示名不传 userId，同一人可能显示为
+# "hugozhu"/"朱鸿"，都列上避免认不出主管。
+export AGENT_SUPERVISOR_ALIASES="${AGENT_SUPERVISOR_ALIASES:-}"
+
+# --- 裁决交互（#107）：让主管少打字 ---
+# 贴表情裁决：主管给**任意一条**审核相关消息贴个表情就完成裁决（#108）。
+# 走事件订阅 user_im_message_reaction_o2o（只订阅主管一人），不再轮询 —— 于是待审结束
+# 之后、甚至重启之后贴的表情照样有效。订阅由 bin/custom/dws-connect.sh 在"配了
+# AGENT_SUPERVISOR_USER_ID 且开了 CAP_SUPERVISOR_REVIEW_ENABLED"时自动起。
+# 贴错立刻撤的宽限期（秒）：事件驱动后每次贴都是不可撤的即时裁决，而"手滑把没审过的
+# 草稿公开发到群里"不该是一键操作。宽限期内撤掉表情就取消。0=不宽限，立即执行。
+export SUPERVISOR_REACTION_DEBOUNCE="${SUPERVISOR_REACTION_DEBOUNCE:-3}"
+# 表情名 → 裁决。注意钉钉返回的是**表情名**而非 unicode 码点，各客户端叫法可能不同：
+# 认不出的表情不会被当成裁决，数字员工会问一句并把真实名字记进 monitor.log，按需补进这里。
+export SUPERVISOR_APPROVE_EMOJIS="${SUPERVISOR_APPROVE_EMOJIS:-赞,好的,OK,👍,✅}"
+export SUPERVISOR_IGNORE_EMOJIS="${SUPERVISOR_IGNORE_EMOJIS:-不行,取消,❌,🚫}"
+# 草稿超过多少行就在卡片里折叠（全文紧跟着单独发一条）。0=不折叠。
+# 几十行的草稿会把「问题」和操作提示挤出一屏，手机上要滚半天才找得到怎么裁决。
+export SUPERVISOR_CARD_DRAFT_MAX_LINES="${SUPERVISOR_CARD_DRAFT_MAX_LINES:-12}"
+# 短于此长度、又不在裁决关键词里的回复 → **问一句而不是当答案发出去**。
+# 老行为是「不在白名单=改写」，主管随口回「可以发」就会把这三个字发给提问者（群聊里
+# 直接公开）。要写短答案就用无歧义前缀：「#N 改：<答案>」。
+# 注意这个阈值只挡短句：长的随口评论（如「这个回答我觉得不太对，你再想想」）仍会被
+# 当成答案发出去。**要彻底堵死就把它调得很大**（如 9999）—— 那等于「改写一律要带
+# 改：/答： 前缀」，没有任何猜测；代价是每次改写多敲两个字。
+export SUPERVISOR_UNCLEAR_MAX_LEN="${SUPERVISOR_UNCLEAR_MAX_LEN:-8}"
+# 主管**引用**待审卡片回复时，把内容交大模型判"能不能原样发给提问者"：
+#   能   → 直接发（不用敲「改：」前缀，主管想怎么写就怎么写）
+#   不能 → 一个字都不发，回主管一句（比如「这个不太对，你再想想」是说给 AI 听的）
+# 这是上面那个字数阈值的升级版——长度分不开「这个回答我觉得不太对，你再想想」（评语）
+# 和「找财务小王签字」（答案）。判不了（模型不可用/答非所问）自动回落字数阈值。
+# 分工：贴表情 = 采纳/忽略，引用回复 = 正式作答。0=关掉判断，退回纯字数启发式。
+export SUPERVISOR_JUDGE_QUOTED="${SUPERVISOR_JUDGE_QUOTED:-1}"
+# 审核流水（JSONL，相对 PROJECT_DIR）：短号 #N 靠它**跨重启唯一**。
+# 以前 _seq_counter 是纯内存的，重启归零 → 主管会话里同时存在多张「待审 #3」，反查卡片
+# 时会匹配到上一轮那张同号的，贴表情从此静默失效。放 knowledge/ 下而不是根目录点文件——
+# 后者会被 stop/reboot 的 clean_runtime_state() 删掉。删了这个文件 = 短号重新从 1 开始。
+export SUPERVISOR_REVIEW_JOURNAL="${SUPERVISOR_REVIEW_JOURNAL:-knowledge/supervisor_reviews.jsonl}"
+# 启动时只回放流水末尾这么多字节（跑久了文件会很大，全量解析拖慢每次重启）
+export SUPERVISOR_REVIEW_JOURNAL_TAIL="${SUPERVISOR_REVIEW_JOURNAL_TAIL:-262144}"
+# 消息落盘存储（capabilities/msgstore_cap + custom/msgstore，#111）：任何会话进出的每条
+# 消息收到即落盘，事后按 msgId 查回是一次本地查表。在此之前数字员工其实是"把钉钉当存储"
+# ——引用旧消息裁决要靠正文里的「待审 #N」标记 + list-by-ids 回读，没标记的消息完全定位
+# 不了。目录结构：<DIR>/<会话id 百分号编码>/<YYYY-MM-DD>.jsonl，按天分片便于整文件清理。
+# 关掉只影响"事后查回"，不影响消息收发。
+export CAP_MSGSTORE_ENABLED="${CAP_MSGSTORE_ENABLED:-1}"
+export AGENT_MSGSTORE_DIR="${AGENT_MSGSTORE_DIR:-knowledge/messages}"
+export AGENT_MSGSTORE_KEEP_DAYS="${AGENT_MSGSTORE_KEEP_DAYS:-30}"   # 超期整分片删掉
+export AGENT_MSGSTORE_TEXT_MAX="${AGENT_MSGSTORE_TEXT_MAX:-4000}"   # 单条正文上限（截断标记 trunc）
+# 知识库（JSONL，相对 PROJECT_DIR）。AGENT_KNOWLEDGE_MAX=0 可关闭知识注入。
+export AGENT_KNOWLEDGE_FILE="${AGENT_KNOWLEDGE_FILE:-knowledge/supervisor_qa.jsonl}"
+export AGENT_KNOWLEDGE_MAX="${AGENT_KNOWLEDGE_MAX:-20}"
 # opencode serve 端口（start_serve 用；密码自动生成写 .serve.pwd）。brain(opencode) 走
 # 此 serve 的 HTTP 接口生成回复。
 export OPENCODE_SERVE_PORT="${OPENCODE_SERVE_PORT:-4096}"
@@ -208,6 +330,14 @@ export ACK_AT_MENTION="${ACK_AT_MENTION:-1}"
 # 群被@ / 群普通消息）都会 mark-read；只有单聊和群被@ 才额外贴状态表情（群普通消息只已读、
 # 不贴表情，避免逐条噪音）。设 0 则完全不标已读。
 export ACK_MARK_READ="${ACK_MARK_READ:-1}"
+# 只对**主管**的消息贴状态表情（#106，拟人化）。真人同事不会在每条收到的消息上贴一个
+# 状态标签；且主管审核回路（CAP_SUPERVISOR_REVIEW_ENABLED）开启后，非主管的消息实际是
+# 转交主管处理的，给提问者贴「正在处理中」与事实不符。
+# 主管身份按显示名判定（AGENT_SUPERVISOR_NAME + AGENT_SUPERVISOR_ALIASES）。
+# **已读不受本项影响**：所有人的消息照常 mark-read（真人也会已读）。
+# **未配主管时自动退化为原行为（都贴）**，故默认 1 对未配主管的部署零影响。
+# 设 0 = 回到「所有人都贴」。
+export ACK_SUPERVISOR_ONLY="${ACK_SUPERVISOR_ONLY:-1}"
 # 文字表情时间线：`delay秒:表情名:文字`，多阶段用 `|` 分隔，按 delay 升序。delay=消息到达后
 # 多少秒切到该状态（首个应为 0=收到即贴；文字里可含 : 和 ,，只按前两个 : 切分）。任一时刻
 # 只显示一个文字表情（升级=移除旧+贴新）。表情名为 DingTalk **具名表情**（实测 收到/稍等/

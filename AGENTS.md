@@ -110,6 +110,10 @@ bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路�
 | `src/core/event_watcher.py` | @core | `connect_sse` / `log_tail_thread` / `format_and_forward` | 事件流主进程（调用 custom.routes 的 hook） |
 | `src/custom/handler.py` | @custom | `fetch_attachments` / `render_prompt` / `_lookup_senders_batch` / `match_business_line` | 业务 handler（FDE 改这里） |
 | `src/custom/routes.py` | @custom | `route_reply` / `route_business_line` / `route_sse_event` | 业务路由注册（FDE 改这里，不改 core） |
+| `src/custom/msgstore.py` | @custom | `record` / `transcript` / `search` / `message` / `recent_media` | 消息落盘存储 + 查询时 join desc/fb |
+| `src/custom/mediadesc.py` | @custom | `describe` / `describe_sync` / `_acquire` | 图片识别单飞（进程内 Future + 跨进程文件锁） |
+| `src/custom/convq.py` | @custom | `main` / `cmd_hint` / `CLI_PATH` | 给大脑查本会话记录的 CLI（入口 `bin/custom/convq.py`） |
+| `src/custom/context.py` | @custom | `build` | 拼这一轮的上下文（引用优先、时间窗其次，不阻塞） |
 | `src/templates/handler_template.py` | @template | (同 custom/handler.py 的纯净版) | diff 基线，不要改 |
 | `tests/core/test_agent_common.py` | @core | `TestCleanSessionTitle` / `TestHandlerPools` | Python 单测 |
 | `tests/core/unit_test.sh` | @core | (脚本本身，含 dws-connect 订阅选择) | shell 单测 |
@@ -192,6 +196,11 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 - shell 单测：`bash -n` 语法检查 + 函数级断言，不依赖网络/钉钉/serve
 - Python 单测：`unittest` + `patch.object(<module>, "<func>", return_value=...)`
+- **测试必须把存储指到 tmpdir**（`AGENT_MSGSTORE_DIR` / `AGENT_KNOWLEDGE_FILE` /
+  `SUPERVISOR_REVIEW_JOURNAL` / `AGENT_OPENCODE_LOG`）。忘了就会把夹具写进生产
+  `knowledge/` —— 已经发生过**五次**，其中一次 31 条夹具把 system prompt 实际注入的
+  20 条挤掉了大半。改完跑一遍 `bash tests/custom/leak_check.sh`：它把 `PROJECT_DIR`
+  指到临时目录跑全套，谁漏了一目了然，且这一趟本身不会污染生产
 - 业务 handler 测试：mock `core.brain.generate_reply` 验证 prompt 拼装 + **ctx 带 conv_id**，不测大脑内部
 - e2e 通用范式：**实际触发 + 监控日志 + DWS 独立拉群消息**（两侧对照的双校验）
   - **基础文本 e2e（最底层冒烟）**：以真人身份发一条纯文本、断言数字员工回复。这条不碰合并转发/serve，只验"收→大脑→发"闭环——最快定位链路断在哪。**已脚本化：`bash tests/custom/e2e_text_reply_test.sh`**（opencode / Claude Code / Codex 通用；参数化身份不写死，SKIP 友好）。
@@ -209,9 +218,11 @@ systemctl --user start dingtalk-agent.service     # 启动
   - **业务 e2e（合并转发路径）**：`dws chat message forward` 触发 → 监控日志 → 拉群校验，见 `tests/custom/e2e_test.sh`。
   - **合并转发混合消息 e2e（本地冒烟，无需真发）**：钉钉 `combine-forward` 只能转发已存在 msgId、`send --msg-type image` 又需预置 mediaId，故真造一条 2图+1文件+3文本的转发不可行。改用**合成 fixture 驱动真实代码路径**：真实 `list-by-ids` 结构 + **真实 serve+gemini 视觉识别本地图** + 真实摘要发送人解析 + 真实 brain，只 stub 转发源/媒体下载/发送三处 I/O。断言 6 条全在、类型都解析对、发送人从外层摘要对齐、图片走 serve+gemini（非 `_proxy_vision`）、回复带 `ctx.conv_id` 进主 session。见 `tests/custom/e2e_forward_mixed.py`（serve 在跑即真识别图片）。
   - **文本回复 HTTP e2e（本地冒烟，无需钉钉）**：起临时 serve → 直接调 `brain.generate_reply("u","1+1")` 断言回复 + `opencode.log` 有 `transport=http`，见 `tests/custom/e2e_text_http_test.sh`。
+  - **主管审核裁决 e2e（本地冒烟，无需真发）**：贴表情裁决要真人在钉钉上点表情才能触发，无法自动化，故 stub `list-emotion-replies` 的返回与 `_locate_card_msg_id`，其余（group_gate → ack → supervisor_review → 轮询 → `_execute_verdict` → 发回原会话）全走真实代码路径。断言：草稿只转主管不落群、卡片操作提示压成一行、贴 👍 即放行、主管随口回的短语**不会**被当答案发到群里且待审保留。带 `E2E_SIMULATE_BUG=1` 反证开关（关掉贴表情裁决 + 认不出的短文本当答案，此时必须 FAIL）。见 `tests/custom/e2e_supervisor_reaction_test.py`。
+  - **ack 收尾 e2e（本地冒烟，无需真发）**：把 `ACK_PROGRESS_INTERVAL` 压到 1s，验证主管裁决后两条消息的 ack worker 都收尾、不再周期播「仍在处理中」（#109）。同样带 `E2E_SIMULATE_BUG=1` 反证。见 `tests/custom/e2e_supervisor_ack_test.py`。
   - **@我(AT) 订阅 e2e**：验证 `user_im_message_receive_at` 订阅 → bridge(convType=2) → inbound → 能力分发全链，末段 LIVE 用 `dws event consume ...receive_at --duration` 抓 `[event] ready` 证明真实建联（只读不发消息，无 dws/未登录则 SKIP）。见 `tests/custom/e2e_at_test.sh`。开启订阅：`config/constants.local.sh` 设 `DWS_EVENT_AT=1`。
   - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）；群聊场景可回退 `list-by-sender`（按发送者拉）。**但 o2o 私聊回复实测 `list-by-sender` 索引不到**——私聊校验必须用 `list --group <o2o-convId>`（convId 从 connect log 入站行 `convId=…` 取）。`e2e_text_reply_test.sh` 的 V4 即如此。
-  - **坑#2**：实时订阅（connect 日志）**不回显当前登录用户自己发的消息**——数字员工的回复不会出现在它自己的接收流里，别把"connect 日志没看到回复"误判为没发出去；用校验 B 的 DWS 拉取确认。
+  - **坑#2（2026-08 修正，按订阅类型区分）**：自己发的消息会不会回显进 connect log，**取决于订阅的 rule_type**——群订阅 `user_im_message_receive_group`（rule_type=group，"当前用户所在会话的消息"）**双向**，自己发到群里的会回显；`user_im_message_receive_o2o_all`（rule_type=all，"当前用户**收到**的所有单聊消息"）**只收不发**，自己发出的单聊不回显；`user_im_message_receive_o2o --user X`（rule_type=singleChat，"当前用户**与**指定用户的单聊消息"）**双向**。旧文档笼统说"不回显"，是 `dws dev connect` 时代的结论。实践含义：msgstore 能记下群里的出站消息，但记不下发给主管的单聊卡片（见 src/custom/msgstore.py 的"已知缺口"）。
   - **坑#3**：`dws event` 订阅偶发**投递停滞**——`dws event consume` 子进程还活着（healthcheck 只查进程存活会误判"健康"），但连接静默失活、消息迟迟不进 connect log，只延到下次重启。跑基础文本 e2e 时若 V2 超时未见入站，先 `bash bin/core/reboot.sh` 重建订阅再跑。
   - **所有能力共走同一条后端路**：文本回复、合并转发、图片、文件都调 `core.brain.generate_reply(ctx={"conv_id": ...})` → `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI。因为共享同一个 conv 的 session，**转发完再追问能接上上下文**。都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
   - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**（统一调试总开关，原 `AGENT_SERVE_DEBUG` 已并入）：每次 opencode 调用记一条摘要（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败），**并把每个 serve 请求/响应的完整 body（含发给模型的 prompt 与模型返回）写到同一文件**，长 body（图片 data_url 等）自动截断头尾。想确认"回复到底走 HTTP 还是 CLI 回退"或"到底发了什么 prompt / serve 返回了什么"都看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
@@ -236,3 +247,5 @@ systemctl --user start dingtalk-agent.service     # 启动
 - **不要**用 `flock`（macOS 不可用）——用 `shlock` 或文件存在性判断
 - **不要**用 `tee -a file >&2`（launchd 已重定向 stderr 到同一文件，会双写）——`log()` 只写 stderr
 - **不要**把真实凭据写入 `config/config.example.json` 或 `config/constants.sh`——只填 `*.local.*`（已 gitignore）
+- **不要**直接 `cat`/`grep` `knowledge/messages/*/*.jsonl`——用 `bin/custom/convq.py`：它按会话限定、把图片识别结果与主管裁决 join 到消息上、时间戳按本地时区渲染、输出有上限。裸读拿到的是 epoch 秒和三种散落的记录类型，容易读错
+- **不要**在 `config/constants.sh` 里加了配置就以为生效了——`constants.local.sh` 是**替代**不是叠加（见 `bin/core/healthcheck.sh` 的 `if/elif`），要真生效必须同时写进 local 那份

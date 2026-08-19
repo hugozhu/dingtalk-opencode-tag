@@ -130,6 +130,21 @@ run_with_timeout() {
     wait "$cmd_pid"
 }
 
+# stat 可移植取值 — stat_field <gnu_fmt> <bsd_fmt> <file>，失败/异常一律回 0。
+#
+# **GNU 必须先试**：GNU stat 的 -f 是「查文件系统信息」而非格式化，`stat -f %i file`
+# 会把 %i 当文件名报错(rc=1)，却仍把 file 的文件系统报告（File:/ID:/Namelen:…）打到
+# stdout。命令替换先收 stdout，`||` 回退救不回来，调用方拿到整段多行文本：
+#   - 进 $(( )) → "File: unbound variable"（set -u 下直接中止脚本）
+#   - 当 inode 存进 offset 文件 → 比对恒不等，窗口计数每次从头算
+# 末尾 tr -dc 是二次兜底，把任何平台泄漏的非数字噪声在返回前剥干净。
+stat_field() {
+    local gnu_fmt="$1" bsd_fmt="$2" file="$3" val=""
+    val=$(stat -c "$gnu_fmt" "$file" 2>/dev/null || stat -f "$bsd_fmt" "$file" 2>/dev/null || echo 0)
+    val=$(printf '%s' "$val" | tr -dc '0-9')
+    printf '%s' "${val:-0}"
+}
+
 # count_new_matches <log_file> <offset_file> <grep_pattern> <consume>
 #
 # 统计 <log_file> 里**距上次调用以来**新增的、匹配 <grep_pattern> 的行数。
@@ -154,8 +169,7 @@ count_new_matches() {
     fi
     size=$(wc -c < "$log_file" 2>/dev/null | tr -d ' ')
     [[ "$size" =~ ^[0-9]+$ ]] || size=0
-    # inode：macOS `stat -f %i`，Linux `stat -c %i`——两个都试（同 healthcheck 的 mtime 写法）
-    cur_ino=$(stat -f %i "$log_file" 2>/dev/null || stat -c %i "$log_file" 2>/dev/null || echo 0)
+    cur_ino=$(stat_field %i %i "$log_file")
 
     if [[ ! -f "$offset_file" ]]; then
         [[ -n "$consume" ]] && echo "$cur_ino $size" > "$offset_file"

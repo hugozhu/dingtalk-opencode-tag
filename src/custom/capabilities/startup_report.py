@@ -10,7 +10,8 @@
 
 设计要点：
 - **启动时触发**：利用 on_startup hook（需在 event_watcher 启动时调用）
-- **获取主管信息**：通过 dws contact user get 查询订阅用户的主管
+- **获取主管信息**：通过 dws contact user get-self 读通讯录汇报线；数字员工账号常常没挂
+  汇报线（orgMasterUserId 为 null），此时回退 AGENT_SUPERVISOR_USER_ID/_NAME 配置兜底
 - **发送详细报告**：使用 dws chat message send 发送到主管的单聊
 
 开关：CAP_STARTUP_REPORT_ENABLED（默认开）。
@@ -145,6 +146,28 @@ def _get_healthcheck_summary():
         return f"❌ 检查失败: {str(e)[:50]}"
 
 
+def _resolve_supervisor(org_model):
+    """解析数字员工的主管：通讯录优先，配置兜底。
+
+    数字员工账号往往没挂组织汇报线（orgMasterUserId/orgMasterDisplayName 都是 null），
+    此时回退到 AGENT_SUPERVISOR_USER_ID/AGENT_SUPERVISOR_NAME。名字缺省用 userId 顶上，
+    避免"有 id 没名字"被当成没主管而整份报告不发。
+
+    返回 (user_id, name, source)，没有主管则 (None, None, None)。
+    """
+    supervisor_id = (org_model.get("orgMasterUserId") or "").strip()
+    supervisor_name = (org_model.get("orgMasterDisplayName") or "").strip()
+    if supervisor_id:
+        return supervisor_id, supervisor_name or supervisor_id, "通讯录"
+
+    supervisor_id = os.environ.get("AGENT_SUPERVISOR_USER_ID", "").strip()
+    supervisor_name = os.environ.get("AGENT_SUPERVISOR_NAME", "").strip()
+    if supervisor_id:
+        return supervisor_id, supervisor_name or supervisor_id, "配置兜底"
+
+    return None, None, None
+
+
 def _build_report():
     """构建详细的服务状态报告"""
     startup_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -160,9 +183,8 @@ def _build_report():
     org_name = org_model.get("orgName", "未知")
     corp_id = org_model.get("corpId", "未知")
 
-    # 获取数字员工的主管信息
-    supervisor_name = org_model.get("orgMasterDisplayName", "")
-    supervisor_id = org_model.get("orgMasterUserId", "")
+    # 获取数字员工的主管信息（通讯录优先，配置兜底）
+    supervisor_id, supervisor_name, supervisor_source = _resolve_supervisor(org_model)
 
     depts = org_model.get("depts", [])
     dept_info = depts[0] if depts else {}
@@ -191,7 +213,8 @@ def _build_report():
 
     # 显示数字员工的主管信息
     if supervisor_id:
-        report_lines.append(f"- **汇报主管**：{supervisor_name} (`{supervisor_id}`)")
+        suffix = "（配置兜底）" if supervisor_source == "配置兜底" else ""
+        report_lines.append(f"- **汇报主管**：{supervisor_name} (`{supervisor_id}`){suffix}")
     else:
         report_lines.append(f"- **汇报主管**：无")
 
@@ -288,11 +311,11 @@ def _build_report():
 
     # 报告接收者：数字员工自己的主管
     supervisor_recipient = None
-    if supervisor_id and supervisor_name:
+    if supervisor_id:
         supervisor_recipient = {
             "user_id": supervisor_id,
             "name": supervisor_name,
-            "role": f"{user_name} 的主管"
+            "role": f"{user_name} 的主管（{supervisor_source}）",
         }
 
     return "\n".join(report_lines), supervisor_recipient
@@ -302,10 +325,12 @@ def _send_to_user(user_id, report_text):
     """向指定用户发送报告（单聊）"""
     try:
         # 使用 dws chat message send --user 直接发送单聊消息（Markdown 自动渲染）
+        # --ai-tag=false：去掉「AI」角标（dws 默认 true），与 replier 保持一致
         cmd = [
             "dws", "chat", "message", "send",
             "--user", user_id,
             "--text", report_text,
+            "--ai-tag=false",
             "--profile", PROFILE,
             "-y"
         ]
@@ -335,6 +360,7 @@ def _send_to_group_with_at(user_id, report_text):
             "dws", "chat", "message", "send",
             "--group", group_id,
             "--text", f"@{user_id} \n\n{report_text}",
+            "--ai-tag=false",
             "--profile", PROFILE,
             "-y"
         ]
@@ -368,7 +394,8 @@ def send_startup_report():
     report_text, supervisor = result
 
     if not supervisor:
-        log("[startup_report] 当前数字员工没有主管，跳过发送")
+        log("[startup_report] 当前数字员工没有主管（通讯录无汇报线，也未配置 "
+            "AGENT_SUPERVISOR_USER_ID），跳过发送")
         return
 
     log(f"[startup_report] 报告已生成，将发送给主管: {supervisor['name']} ({supervisor['role']}, ID: {supervisor['user_id']})")
