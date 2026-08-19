@@ -10,6 +10,13 @@ from unittest.mock import MagicMock, patch
 # 添加 src 到模块搜索路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
+# 转写结果现在会落进 msgstore（#113）—— 指到 tmpdir，否则夹具会写进真实的
+# knowledge/messages（这个仓库已经漏过四次了）
+import atexit as _atexit, shutil as _shutil, tempfile as _tempfile
+_MS_TMP = _tempfile.mkdtemp(prefix="test-ms-")
+_atexit.register(_shutil.rmtree, _MS_TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = _MS_TMP
+
 from core.inbound import KIND_AUDIO, InboundMessage, classify
 from custom.capabilities import audio
 

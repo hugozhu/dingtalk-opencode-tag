@@ -499,6 +499,14 @@ def handle_file(user, text, msg_id, conv_id, conv_type):
         return
 
     log(f"file: msgId={msg_id[:24]} 解析成功 type={file_type} content_len={len(content)}")
+    # 解析出的正文落盘（#113）：以前只进 prompt、回完就丢，而文档是事实密度最高的
+    # 地方（OKR、名单、流程）。best-effort，写失败不影响回复。
+    try:
+        from custom import msgstore
+        msgstore.record_description(conv_id, msg_id, content, by="file", ok=True,
+                                    kind="file")
+    except Exception as e:      # noqa: BLE001
+        log(f"file: 解析结果落盘失败 {e}")
 
     # 参考 image 能力：结构化呈现文件信息（用户+文件名+内容+任务指令）
     parts = [

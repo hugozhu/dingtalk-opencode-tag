@@ -21,9 +21,14 @@ bridge 从被引用正文里抽「待审 #N」、靠 `list-by-ids` 回读正文�
 conv_id（被引用的那条必在同一会话里），reaction 事件带 conversation_id。所以查一条
 消息 = 在它所属会话的分片里从最新一天往回扫，扫描范围由保留天数封顶。
 
-记录两类：
-    {"t":"msg","dir":"in|out","id":..,"conv":..,"ct":..,"from":..,"kind":..,"text":..,"ts":..}
+记录三类：
+    {"t":"msg","dir":"in|out","id":..,"conv":..,"ct":..,"from":..,"kind":..,"text":..,"ts":..,
+     "from_id":..,"quoted":..,"quoted_from_id":..}   ← 后三个可选，见 record()
     {"t":"fb","id":<提问者原始消息 id>,"seq":N,"action":..,"answer":..,"by":..,"ts":..}
+    {"t":"desc","id":..,"conv":..,"text":..,"by":..,"kind":"image|audio|file",..}
+
+**新增字段一律可选、读侧一律 `.get()`**：库里已经有的记录没有它们，任何查询链路都不能
+因为缺字段而报错（#113）。
 
 `ts` 存 **epoch 秒**而不是格式化字符串：守护进程由 reboot.sh 以 `env -i` 拉起、不继承
 TZ，跑在 UTC，而钉钉给的时间戳是本地时区——存字符串必然埋雷（已经因此静默失效过一次，
@@ -240,14 +245,19 @@ def feedback_of(conv_id, msg_id, path=None):
     return hits[0] if hits else None
 
 
-def record_description(conv_id, msg_id, text, by="", ok=True, err="", path=None):
-    """记一条"这张图识别出来是什么"。失败也要记（ok=False）—— 否则坏 mediaId 会被
-    反复重试，每次都是一轮下载 + 视觉超时。"""
+def record_description(conv_id, msg_id, text, by="", ok=True, err="", path=None,
+                       kind="image"):
+    """记一条"这条媒体消息的内容是什么"。失败也要记（ok=False）—— 否则坏 mediaId 会被
+    反复重试，每次都是一轮下载 + 视觉超时。
+
+    `kind` 区分来源（image / audio / file / forward，#113）：图片是 OCR，语音是转写，
+    文件是解析出的正文 —— 做知识抽取时要分得开，事实密度和可信度都不一样。
+    """
     if not msg_id:
         return False
     desc, trunc = _clip(text)       # 密集文字截图的 OCR 轻松超上限，不截会撑爆分片
     rec = {"t": "desc", "id": msg_id, "conv": conv_id, "text": desc,
-           "by": by, "ok": bool(ok), "err": err, "ts": int(time.time())}
+           "by": by, "kind": kind, "ok": bool(ok), "err": err, "ts": int(time.time())}
     if trunc:
         rec["trunc"] = True
     return _append(conv_id, rec, path=path)

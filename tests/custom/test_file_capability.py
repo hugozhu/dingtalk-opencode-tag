@@ -19,6 +19,13 @@ SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
+# 解析出的文件正文现在会落进 msgstore（#113）—— 指到 tmpdir，否则夹具会写进真实的
+# knowledge/messages（这个仓库已经漏进去过四次）
+import atexit as _atexit
+_MS_TMP = tempfile.mkdtemp(prefix="test-file-ms-")
+_atexit.register(shutil.rmtree, _MS_TMP, True)
+os.environ["AGENT_MSGSTORE_DIR"] = _MS_TMP
+
 from custom.capabilities import file as F
 from core.inbound import InboundMessage, KIND_FILE, parse_line
 

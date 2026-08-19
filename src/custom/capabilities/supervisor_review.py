@@ -484,6 +484,7 @@ def _replay(path=None):
         t = r.get("t")
         if t == "open":
             _remember_history(n, state="open", asker=r.get("asker"),
+                              asker_id=r.get("asker_id"),
                               asker_conv_id=r.get("conv_id"),
                               asker_conv_type=r.get("conv_type"),
                               asker_msg_id=r.get("msg_id"),
@@ -570,24 +571,41 @@ def _knowledge_path():
     return p if os.path.isabs(p) else os.path.join(base, p)
 
 
-def _record_knowledge(question, answer, asker=""):
+def _record_knowledge(question, answer, asker="", p=None, seq=None):
     """把主管改写过的 Q→A 追加进知识库（JSONL 一行一条）。best-effort。
 
     只在**改写**时记录：主管点「同意」说明 AI 本来就答对了，没有新知识。
+
+    **带上溯源 id（#113）**：这是全仓信噪比最高的数据 —— 主管逐条确认过的口径，天然
+    是标注集。但光有问答文本，就没法回到它发生的上下文（涉及谁、什么场景），做知识
+    图谱时这批最该用的数据反而是孤岛。存了 conv/msg_id 之后，任取一条都能
+    `convq msg` 取回原文。
+
+    `ts` 存 **epoch 秒**，与 msgstore 对齐：以前存的是格式化字符串，而守护进程曾跑在
+    UTC —— 这个仓库已经因为时区不一致静默失效过一次（531d039）。读侧不看 ts，改格式
+    对老记录无影响。
     """
     q = (question or "").strip()
     a = (answer or "").strip()
     if not q or not a:
         return False
     path = _knowledge_path()
+    src = p or {}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         rec = {
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": int(time.time()),
             "asker": asker,
             "question": q,
             "answer": a,
         }
+        # 溯源字段：缺就不写（老记录本来就没有，读侧一律 .get()）
+        for key, val in (("seq", seq),
+                         ("conv", src.get("asker_conv_id")),
+                         ("msg_id", src.get("asker_msg_id")),
+                         ("asker_id", src.get("asker_id"))):
+            if val:
+                rec[key] = val
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         log(f"supervisor_review: 已学习 Q={q[:40]!r} → A={a[:40]!r}")
@@ -777,6 +795,7 @@ def _revive_seq(seq):
         "question": rec.get("question") or "",
         "draft": rec.get("draft") or "",
         "asker_msg_id": rec.get("asker_msg_id") or "",
+        "asker_id": rec.get("asker_id") or "",      # 事后补裁沉淀的知识同样要能溯源
         "ts": time.time(),
         "timer": None,
     })
@@ -785,7 +804,8 @@ def _revive_seq(seq):
     return True
 
 
-def _draft_and_forward(user, text, conv_type, conv_id, msg_id, quoted_msg_id=None):
+def _draft_and_forward(user, text, conv_type, conv_id, msg_id, quoted_msg_id=None,
+                       asker_id=""):
     """后台线程：生成草稿 → 转交主管 → 登记待审。"""
     global _seq_counter
     # 上下文补全（#112）：被引用的那条消息、以及"刚才发的图 + 现在的追问"这种跨消息
@@ -829,17 +849,19 @@ def _draft_and_forward(user, text, conv_type, conv_id, msg_id, quoted_msg_id=Non
             "asker_msg_id": msg_id,
             "question": text,
             "draft": draft or "",
+            "asker_id": asker_id,      # 提问者的稳定 id（#113），沉淀知识时溯源用
             "ts": time.time(),
             "timer": timer,
         }
     if timer:
         timer.start()
-    _journal_append({"t": "open", "n": seq, "asker": user, "conv_id": conv_id,
-                     "conv_type": conv_type, "msg_id": msg_id, "q": text, "draft": draft or "",
+    _journal_append({"t": "open", "n": seq, "asker": user, "asker_id": asker_id,
+                     "conv_id": conv_id, "conv_type": conv_type, "msg_id": msg_id,
+                     "q": text, "draft": draft or "",
                      "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
-    _remember_history(seq, state="open", asker=user, asker_conv_id=conv_id,
-                      asker_conv_type=conv_type, asker_msg_id=msg_id,
-                      question=text, draft=draft or "")
+    _remember_history(seq, state="open", asker=user, asker_id=asker_id,
+                      asker_conv_id=conv_id, asker_conv_type=conv_type,
+                      asker_msg_id=msg_id, question=text, draft=draft or "")
     log(f"supervisor_review: #{seq} 已转交主管审核 asker={user} q={text[:40]!r}")
 
     # 草稿被折叠了就把全文补一条（卡片只留前几行，见 _fold_draft）
@@ -897,7 +919,7 @@ def _execute_verdict(seq, action, payload="", source=""):
         _send_to_supervisor(f"⚠️ 待审 #{seq} 未识别到答案内容，请重发。")
         return True
     send_reply(asker_conv_id, asker_conv_type, answer)
-    _record_knowledge(p["question"], answer, asker=p["asker"])
+    _record_knowledge(p["question"], answer, asker=p["asker"], p=p, seq=seq)
     log(f"supervisor_review: #{seq} 主管改写并已回复 {p['asker']}")
     _record_decision(seq, "answered", answer, p=p)
     _send_to_supervisor(f"📝 待审 #{seq} 已用你的答案回复 {_asker_label(p)}，并已存入知识库。")
@@ -1133,7 +1155,8 @@ def on_inbound(msg):
     # 引用的内容就没有意义（#112）。**裁决路径不经这里**，所以主管引用卡片仍按「待审 #N」
     # 走裁决，不会被当成"提问的上下文"。
     submit_reply(_draft_and_forward, msg.user, msg.text, msg.conv_type,
-                 msg.conv_id, msg.msg_id, (msg.extra or {}).get("quoted_msg_id"))
+                 msg.conv_id, msg.msg_id, (msg.extra or {}).get("quoted_msg_id"),
+                 (msg.extra or {}).get("from_id", ""))
     return True
 
 

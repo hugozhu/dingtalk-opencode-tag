@@ -27,6 +27,10 @@ sys.path.insert(0, os.path.join(
 _TMP = tempfile.mkdtemp(prefix="e2e-ms-")
 atexit.register(shutil.rmtree, _TMP, True)
 os.environ["AGENT_MSGSTORE_DIR"] = os.path.join(_TMP, "messages")
+# 本用例故意制造大脑失败，会往 opencode.log 记 ok=False —— **必须指到 tmpdir**：
+# healthcheck 的 check_brain 靠统计该文件里「距上次检查以来」新增的 ok=False 条数
+# 决定要不要真发一次模型探测（阈值 3），写进生产日志会触发误探测、抬高熔断计数。
+os.environ["AGENT_OPENCODE_LOG"] = os.path.join(_TMP, "opencode.log")
 os.environ["AGENT_BRAIN"] = "opencode"
 os.environ["AGENT_FALLBACK_REPLY"] = "⚠️ 暂时无法处理你的消息，请稍后再试。"
 os.environ["ACK_STAGES"] = "0:稍等:已收到，正在处理…"   # 立即贴处理中

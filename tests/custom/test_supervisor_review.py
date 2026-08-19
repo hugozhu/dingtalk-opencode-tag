@@ -1009,6 +1009,67 @@ class TestPendingNotLost(_Base):
         self.assertEqual(len(sr._pending), 1)
 
 
+class TestKnowledgeProvenance(_Base):
+    """沉淀的知识要能回到原文（#113）—— 这是全仓信噪比最高的数据，不该是孤岛。"""
+
+    def _learned(self):
+        import json as _json
+        with open(self.kf, encoding="utf-8") as f:
+            return [_json.loads(ln) for ln in f if ln.strip()]
+
+    def _rewrite_with_ids(self):
+        """提问者带稳定 id 走一遍：转交 → 主管改写 → 学习。"""
+        with patch.object(sr, "generate_reply_ex", return_value=("AI草稿", "ok")), \
+             patch.object(sr, "_send_to_supervisor", return_value=True), \
+             patch.object(sr, "send_reply"):
+            sr._draft_and_forward("张三", "报销怎么走", "1", "cidZhang", "mAsk",
+                                  None, "idZhangsan")
+        with patch.object(sr, "_send_to_supervisor", return_value=True), \
+             patch.object(sr, "send_reply"):
+            sr._execute_verdict(1, "rewrite", "找财务小王签字")
+
+    def test_record_carries_source_ids(self):
+        self._rewrite_with_ids()
+        rec = self._learned()[-1]
+        self.assertEqual(rec["question"], "报销怎么走")
+        self.assertEqual(rec["answer"], "找财务小王签字")
+        self.assertEqual(rec["conv"], "cidZhang")       # 能 convq msg 取回原文
+        self.assertEqual(rec["msg_id"], "mAsk")
+        self.assertEqual(rec["asker_id"], "idZhangsan")  # 展示名之外的稳定标识
+        self.assertEqual(rec["seq"], 1)
+
+    def test_ts_is_epoch_like_msgstore(self):
+        """以前存格式化字符串，而守护进程曾跑在 UTC —— 本仓库为此静默失效过一次。"""
+        self._rewrite_with_ids()
+        ts = self._learned()[-1]["ts"]
+        self.assertIsInstance(ts, int)
+        self.assertGreater(ts, 1_700_000_000)
+
+    def test_missing_ids_are_omitted_not_blanked(self):
+        """老链路（没有 from_id）照样能学，只是少几个字段，不写空串。"""
+        self._escalate(user="李四", text="问题", conv_id="cidLi", msg_id="mL")
+        with patch.object(sr, "_send_to_supervisor", return_value=True), \
+             patch.object(sr, "send_reply"):
+            sr._execute_verdict(1, "rewrite", "答案")
+        rec = self._learned()[-1]
+        self.assertNotIn("asker_id", rec)
+        self.assertEqual(rec["conv"], "cidLi")
+
+    def test_reader_tolerates_old_records(self):
+        """**向后兼容**：库里已有的记录是字符串 ts、无 id，注入链路不能炸。"""
+        import json as _json
+        from custom import brain
+        with open(self.kf, "w", encoding="utf-8") as f:
+            f.write(_json.dumps({"ts": "2026-08-17 10:35:23", "asker": "张三",
+                                 "question": "老问题", "answer": "老答案"},
+                                ensure_ascii=False) + "\n")
+        with patch.object(brain, "_KNOWLEDGE_FILE", self.kf):
+            brain._knowledge_cache = {"mtime": None, "text": ""}
+            out = brain._load_knowledge()
+        self.assertIn("老问题", out)
+        self.assertIn("老答案", out)
+
+
 class TestCapabilityWiring(_Base):
     def test_classify_line_registered(self):
         """没挂上 classify_line，引用回复裁决就是死代码。"""
