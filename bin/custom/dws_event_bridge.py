@@ -100,6 +100,33 @@ def _quoted_seq(src):
     return ""
 
 
+def _sender_id(src):
+    """发送人的稳定标识（`sender_open_dingtalk_id`）；取不到返回 ""。
+
+    字段名来自 `dws event schema user_im_message_receive_{group,o2o_all,at} --flatten`
+    —— 三种事件都有它。**这是全链路唯一稳定的人标识**：`sender` 只是展示名，同一个人
+    在不同地方会是「可菡」/「Cania Chen(可菡)」，主管更是「hugozhu」和「朱鸿」两个名字，
+    靠它建实体必然对不齐（#113）。嵌套格式的字段名未文档化，几种写法都试。
+    """
+    for key in ("sender_open_dingtalk_id", "senderOpenDingTalkId", "senderId"):
+        v = src.get(key)
+        if v:
+            return str(v)
+    return ""
+
+
+def _quoted_sender_id(src):
+    """被引用那条消息的发送人 id；取不到返回 ""。
+
+    有了它，「A 引用 B 的话回复」这条边的两端都是稳定 id，不用回头去查被引用消息。
+    """
+    for key in ("quoted_message", "quotedMessage", "quoteMessage"):
+        q = src.get(key)
+        if isinstance(q, dict):
+            return _sender_id(q)
+    return ""
+
+
 def _quoted_msg_id(src):
     """引用回复所引用的那条原消息 id；不是引用回复返回 ""。
 
@@ -165,6 +192,8 @@ def _to_connect_line(evt):
         msg_id = body.get("openMessageId", "")
         quoted_msg_id = _quoted_msg_id(body)
         quoted_seq = _quoted_seq(body)
+        sender_id = _sender_id(body)
+        quoted_sender_id = _quoted_sender_id(body)
     else:
         # 新版扁平格式：字段直接在事件顶层（dws CLI 升级后的输出）
         etype = etype or evt.get("type") or ""
@@ -174,6 +203,8 @@ def _to_connect_line(evt):
         msg_id = evt.get("message_id", "")
         quoted_msg_id = _quoted_msg_id(evt)
         quoted_seq = _quoted_seq(evt)
+        sender_id = _sender_id(evt)
+        quoted_sender_id = _quoted_sender_id(evt)
     conv_type = _CONV_TYPE_BY_EVENT.get(etype, 2)
     # @我(at) 事件天然是“被 @ 的消息”（payload 无显式 atUsers 字段，唯一可靠信号是事件类型）。
     # 打标 atMention=1 让 core.inbound.parse_line 解析进 extra['at_mention']，供 ack 回执判定
@@ -188,6 +219,11 @@ def _to_connect_line(evt):
         return None
     # 格式对齐 event_watcher.REPLY_RE：'\[connect\] 收到 @(.+?):\s*(.+?)\s+\(convType=(\d+)'
     tail = f"convType={conv_type} convId={conv_id} msgId={msg_id}"
+    if sender_id:
+        # 发送人的稳定 id（#113）。展示名建不了实体，这个才行。同样追加在尾部，由
+        # custom/connline 从**最后一个** `(convType=` 之后解析 —— 正文里出现同名字面量
+        # 伪造不了。
+        tail += f" senderId={sender_id}"
     if at_mention:
         tail += " atMention=1"
     if quoted_msg_id:
@@ -197,6 +233,8 @@ def _to_connect_line(evt):
         # 解析不出编号也要打标（`?`），让能力能区分"引用了审核消息但认不出号"和
         # "引用了完全无关的消息" —— 前者该追问，后者绝不能改判到别的待审上。
         tail += f" quotedSeq={quoted_seq or '?'}"
+        if quoted_sender_id:
+            tail += f" quotedSenderId={quoted_sender_id}"
     return f"[connect] 收到 @{sender}: {content} ({tail})"
 
 

@@ -67,7 +67,7 @@ from core.brain import generate_reply_ex
 from core.capabilities import Capability, dispatch_reply_sent, register
 from core.inbound import InboundMessage, KIND_TEXT, parse_line
 from core.replier import send_reply
-from custom import context, msgstore
+from custom import connline, context, msgstore
 from custom.identity import is_supervisor, supervisor_id, supervisor_names
 
 # 超时未裁决 → 按**不回复**处理并归档（秒），主管事后引用卡片仍可补裁。
@@ -1138,14 +1138,9 @@ def on_inbound(msg):
 
 
 def _line_tail(line):
-    """connect 行的**尾部字段段**（最后一个 `(convType=` 之后的部分）。
-
-    必须切出来再抽字段，不能对整行 search：正文也在同一行里，主管（或提问者，他的正文
-    同样会原样进 connect 行）打一句 `quotedSeq=9` 就能伪造出一个引用标记。
-    取**最后一个** `(convType=` 是因为正文里也可能出现这串字面量。
-    """
-    i = (line or "").rfind("(convType=")
-    return line[i:] if i >= 0 else ""
+    """connect 行的**尾部字段段**。防正文伪造的切法已移到 custom/connline 共享
+    （msgstore 也要解析同一批字段，见 #113）。"""
+    return connline.tail(line)
 
 
 def classify_line(line):

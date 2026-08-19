@@ -216,6 +216,57 @@ class TestFormatHealthCheck(unittest.TestCase):
             bridge._FORMAT_WARN_THRESHOLD, 0, True))
 
 
+class TestSenderId(unittest.TestCase):
+    """透传发送人的稳定标识（#113）—— 展示名建不了知识图谱的实体。"""
+
+    def test_flat_sender_id_appended(self):
+        evt = {
+            "type": "user_im_message_receive_group",
+            "sender": "可菡", "content": "明天请个假",
+            "conversation_id": "cidG==", "message_id": "msgA==",
+            # 字段名来自 dws event schema ... --flatten（三种事件都有它）
+            "sender_open_dingtalk_id": "idKehan",
+        }
+        line = bridge._to_connect_line(evt)
+        self.assertIn("senderId=idKehan", line)
+        self.assertTrue(line.rstrip().endswith(")"))
+
+    def test_nested_sender_id_appended(self):
+        body = {
+            "sender": "可菡", "content": "明天请个假",
+            "openConversationId": "cidG==", "openMessageId": "msgA==",
+            "senderOpenDingTalkId": "idKehan",
+        }
+        line = bridge._to_connect_line({
+            "type": "event", "event_type": "user_im_message_receive_group",
+            "event_id": "ev-s", "data": json.dumps({"payload": {"body": body}}),
+        })
+        self.assertIn("senderId=idKehan", line)
+
+    def test_quoted_sender_id_gives_both_ends_of_the_edge(self):
+        """回复边的两端都要是稳定 id，不用回头再查被引用的那条消息。"""
+        evt = {
+            "type": "user_im_message_receive_o2o",
+            "sender": "hugozhu", "content": "我觉得不错",
+            "conversation_id": "cidQ==", "message_id": "msgQ==",
+            "sender_open_dingtalk_id": "idHugo",
+            "quoted_message": {"message_id": "msgCARD==", "sender": "彭轶",
+                               "sender_open_dingtalk_id": "idPengyi"},
+        }
+        line = bridge._to_connect_line(evt)
+        self.assertIn("senderId=idHugo", line)
+        self.assertIn("quotedSenderId=idPengyi", line)
+
+    def test_absent_sender_id_omits_the_field(self):
+        """服务端没给就不写 —— 别塞个空值让下游以为拿到了 id。"""
+        line = bridge._to_connect_line({
+            "type": "user_im_message_receive_o2o", "sender": "某人",
+            "content": "hi", "conversation_id": "c", "message_id": "m",
+        })
+        self.assertNotIn("senderId=", line)
+        self.assertNotIn("quotedSenderId=", line)
+
+
 class TestQuotedMessage(unittest.TestCase):
     """引用回复：把被引用的原消息 id 透传到行尾，供主管审核按卡片定位（#107 B）。"""
 

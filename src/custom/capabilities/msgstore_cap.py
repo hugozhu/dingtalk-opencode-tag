@@ -27,16 +27,45 @@
 
 from core.agent_common import log
 from core.capabilities import Capability, register
-from custom import msgstore
+from custom import connline, msgstore
 from custom.identity import self_names
+
+# bridge 追加在行尾、core 的 parse_line 不认的字段 → extra 的键名（#113）
+_EXTRA_FIELDS = (("senderId", "from_id"),
+                 ("quotedMsgId", "quoted_msg_id"),
+                 ("quotedSenderId", "quoted_from_id"))
+
+
+def _enrich(msg):
+    """把 connect 行尾部的 id 字段补进 `msg.extra`。
+
+    放这里而不是新加一个 classify_line：`classify_line` 是**首个匹配即胜出**，插一个
+    通吃的 enricher 会把 supervisor_review 的引用解析整个挤掉。而本能力 priority=-10
+    最先跑，在这儿富化，**后面所有能力都能看到**，顺带白送。
+
+    已有的键不覆盖：supervisor_review.classify_line 可能已经解析过 quoted_msg_id。
+    """
+    line = getattr(msg, "raw_line", "") or ""
+    if not line:
+        return
+    for key, name in _EXTRA_FIELDS:
+        if msg.extra.get(name):
+            continue
+        v = connline.field(line, key)
+        if v:
+            msg.extra[name] = v
 
 
 def on_inbound(msg):
-    """把消息落盘后放行（return False，非消费型）。"""
+    """富化 extra + 落盘，然后放行（return False，非消费型）。"""
+    try:
+        _enrich(msg)
+    except Exception as e:      # 富化失败不影响落盘，落盘失败不影响消息处理
+        log(f"msgstore: 解析行尾字段失败 {e}")
     try:
         direction = "out" if msg.user and msg.user in self_names() else "in"
         msgstore.record(msg, direction)
-    except Exception as e:      # 落盘失败绝不能影响消息处理
+    except Exception as e:
         log(f"msgstore: 记录失败 {e}")
     return False
 

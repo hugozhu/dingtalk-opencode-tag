@@ -130,7 +130,19 @@ def _clip(text):
 
 
 def record(msg, direction="in", path=None):
-    """记一条消息。direction: in=别人发的 / out=自己发的（经群订阅回显进来的）。"""
+    """记一条消息。direction: in=别人发的 / out=自己发的（经群订阅回显进来的）。
+
+    除正文外还落两类**否则会永久丢失**的东西（#113，为知识图谱备料）：
+
+    - `from_id`：发送人的稳定标识。`from` 是展示名，同一个人在不同会话是「可菡」/
+      「Cania Chen(可菡)」，主管是「hugozhu」和「朱鸿」两个名字 —— 靠展示名建实体
+      必然对不齐，之后所有边跟着脏。
+    - `quoted` / `quoted_from_id`：回复关系这条边。bridge 早就把它送到了，以前用完就扔。
+
+    **只存"否则会丢的"**：被 @ 的人不落盘 —— dws 的事件 payload 里根本没有 atUsers
+    （实测三种事件的 schema），唯一来源是正文里的 `@张三`，而正文本来就存着，离线抽取
+    时照样解析得到。存一份展示名进来只会多一处要维护的脏数据。
+    """
     if not getattr(msg, "msg_id", ""):
         return False        # 没有 id 就无从查回，存了也没用
     text, trunc = _clip(getattr(msg, "text", ""))
@@ -138,6 +150,11 @@ def record(msg, direction="in", path=None):
            "conv": getattr(msg, "conv_id", ""), "ct": getattr(msg, "conv_type", ""),
            "from": getattr(msg, "user", ""), "kind": getattr(msg, "kind", ""),
            "text": text, "ts": int(time.time())}
+    extra = getattr(msg, "extra", None) or {}
+    for key, field in (("from_id", "from_id"), ("quoted_msg_id", "quoted"),
+                       ("quoted_from_id", "quoted_from_id")):
+        if extra.get(key):
+            rec[field] = extra[key]     # 缺就不写：老记录没有这些键，读侧一律 .get()
     if trunc:
         rec["trunc"] = True
     return _append(rec["conv"], rec, path=path)

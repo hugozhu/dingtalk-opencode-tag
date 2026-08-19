@@ -161,6 +161,61 @@ class TestPrune(_Base):
         self.assertEqual(msgstore.prune(keep_days=1, path=os.path.join(self.root, "无")), 0)
 
 
+class TestIdentityAndEdges(_Base):
+    """为知识图谱备料（#113）：稳定标识 + 现成的关系边。"""
+
+    def _msg_with(self, **extra):
+        m = _msg("mX")
+        m.extra = extra
+        return m
+
+    def test_from_id_persisted(self):
+        """`from` 是展示名，建不了实体；`from_id` 才是能跨会话合并同一人的东西。"""
+        msgstore.record(self._msg_with(from_id="idKehan"), "in", path=self.root)
+        rec = msgstore.find(CONV, "mX", path=self.root)
+        self.assertEqual(rec["from_id"], "idKehan")
+        self.assertEqual(rec["from"], "张三")        # 展示名仍然留着（人看日志要用）
+
+    def test_reply_edge_persisted(self):
+        """回复关系：bridge 早就把它送到了，以前用完就扔。"""
+        msgstore.record(self._msg_with(from_id="idA", quoted_msg_id="mB",
+                                       quoted_from_id="idB"), "in", path=self.root)
+        rec = msgstore.find(CONV, "mX", path=self.root)
+        self.assertEqual((rec["from_id"], rec["quoted"], rec["quoted_from_id"]),
+                         ("idA", "mB", "idB"))
+
+    def test_absent_fields_are_not_written(self):
+        """缺就不写 —— 老记录没有这些键，读侧一律 .get()，别塞一堆空串进去。"""
+        msgstore.record(_msg("mPlain"), "in", path=self.root)
+        rec = msgstore.find(CONV, "mPlain", path=self.root)
+        for k in ("from_id", "quoted", "quoted_from_id"):
+            self.assertNotIn(k, rec)
+
+    def test_old_records_without_ids_still_readable(self):
+        """**向后兼容**：库里已有的记录没有这些字段，查询链路一条都不能炸。"""
+        d = os.path.join(self.root, msgstore.conv_key(CONV))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{time.strftime('%Y-%m-%d')}.jsonl"), "w",
+                  encoding="utf-8") as f:
+            f.write(json.dumps({"t": "msg", "dir": "in", "id": "mOld", "conv": CONV,
+                                "from": "张三", "kind": "text", "text": "老记录",
+                                "ts": int(time.time())}) + "\n")
+        self.assertEqual(msgstore.find(CONV, "mOld", path=self.root)["text"], "老记录")
+        rows = msgstore.transcript(CONV, path=self.root)
+        self.assertEqual(rows[0]["msg"].get("from_id"), None)
+        self.assertEqual(msgstore.message(CONV, "mOld", path=self.root)["msg"]["id"], "mOld")
+
+    def test_at_mentions_are_not_stored(self):
+        """**刻意不存**：事件 payload 里没有 atUsers（三种事件的 schema 都没有），
+        唯一来源是正文里的 @展示名 —— 正文本来就存着，抽取时照样解析得到。
+        存一份展示名进来只会多一处要维护的脏数据。"""
+        m = self._msg_with(at_mention=True, from_id="idA")
+        msgstore.record(m, "in", path=self.root)
+        rec = msgstore.find(CONV, "mX", path=self.root)
+        self.assertNotIn("at", rec)
+        self.assertNotIn("at_mention", rec)
+
+
 class TestQueryJoins(_Base):
     """查询时把 desc/fb join 到消息上 —— 存储保持追加日志，AI Ready 体现在查询侧。"""
 
@@ -320,6 +375,36 @@ class TestCapabilityWiring(unittest.TestCase):
     def test_never_consumes(self):
         with patch.object(msgstore, "record", return_value=True):
             self.assertFalse(self.cap.on_inbound(_msg()))
+
+    def test_enriches_extra_from_raw_line(self):
+        """行尾的 id 字段在这里补进 extra —— 本能力 priority=-10 最先跑，
+        所以**后面所有能力**都能看到，不用各自去解析 raw_line。"""
+        from core.inbound import parse_line
+        m = parse_line("[connect] 收到 @可菡: hi (convType=1 convId=cidK msgId=msgA "
+                       "senderId=idKehan quotedMsgId=msgB quotedSenderId=idHugo)")
+        with patch.object(msgstore, "record", return_value=True):
+            self.cap.on_inbound(m)
+        self.assertEqual(m.extra["from_id"], "idKehan")
+        self.assertEqual(m.extra["quoted_msg_id"], "msgB")
+        self.assertEqual(m.extra["quoted_from_id"], "idHugo")
+
+    def test_enrich_does_not_overwrite_existing(self):
+        """supervisor_review.classify_line 可能已经解析过 quoted_msg_id，别覆盖它。"""
+        from core.inbound import parse_line
+        m = parse_line("[connect] 收到 @a: hi (convType=1 convId=c msgId=m "
+                       "quotedMsgId=msgFromLine)")
+        m.extra["quoted_msg_id"] = "msgAlreadyParsed"
+        with patch.object(msgstore, "record", return_value=True):
+            self.cap.on_inbound(m)
+        self.assertEqual(m.extra["quoted_msg_id"], "msgAlreadyParsed")
+
+    def test_enrich_failure_does_not_block_record(self):
+        """富化炸了也必须照常落盘 —— 落盘是本能力的本职。"""
+        from custom.capabilities import msgstore_cap as mc
+        with patch.object(mc.connline, "field", side_effect=RuntimeError("boom")), \
+             patch.object(msgstore, "record", return_value=True) as rec:
+            self.assertFalse(self.cap.on_inbound(_msg()))
+        rec.assert_called_once()
 
     def test_store_failure_does_not_break_dispatch(self):
         def boom(*a, **k):
