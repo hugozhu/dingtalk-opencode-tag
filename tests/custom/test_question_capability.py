@@ -51,6 +51,14 @@ class TestRenderMatch(unittest.TestCase):
         # 单选第0题已答 → 序号不再命中它
         self.assertIsNone(Q._match_option("1", _SINGLE, {0}))
 
+    def test_rendered_question_text_does_not_self_match(self):
+        # 回归：问题正文含全部 label，包含匹配会命中多个 → 歧义不猜（配合 loop_guard 双保险）
+        self.assertIsNone(Q._match_option(Q._render_question(_SINGLE), _SINGLE, set()))
+
+    def test_ambiguous_contains_returns_none(self):
+        # 文本同时含两个 label → 不猜最长的那个
+        self.assertIsNone(Q._match_option("面和饭都行", _SINGLE, set()))
+
 
 class TestOnSSE(unittest.TestCase):
     def setUp(self):
@@ -142,6 +150,26 @@ class TestOnInbound(unittest.TestCase):
             Q.on_inbound(self._msg("1"))   # 选葱
             Q.on_inbound(self._msg("1"))   # 再选 → 取消葱
         self.assertEqual(Q._pending["que_1"]["answers"][0], [])
+
+    def test_self_message_skipped_by_loop_guard(self):
+        # 回归：数字员工自己发的问题正文被钉钉回投，不能被当成用户的答案
+        from core import capabilities as C
+        C.clear()
+        C.register(Q.CAPABILITY)
+        self._seed()
+        os.environ["AGENT_SELF_NAMES"] = "涌现"
+        try:
+            m = InboundMessage(user="涌现", text=Q._render_question(_SINGLE),
+                               conv_type="2", conv_id="cid==", msg_id="m==", kind=KIND_TEXT)
+            with patch.object(Q, "_post_question", return_value=(True, "ok")) as pq, \
+                 patch.object(Q, "send_reply") as snd:
+                C.dispatch_inbound(m)
+            pq.assert_not_called()
+            snd.assert_not_called()
+        finally:
+            os.environ.pop("AGENT_SELF_NAMES", None)
+            C.clear()
+        self.assertEqual(Q._pending["que_1"]["answers"], {})   # 没记任何答案
 
     def test_timeout_rejects_and_notifies(self):
         self._seed()

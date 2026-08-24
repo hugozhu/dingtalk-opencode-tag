@@ -15,7 +15,8 @@ agent 调 `question` 工具时，opencode serve 发 `question.asked` SSE 事件�
 event-consume 不自动转发答案文本，故**不需要** spurious 轮次 cleanup。
 
 开关：CAP_QUESTION_ENABLED（默认开）。on_inbound 优先级 20（先于 image 40 / forward 50 /
-text_reply 100，必须最先看到用户回复以判断是否在答问题）。
+text_reply 100，必须最先看到用户回复以判断是否在答问题）。loop_guard=True：问题正文里逐条
+列了所有 label，被钉钉回投后会自命中包含匹配，必须先挡掉自己发的消息。
 """
 
 import base64
@@ -133,7 +134,8 @@ def _match_option(text, questions, answered_idxs):
             lbl = o.get("label", "") or ""
             if lbl and lbl == t:
                 return (i, lbl)
-    # 3) 包含关系（最长 label 优先）
+    # 3) 包含关系（最长 label 优先）。命中 ≥2 个不同 label 视为**歧义**，不猜 ——
+    #    典型场景：文本里同时含多个 label（引用/转述了问题正文本身），猜哪个都可能猜错。
     cand = []
     for i, q in enumerate(questions):
         if i in answered_idxs and not q.get("multiple"):
@@ -142,8 +144,9 @@ def _match_option(text, questions, answered_idxs):
             lbl = o.get("label", "") or ""
             if lbl and (lbl in t or t in lbl):
                 cand.append((len(lbl), i, lbl))
+    if len({(i, lbl) for _, i, lbl in cand}) > 1:
+        return None
     if cand:
-        cand.sort(key=lambda x: -x[0])
         return (cand[0][1], cand[0][2])
     return None
 
@@ -339,5 +342,6 @@ CAPABILITY = Capability(
     on_sse_event=on_sse_event,
     priority=20,                 # 最先看到用户回复（先于 image40/forward50/text100）
     default_enabled=True,
+    loop_guard=True,             # 数字员工自己发的问题正文回投时不当成答案（同 permission）
 )
 register(CAPABILITY)
