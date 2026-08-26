@@ -87,6 +87,14 @@ export DWS_PROFILE="${DWS_PROFILE:-}"           # 组织 profile（敏感，勿�
 # 大脑后端: echo(默认,零依赖) | opencode(serve HTTP 优先, 失败回退 opencode run CLI) | proxy(LLM API)
 export AGENT_BRAIN="${AGENT_BRAIN:-echo}"
 export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-free}"
+# 便宜模型（#117）：任务消息带触发词时**本轮**改用它，适合浏览器自动化这类「多轮工具调用、
+# token 量大、但推理深度要求不高」的任务。模型随每条 message POST 传，故同一复用 session
+# 也能逐轮切换，不需要重建会话。留空=关闭本特性（所有消息都走 AGENT_OPENCODE_MODEL）。
+export AGENT_OPENCODE_MODEL_FLASH="${AGENT_OPENCODE_MODEL_FLASH:-}"
+# 触发词，逗号分隔。**子串**匹配且大小写不敏感——触发词是跟在真实任务前的修饰语
+# （「用flash模型 打开浏览器抓一下股价」），不同于 CANCEL/RESET 关键词的整句严格匹配。
+# 命中后触发词会从 prompt 里摘掉，避免模型看到一句它无法执行的指令。
+export AGENT_OPENCODE_FLASH_KEYWORDS="${AGENT_OPENCODE_FLASH_KEYWORDS:-用flash模型,用flash}"
 # 工具授权审批（可选）：brain 临时 session 的 per-session 权限规则（serve v1 格式 JSON 数组）。
 # 配了 ask 规则后命中的工具调用会挂起 → permission 能力发钉钉群审批（回「同意/总是/拒绝」，
 # CAP_PERMISSION_TIMEOUT 默认 60s 未回自动拒绝）。空=不启用（serve 默认全放行）。示例：
