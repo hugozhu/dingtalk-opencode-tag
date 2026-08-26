@@ -88,8 +88,14 @@ export DWS_PROFILE="${DWS_PROFILE:-}"           # 组织 profile（敏感，勿�
 export AGENT_BRAIN="${AGENT_BRAIN:-echo}"
 export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-free}"
 # 便宜模型（#117）：任务消息带触发词时**本轮**改用它，适合浏览器自动化这类「多轮工具调用、
-# token 量大、但推理深度要求不高」的任务。模型随每条 message POST 传，故同一复用 session
-# 也能逐轮切换，不需要重建会话。留空=关闭本特性（所有消息都走 AGENT_OPENCODE_MODEL）。
+# token 量大、但推理深度要求不高」的任务。模型随每条 message POST 传，但**命中的这一轮不
+# 复用主会话**：provider 的 prompt cache 按模型分桶，在攒了长上下文的复用 session 里换模型
+# = 整段历史对新模型全 miss（线上实测同一 session 主模型轮 input=303/cache_read=59392，
+# 紧接的 flash 轮变成 input=57557/cache_read=1024），比省下的还贵；而全新 session 只需重编
+# system+tools 前缀（provider 侧跨 session 命中，约 1~8k）。故命中轮单开一次性 session
+# 跑完即删，代价是**看不到前文**（也顺带避免了 flash 轮照抄主会话上一轮答案）。
+# 判据是「≠ AGENT_OPENCODE_MODEL」：配成和默认同值时并没换缓存桶，不分流。
+# 留空=关闭本特性（所有消息都走 AGENT_OPENCODE_MODEL）。
 export AGENT_OPENCODE_MODEL_FLASH="${AGENT_OPENCODE_MODEL_FLASH:-}"
 # 触发词，逗号分隔。**子串**匹配且大小写不敏感——触发词是跟在真实任务前的修饰语
 # （「/flash 打开浏览器抓一下股价」），不同于 CANCEL/RESET 关键词的整句严格匹配。

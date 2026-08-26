@@ -173,7 +173,7 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 ## 常见坑
 
-1. **会话复用只按 conv_id，不按工作目录**——一个目录下会有上百个 session，「最近活跃的那个」未必属于当前这场对话，按目录复用会串上下文。复用逻辑统一在 `custom/brain.py`（`AGENT_SESSION_REUSE`），能力侧只需在 ctx 里带上 `conv_id`
+1. **会话复用只按 conv_id，不按工作目录**——一个目录下会有上百个 session，「最近活跃的那个」未必属于当前这场对话，按目录复用会串上下文。复用逻辑统一在 `custom/brain.py`（`AGENT_SESSION_REUSE`），能力侧只需在 ctx 里带上 `conv_id`。**例外**：逐轮换模型（`/flash`，#117）的那一轮单开一次性 session，不进主会话——provider 的 prompt cache 按模型分桶，在长上下文的复用 session 里换模型反而更贵，详见 ARCHITECTURE.md 第 8 节
 2. **进程活着 + HTTP 200 ≠ 大脑活着**——`check_serve`/`check_serve_http` 都不碰模型。2026-08-08 大脑与模型网关失联 16 分钟，这两项全程 OK、healthcheck 每 5 分钟报「健康」，任何请求都答不出来，只能靠人在钉钉里发现。故新增检查7 `check_brain`：按 `opencode.log` 里「距上次检查以来」新增的 `ok=False` 条数触发一次**真实模型调用**自检（阈值 `HEALTHCHECK_BRAIN_FAIL_THRESHOLD`，默认 3），健康时零请求零成本
 3. **asked_ts buffer 设 5s**——依赖服务写日志时刻 vs serve POST 时刻有微小偏差
 4. **轮询 do-while 风格**（先调一次再判断）——保证至少调一次，避免常量 patch 为 0 时跳过整个循环

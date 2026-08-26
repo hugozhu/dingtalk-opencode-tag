@@ -11,7 +11,10 @@
   4. 大小写不敏感；「用flash」不会在「用flash模型」上留下孤零零的「模型」。
   5. 整句只有触发词（摘完为空）→ 不切模型，当普通消息处理。
   6. CLI 回退路径 --model 带的也是 flash（否则 serve 挂掉会静默切回贵模型）。
-  7. 会话复用下逐轮切模型，**不会**因换模型而重建 session。
+  7. 会话复用下命中触发词的那一轮**另起独立一次性 session**，不进主会话——provider 的
+     prompt cache 按模型分桶，在长上下文的复用 session 里换模型反而更贵（见
+     TestFlashRunsStandalone 的类注释）；主会话不被打断，之后照常复用。
+  8. FLASH 误配成和默认模型同值 → 不分流（判据是「≠ 默认」而非「== FLASH」）。
 
 不依赖网络：全程 patch brain._serve_request。
 """
@@ -42,19 +45,25 @@ class _FakeServe:
         self.reply = reply
         self.posts = []       # 每次 POST /message 的 body
         self.created = 0      # 建了几个 session
+        self.titles = []      # 每次 POST /session 的 title
+        self.post_sids = []   # 每次 POST message 落在哪个 sid
+        self.deleted = []     # 被 DELETE 掉的 sid
         self._sid = 0
 
     def __call__(self, method, port, pwd, path, body=None, timeout=8):
         if method == "POST" and path == "/session":
             self._sid += 1
             self.created += 1
+            self.titles.append((body or {}).get("title", ""))
             return {"id": f"ses_{self._sid}"}
         if method == "DELETE":
+            self.deleted.append(path.rsplit("/", 1)[-1])
             return True
         if method == "GET" and path.endswith("/message"):
             return []
         if method == "POST" and path.endswith("/message"):
             self.posts.append(body)
+            self.post_sids.append(path.split("/")[2])
             return {"info": {"tokens": {"input": 1, "output": 1}},
                     "parts": [{"type": "text", "text": self.reply}]}
         return None
@@ -65,6 +74,9 @@ class _FakeServe:
 
     def prompt_of(self, i=0):
         return self.posts[i]["parts"][0]["text"]
+
+    def sid_of(self, i=0):
+        return self.post_sids[i]
 
 
 def _ctx(conv_id="cidT"):
@@ -198,25 +210,74 @@ class TestHttpPath(unittest.TestCase):
         self.assertEqual(fake.model_of(), _DEFAULT)
 
     def test_oneshot_mode_also_switches(self):
-        """无状态模式（SESSION_REUSE=0）同样按提示词切模型。"""
+        """无状态模式（SESSION_REUSE=0）同样按提示词切模型，且仍是建→发→删。"""
         fake = _FakeServe()
         _run(fake, "用flash模型 抓数据", _SESSION_REUSE=False)
         self.assertEqual(fake.model_of(), _FLASH)
+        self.assertEqual(fake.created, 1)
+        self.assertEqual(fake.deleted, [fake.sid_of(0)], "一次性 session 用完必须删")
 
 
-class TestSessionReuse(unittest.TestCase):
-    """模型是 per-message 传的，换模型不该导致会话重建（#117 的成立前提）。"""
+class TestFlashRunsStandalone(unittest.TestCase):
+    """逐轮模型的那一轮走**独立一次性 session**，不进复用主会话（#117 跟进）。
+
+    #117 原本假定「模型 per-message 传 → 换模型不必重建会话」。线上日志证否：
+    provider 的 prompt cache 按模型分桶，在攒了长上下文的复用 session 里换模型 =
+    整段历史对新模型全部 miss（实测一轮 input 从 303 涨到 57,557），比省下的还贵；
+    而全新 session 只需重编 system+tools 前缀（provider 侧跨 session 命中）。
+    另有正确性副作用：flash 轮继承主会话历史后会照抄上一轮答案。
+    取舍：flash 轮看不到前文。
+    """
 
     def setUp(self):
         brain._reset_sessions()
 
-    def test_switch_within_same_session(self):
+    def test_flash_turn_uses_its_own_session(self):
         fake = _FakeServe()
-        _run(fake, "用flash模型 抓股价")     # 第一轮：flash
-        _run(fake, "帮我总结一下")            # 第二轮：默认模型，同一 conv
-        self.assertEqual(fake.model_of(0), _FLASH)
+        _run(fake, "帮我记住暗号")            # 第一轮：默认模型 → 建主会话
+        _run(fake, "用flash模型 抓股价")       # 第二轮：flash → 另起一次性 session
+        self.assertEqual(fake.model_of(0), _DEFAULT)
+        self.assertEqual(fake.model_of(1), _FLASH)
+        self.assertEqual(fake.created, 2, "flash 轮必须另起 session")
+        self.assertNotEqual(fake.sid_of(1), fake.sid_of(0))
+
+    def test_flash_session_deleted_main_survives(self):
+        fake = _FakeServe()
+        _run(fake, "帮我记住暗号")
+        _run(fake, "用flash模型 抓股价")
+        main_sid, flash_sid = fake.sid_of(0), fake.sid_of(1)
+        self.assertIn(flash_sid, fake.deleted, "一次性 session 用完要删")
+        self.assertNotIn(main_sid, fake.deleted, "主会话不能被 flash 轮误删")
+        self.assertEqual(brain._lookup_sid("cidT"), main_sid, "主会话记录应原封不动")
+
+    def test_main_session_still_reused_after_flash(self):
+        """flash 轮插在中间，之后的默认模型轮仍落回同一个主 session。"""
+        fake = _FakeServe()
+        _run(fake, "帮我记住暗号")
+        _run(fake, "用flash模型 抓股价")
+        _run(fake, "暗号是多少")
+        self.assertEqual(fake.sid_of(2), fake.sid_of(0))
+        self.assertEqual(fake.created, 2, "第三轮不该再建 session")
+
+    def test_flash_equal_to_default_stays_in_session(self):
+        """判据是「≠ 默认模型」而非「== FLASH」：配成同值时没换缓存桶，不该白丢上下文。"""
+        fake = _FakeServe()
+        _run(fake, "帮我记住暗号", _OPENCODE_MODEL_FLASH=_DEFAULT)
+        _run(fake, "用flash模型 抓股价", _OPENCODE_MODEL_FLASH=_DEFAULT)
         self.assertEqual(fake.model_of(1), _DEFAULT)
-        self.assertEqual(fake.created, 1, "换模型不应重建 session")
+        self.assertEqual(fake.created, 1, "同值不分流")
+        self.assertEqual(fake.sid_of(1), fake.sid_of(0))
+
+    def test_flash_session_title_marked(self):
+        """独立 session 打 ⚡ 前缀，opencode 后台列表里能和主会话区分开。"""
+        fake = _FakeServe()
+        _run(fake, "用flash模型 抓股价")
+        self.assertTrue(fake.titles[0].startswith("⚡ "), fake.titles)
+
+    def test_normal_turn_title_unmarked(self):
+        fake = _FakeServe()
+        _run(fake, "帮我记住暗号")
+        self.assertFalse(fake.titles[0].startswith("⚡"), fake.titles)
 
 
 class TestCliFallback(unittest.TestCase):

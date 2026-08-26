@@ -133,6 +133,15 @@ handler.py — 业务 handler（FDE 在 src/custom/handler.py 改造，模板在
 - 自愈两路：复用的 sid 404（serve 重启/GC）→ 重建一次重试；复用的 sid 回空
   （疑似后端 stream-error 把回合 completed 成空）→ 丢弃 + 删远端 + 新建重试
 - 重置关键词（`AGENT_SESSION_RESET_KEYWORDS`）让用户主动开新话题
+- **逐轮换模型的那一轮是例外，不进主会话**（#117）：消息带 `/flash` 等触发词 → 本轮改用
+  `AGENT_OPENCODE_MODEL_FLASH`，且单开一次性 session 跑完即删。原因是 provider 的
+  prompt cache **按模型分桶**——2026-08-26 线上同一 session：主模型轮
+  `input=303 / cache_read=59,392`，紧接的 flash 轮变成 `input=57,557 / cache_read=1,024`，
+  59K 历史对新模型全量重编码，省下的单价全赔进去；而每条 `(new sid)` 都落在
+  `input 250~2,700 / cache_read≈19,456`——**全新 session 几乎免费**，system+tools 前缀在
+  provider 侧跨 session 命中。代价是 flash 轮看不到前文（顺带修掉一个正确性问题：继承主
+  会话历史时 flash 会照抄上一轮答案）。判据是「≠ 默认模型」而非「== FLASH」，配成同值不分流。
+  `opencode.log` 每行的 `sess=reuse|oneshot` 用来事后区分两类轮次
 - `_inflight` 登记在跑任务（conv_id → sid/title/started），供 `/cancel` 直接 abort
   和 `/reboot` 通知展示"这一停会打断什么"；经 `core.brain.register_inflight` 注册给 core
 - **所有能力共用这一套**：文本回复、合并转发、图片、文件都调
