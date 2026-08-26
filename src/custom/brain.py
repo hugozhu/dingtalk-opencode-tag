@@ -682,6 +682,15 @@ class _IdleAbort(Exception):
     """watchdog 因空闲/超上限主动 abort 了会话 → 终态失败，**不回退 CLI**（避免整轮长任务被重复执行）。"""
 
 
+class _ServeTurnError(Exception):
+    """serve HTTP 200 但回合以错误收尾（info.error，如模型网关 APIError）且无文本产出。
+
+    与 _IdleAbort 不同：这不是卡死 abort，而是后端把失败正常返回了。必须向上抛成
+    failed（→ 兜底提示 + ack 落失败终态），**不能**伪装成空回复——否则用户收不到任何
+    反馈，ack 一直「仍在处理中」心跳到超时。
+    """
+
+
 def _activity_fingerprint(port, pwd, sid):
     """探测 session 当前活动指纹；变化=agent 仍在产出。
 
@@ -876,6 +885,14 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
     info = d.get("info", {}) or {}
     info_tokens = info.get("tokens", {}) or {}
 
+    # 回合以错误收尾（HTTP 仍 200）：serve 把失败正常返回，info.error 记着原因
+    # （典型：模型网关 APIError "Cannot connect to API"）。无文本产出就抛 _ServeTurnError
+    # → 上层判 failed（兜底提示 + ack 落失败终态），绝不伪装成空回复静默吞掉。
+    err = info.get("error")
+    if err and not reply:
+        emsg = (err.get("data") or {}).get("message") or err.get("name") or str(err)
+        raise _ServeTurnError(f"session {sid[:12]} turn error: {emsg}")
+
     # 格式2: tokens (参考项目格式，可能用于 SSE 事件)
     tokens = d.get("tokens", {}) or {}
 
@@ -977,6 +994,20 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                     _mark_inflight(conv_id, sid, port, pwd, title)
                     reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
                     reused = False  # 重建了，视为新会话
+                else:
+                    raise
+            except _ServeTurnError:
+                # 回合带错收尾且无产出：复用会话按中毒自愈重建一次重试；新会话/重试再错
+                # 就向上抛（→ 回退 CLI → 仍失败则 failed，兜底提示 + ack 落失败终态）
+                if reused and _OPENCODE_EMPTY_RETRY:
+                    log(f"brain: 复用 session {sid[:12]} 回合错误，丢弃并新建重试 conv={conv_id[:12]}")
+                    _forget_sid(conv_id)
+                    _delete_session(port, pwd, sid)
+                    sid = _create_session(port, pwd, title)
+                    _register_textreply_sid(sid, ctx)
+                    _mark_inflight(conv_id, sid, port, pwd, title)
+                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                    reused = False
                 else:
                     raise
             # 会话中毒自愈：复用的 session 回空（多半后端 stream-error 把回合 completed 成空），
