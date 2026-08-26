@@ -38,6 +38,18 @@ _BRAIN = os.environ.get("AGENT_BRAIN", "echo")
 _CHAT_MODEL = os.environ.get("AGENT_CHAT_MODEL", "gpt-4o-mini")
 # opencode 后端用的模型（provider/model 格式；免鉴权可用 *-free）
 _OPENCODE_MODEL = os.environ.get("AGENT_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free")
+# 便宜模型逐轮切换（#117）：消息带触发词 → 本轮改用 FLASH 模型。模型随每条 message POST
+# 传（见 _post_message），所以复用 session 也能逐轮换，不必重建会话。留空=特性关闭。
+# 触发词是**子串**匹配（修饰语跟在真实任务前），区别于 CANCEL/RESET 的整句严格匹配。
+_OPENCODE_MODEL_FLASH = os.environ.get("AGENT_OPENCODE_MODEL_FLASH", "")
+# 长的排前面：「用flash」是「用flash模型」的前缀，短的先匹配会在文本里留下孤零零的「模型」。
+_FLASH_KEYWORDS = sorted(
+    (k.strip().lower()
+     for k in os.environ.get("AGENT_OPENCODE_FLASH_KEYWORDS",
+                             "用flash模型,用flash").split(",")
+     if k.strip()),
+    key=len, reverse=True,
+)
 _OPENCODE_BIN = os.environ.get("AGENT_OPENCODE_BIN", "opencode")
 # 长程任务超时（#75）：活动感知，不再一刀切墙钟硬超时。serve 的 message POST 是同步阻塞
 # 请求，任务跑完才返回，其间 socket 无字节流动，旧的 urllib socket 超时 = 任务总时长上限，
@@ -294,6 +306,30 @@ def _forget_sid(conv_id):
 def _is_reset(text):
     """整句命中重置关键词（大小写不敏感）→ 主动断上下文。"""
     return (text or "").strip().lower() in _RESET_KEYWORDS
+
+
+def _pick_model(text):
+    """按本轮文本选模型（#117），返回 (model, cleaned_text)。
+
+    命中触发词 → 用便宜的 FLASH 模型，并把触发词从文本里摘掉：触发词是给 harness 看的
+    修饰语（「用flash模型 打开浏览器抓股价」），留在 prompt 里模型会当成一条它执行不了的
+    指令，可能回「好的，我将使用 flash 模型」这种噪音。
+
+    未配置 FLASH 模型 = 特性关闭：原样返回，**也不摘触发词**——否则关掉特性反而会让
+    用户的原话被悄悄改写。
+    """
+    if not _OPENCODE_MODEL_FLASH or not text:
+        return _OPENCODE_MODEL, text
+    low = text.lower()
+    hit = next((k for k in _FLASH_KEYWORDS if k in low), None)
+    if not hit:
+        return _OPENCODE_MODEL, text
+    i = low.index(hit)
+    cleaned = (text[:i] + text[i + len(hit):]).strip()
+    if not cleaned:
+        # 整句只有触发词、没有任务：摘完就空了，发空 prompt 没意义。当普通消息处理。
+        return _OPENCODE_MODEL, text
+    return _OPENCODE_MODEL_FLASH, cleaned
 
 
 def _update_stats(conv_id, input_tokens=0, output_tokens=0, reasoning_tokens=0, cache_read=0, cache_write=0):
@@ -594,9 +630,10 @@ def _brain_opencode(user, text, ctx, raw=False):
                 _delete_session(port, pwd, old)
         return "🆕 已开启新话题，之前的上下文已清空。", STATUS_OK
 
+    model, text = _pick_model(text)
     prompt = text if raw else f"{user}：{text}"
     try:
-        reply = _brain_opencode_http(prompt, ctx=ctx)
+        reply = _brain_opencode_http(prompt, ctx=ctx, model=model)
     except _IdleAbort as e:
         # watchdog 空闲/超上限主动 abort → 终态失败，**不回退 CLI**（避免整轮长任务被重复执行）
         log(f"brain(opencode): 活动感知超时 abort，判失败不回退 CLI：{e}")
@@ -607,7 +644,7 @@ def _brain_opencode(user, text, ctx, raw=False):
     # HTTP 不可用（serve 没起/凭据缺失/异常）→ 回退 CLI（无状态，拿不到 serve session）
     log("brain(opencode): serve HTTP 不可用，回退 opencode run CLI")
     try:
-        cli_reply = _brain_opencode_cli(prompt)
+        cli_reply = _brain_opencode_cli(prompt, model=model)
     except Exception as e:
         # CLI 也挂了（超时 / rc!=0 / opencode 不存在）→ 彻底失败，给用户兜底
         log(f"brain(opencode): CLI 回退失败：{e}")
@@ -916,7 +953,7 @@ def _post_message(port, pwd, sid, prompt, provider, model_id):
     }
 
 
-def _brain_opencode_http(prompt, ctx=None):
+def _brain_opencode_http(prompt, ctx=None, model=None):
     """走 opencode serve HTTP 生成回复。
 
     两种会话语义（AGENT_SESSION_REUSE 开关）：
@@ -931,19 +968,22 @@ def _brain_opencode_http(prompt, ctx=None):
     工具，POST 阻塞到用户答复（另一线程 POST reply 解阻塞），故 timeout 需覆盖等待时间。
 
     Returns: 回复文本（可能空串）；serve 不可用/出错返回 None（交给调用方回退 CLI）。
+
+    model: 本轮生效的模型（#117，None=用 _OPENCODE_MODEL）。逐轮传，不影响会话复用。
     """
     pid, port, pwd = find_serve_credentials()
     if not port:
         return None  # serve 没起或凭据缺失 → 回退
     conv_id = (ctx or {}).get("conv_id", "")
     if _SESSION_REUSE and conv_id:
-        return _http_reuse(port, pwd, conv_id, prompt, ctx)
-    return _http_oneshot(port, pwd, prompt, ctx)
+        return _http_reuse(port, pwd, conv_id, prompt, ctx, model=model)
+    return _http_oneshot(port, pwd, prompt, ctx, model=model)
 
 
-def _http_oneshot(port, pwd, prompt, ctx):
+def _http_oneshot(port, pwd, prompt, ctx, model=None):
     """旧语义：建 → 发 → 删，无状态。"""
-    provider, model_id = _split_model(_OPENCODE_MODEL)
+    model = model or _OPENCODE_MODEL
+    provider, model_id = _split_model(model)
     conv_id = (ctx or {}).get("conv_id", "")
     t0 = time.time()
     sid = None
@@ -953,15 +993,15 @@ def _http_oneshot(port, pwd, prompt, ctx):
         _register_textreply_sid(sid, ctx)
         _mark_inflight(conv_id, sid, port, pwd, title)
         reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
-        _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
+        _oc_log("http", model, time.time() - t0, prompt, reply, True)
         _stash_task_stats(conv_id, usage, time.time() - t0)
         return reply
     except _IdleAbort as e:
         # 活动感知超时 abort：终态失败，向上传播（_brain_opencode 判 failed 不回退 CLI）
-        _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
+        _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
         raise
     except Exception as e:
-        _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
+        _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
         log(f"brain opencode http err: {e}")
         return None  # 交给调用方回退 CLI
     finally:
@@ -969,9 +1009,10 @@ def _http_oneshot(port, pwd, prompt, ctx):
         _delete_session(port, pwd, sid)
 
 
-def _http_reuse(port, pwd, conv_id, prompt, ctx):
+def _http_reuse(port, pwd, conv_id, prompt, ctx, model=None):
     """复用语义：同一 conv 串行走同一 session；404 失效则重建一次重试。"""
-    provider, model_id = _split_model(_OPENCODE_MODEL)
+    model = model or _OPENCODE_MODEL
+    provider, model_id = _split_model(model)
     t0 = time.time()
     title = _session_title(ctx, prompt)
     with _conv_lock(conv_id):
@@ -1032,27 +1073,27 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx):
                          cache_read=usage.get("cache_read", 0),
                          cache_write=usage.get("cache_write", 0))
             _stash_task_stats(conv_id, usage, time.time() - t0)
-            _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
+            _oc_log("http", model, time.time() - t0, prompt, reply, True)
             return reply
         except _IdleAbort as e:
             # 活动感知超时 abort：会话已被 abort，丢记录 + 删远端，向上传播（不回退 CLI）
             _forget_sid(conv_id)
             _delete_session(port, pwd, sid)
-            _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
+            _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
             log(f"brain: 活动感知超时 abort conv={conv_id[:12]}")
             raise
         except Exception as e:
             # 失败别把坏 sid 留在表里，避免后续消息一直命中坏会话
             _forget_sid(conv_id)
             _delete_session(port, pwd, sid)
-            _oc_log("http", _OPENCODE_MODEL, time.time() - t0, prompt, "", False, str(e))
+            _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
             log(f"brain opencode http err: {e}")
             return None  # 交给调用方回退 CLI
         finally:
             _clear_inflight(conv_id)
 
 
-def _brain_opencode_cli(prompt):
+def _brain_opencode_cli(prompt, model=None):
     """回退路径：调 `opencode run <prompt> --model M --format json`，拼接 text 事件为回复。
 
     HTTP 不可用时的兜底。输出是 NDJSON 事件流，逐行取 type==text 的 part.text 拼接。
@@ -1060,12 +1101,13 @@ def _brain_opencode_cli(prompt):
     把失败伪装成空字符串，以便上层给用户兜底提示。
     """
     full_prompt = f"{_SYSTEM_PROMPT}\n\n{prompt}"
+    model = model or _OPENCODE_MODEL
     cmd = [_OPENCODE_BIN, "run", full_prompt,
-           "--model", _OPENCODE_MODEL, "--format", "json"]
+           "--model", model, "--format", "json"]
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=_OPENCODE_TIMEOUT)
     if r.returncode != 0:
-        _oc_log("cli", _OPENCODE_MODEL, time.time() - t0, prompt, "", False,
+        _oc_log("cli", model, time.time() - t0, prompt, "", False,
                 r.stderr[:200])
         log(f"opencode run rc={r.returncode} stderr={r.stderr[:200]}")
         raise RuntimeError(f"opencode run rc={r.returncode}")
@@ -1081,7 +1123,7 @@ def _brain_opencode_cli(prompt):
         if evt.get("type") == "text":
             parts.append(evt.get("part", {}).get("text", ""))
     reply = "".join(parts).strip()
-    _oc_log("cli", _OPENCODE_MODEL, time.time() - t0, prompt, reply, True)
+    _oc_log("cli", model, time.time() - t0, prompt, reply, True)
     return reply
 
 
