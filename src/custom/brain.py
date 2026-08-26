@@ -256,6 +256,9 @@ def _lookup_sid(conv_id, ctx=None):
                             "reasoning_tokens": rec.get("reasoning_tokens", 0),
                             "cache_read": rec.get("cache_read", 0),
                             "cache_write": rec.get("cache_write", 0),
+                            "flash_rounds": rec.get("flash_rounds", 0),
+                            "flash_input_tokens": rec.get("flash_input_tokens", 0),
+                            "flash_output_tokens": rec.get("flash_output_tokens", 0),
                             "model": _OPENCODE_MODEL,
                         }
                         summary = _format_session_summary(stats)
@@ -292,6 +295,11 @@ def _remember_sid(conv_id, sid, is_new=False):
                 "reasoning_tokens": 0,
                 "cache_read": 0,
                 "cache_write": 0,
+                # 逐轮模型（#117 跟进）分流到独立一次性 session 的轮次：单独计，不并进上面
+                # 的主计数器（那些数用来算本会话的窗口占用/缓存命中，flash 轮没进过主会话）
+                "flash_rounds": 0,
+                "flash_input_tokens": 0,
+                "flash_output_tokens": 0,
             }
         else:
             _conv_sessions[conv_id]["sid"] = sid
@@ -376,6 +384,25 @@ def _update_stats(conv_id, input_tokens=0, output_tokens=0, reasoning_tokens=0, 
             rec["last"] = time.time()
 
 
+def _update_flash_stats(conv_id, input_tokens=0, output_tokens=0):
+    """把「逐轮模型独立 session」轮次的用量记到该 conv 名下（#117 跟进）。
+
+    **单独计数、不并进主计数器**：这些 token 从没进过复用 session，并进去会把
+    _format_session_summary 的窗口占用/缓存命中率算歪（flash 轮是全量重编码，
+    一轮就能虚增几万 input），而这两个数正是用户判断该不该 /new 的依据。
+    也**不刷新 last**——主会话本轮没被用到，TTL 该照常走。
+    无记录时静默 no-op（无状态模式 / 主会话还没建）。
+    """
+    if not conv_id:
+        return
+    with _conv_meta_lock:
+        rec = _conv_sessions.get(conv_id)
+        if rec:
+            rec["flash_rounds"] = rec.get("flash_rounds", 0) + 1
+            rec["flash_input_tokens"] = rec.get("flash_input_tokens", 0) + (input_tokens or 0)
+            rec["flash_output_tokens"] = rec.get("flash_output_tokens", 0) + (output_tokens or 0)
+
+
 def _get_session_stats(conv_id):
     """获取会话统计信息。返回 dict 或 None。"""
     if not conv_id:
@@ -394,6 +421,9 @@ def _get_session_stats(conv_id):
             "reasoning_tokens": rec.get("reasoning_tokens", 0),
             "cache_read": rec.get("cache_read", 0),
             "cache_write": rec.get("cache_write", 0),
+            "flash_rounds": rec.get("flash_rounds", 0),
+            "flash_input_tokens": rec.get("flash_input_tokens", 0),
+            "flash_output_tokens": rec.get("flash_output_tokens", 0),
             "model": _OPENCODE_MODEL,
         }
 
@@ -437,6 +467,15 @@ def _format_session_summary(stats):
     input_str = _format_tokens(input_tokens)
     output_str = _format_tokens(output_tokens)
     lines.append(f"- 💬 **Tokens:** 输入 {input_str}↑ / 输出 {output_str}↓")
+
+    # 逐轮模型（#117 跟进）：这些轮跑在独立一次性 session，不占本会话窗口，单列一行——
+    # 免得 /stats 把它们的花费漏掉，又不污染下面窗口/缓存命中的口径。
+    flash_rounds = stats.get("flash_rounds", 0)
+    if flash_rounds > 0:
+        flash_in = _format_tokens(stats.get("flash_input_tokens", 0))
+        flash_out = _format_tokens(stats.get("flash_output_tokens", 0))
+        lines.append(f"- ⚡ **独立模型轮:** {flash_rounds} 轮"
+                     f"（输入 {flash_in}↑ / 输出 {flash_out}↓，不占本会话窗口）")
 
     # 推理 tokens（只在 > 0 时显示）
     if reasoning_tokens > 0:
@@ -1046,6 +1085,11 @@ def _http_oneshot(port, pwd, prompt, ctx, model=None):
         reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
         _oc_log("http", model, time.time() - t0, prompt, reply, True, sess="oneshot")
         _stash_task_stats(conv_id, usage, time.time() - t0)
+        if model != _OPENCODE_MODEL:
+            # 逐轮模型分流轮：记进该 conv 的 flash_* 计数（无状态模式下没记录 → no-op）
+            _update_flash_stats(conv_id,
+                                input_tokens=usage.get("input_tokens", 0),
+                                output_tokens=usage.get("output_tokens", 0))
         return reply
     except _IdleAbort as e:
         # 活动感知超时 abort：终态失败，向上传播（_brain_opencode 判 failed 不回退 CLI）

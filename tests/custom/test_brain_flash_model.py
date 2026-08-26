@@ -279,6 +279,26 @@ class TestFlashRunsStandalone(unittest.TestCase):
         _run(fake, "帮我记住暗号")
         self.assertFalse(fake.titles[0].startswith("⚡"), fake.titles)
 
+    def test_flash_tokens_counted_separately(self):
+        """flash 轮的用量单列，不并进主计数器（否则窗口占用/缓存命中率会被算歪）。"""
+        fake = _FakeServe()
+        _run(fake, "帮我记住暗号")
+        before = brain._get_session_stats("cidT")
+        _run(fake, "用flash模型 抓股价")
+        after = brain._get_session_stats("cidT")
+        self.assertEqual(after["rounds"], before["rounds"], "主会话轮次不该被 flash 轮推进")
+        self.assertEqual(after["input_tokens"], before["input_tokens"])
+        self.assertEqual(after["flash_rounds"], 1)
+        self.assertEqual(after["flash_input_tokens"], 1)
+        self.assertEqual(after["flash_output_tokens"], 1)
+        self.assertIn("独立模型轮", brain._format_session_summary(after))
+
+    def test_summary_omits_flash_line_without_flash_rounds(self):
+        fake = _FakeServe()
+        _run(fake, "帮我记住暗号")
+        self.assertNotIn("独立模型轮",
+                         brain._format_session_summary(brain._get_session_stats("cidT")))
+
 
 class TestCliFallback(unittest.TestCase):
     """serve 不可用时回退 CLI，--model 必须跟着切，否则静默变回贵模型。"""
