@@ -92,9 +92,10 @@ export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-
 # 也能逐轮切换，不需要重建会话。留空=关闭本特性（所有消息都走 AGENT_OPENCODE_MODEL）。
 export AGENT_OPENCODE_MODEL_FLASH="${AGENT_OPENCODE_MODEL_FLASH:-}"
 # 触发词，逗号分隔。**子串**匹配且大小写不敏感——触发词是跟在真实任务前的修饰语
-# （「用flash模型 打开浏览器抓一下股价」），不同于 CANCEL/RESET 关键词的整句严格匹配。
-# 命中后触发词会从 prompt 里摘掉，避免模型看到一句它无法执行的指令。
-export AGENT_OPENCODE_FLASH_KEYWORDS="${AGENT_OPENCODE_FLASH_KEYWORDS:-用flash模型,用flash}"
+# （「/flash 打开浏览器抓一下股价」），不同于 CANCEL/RESET 关键词的整句严格匹配。
+# 命中后触发词会从 prompt 里摘掉，避免模型看到一句它无法执行的指令。ASCII 收尾的触发词
+# 带词边界判断：「/flashlight」「useflashmodels」不会被误判成触发词。
+export AGENT_OPENCODE_FLASH_KEYWORDS="${AGENT_OPENCODE_FLASH_KEYWORDS:-用flash模型,use flash model,用flash,/flash}"
 # 工具授权审批（可选）：brain 临时 session 的 per-session 权限规则（serve v1 格式 JSON 数组）。
 # 配了 ask 规则后命中的工具调用会挂起 → permission 能力发钉钉群审批（回「同意/总是/拒绝」，
 # CAP_PERMISSION_TIMEOUT 默认 60s 未回自动拒绝）。空=不启用（serve 默认全放行）。示例：

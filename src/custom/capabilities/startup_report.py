@@ -281,7 +281,7 @@ def _build_report():
     ])
     _flash = os.environ.get("AGENT_OPENCODE_MODEL_FLASH", "")
     if _flash:
-        report_lines.append(f"- **便宜模型**：`{_flash}`（消息带「用flash模型」时本轮启用）")
+        report_lines.append(f"- **便宜模型**：`{_flash}`（消息带 `/flash`、「用flash模型」等触发词时本轮启用）")
     report_lines.extend([
         f"- **视觉模型**：`{os.environ.get('AGENT_VISION_MODEL', '未配置')}`",
         f"- **回复模式**：`{os.environ.get('AGENT_REPLY_MODE', 'log')}`",
