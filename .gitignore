@@ -233,6 +233,9 @@ start-digital-employee.sh
 .serve.pwd
 .serve.dir
 
+# stock_watch 行情价格历史（运行时状态，勿提交）
+.stock-watch-state.json
+
 # monitor 运行时状态（下次健康检查时间戳）
 .next-check
 

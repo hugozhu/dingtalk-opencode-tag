@@ -1,17 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-browser"
   ],
   "mcp": {
-    "browsermcp": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "@browsermcp/mcp"
-      ],
-      "enabled": true
+  },
+  "permission": {
+    "external_directory": {
+      "~/.agents/**": "allow",
+      "/tmp/**": "allow"
     }
   }
 }
