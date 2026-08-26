@@ -46,7 +46,7 @@ _OPENCODE_MODEL_FLASH = os.environ.get("AGENT_OPENCODE_MODEL_FLASH", "")
 _FLASH_KEYWORDS = sorted(
     (k.strip().lower()
      for k in os.environ.get("AGENT_OPENCODE_FLASH_KEYWORDS",
-                             "用flash模型,用flash").split(",")
+                             "用flash模型,use flash model,用flash,/flash").split(",")
      if k.strip()),
     key=len, reverse=True,
 )
@@ -308,6 +308,26 @@ def _is_reset(text):
     return (text or "").strip().lower() in _RESET_KEYWORDS
 
 
+def _find_flash_trigger(low):
+    """在 low（已 lower）里找触发词，返回 (start, keyword) 或 None。
+
+    带 ASCII 词边界：触发词以字母/数字收尾时，后面不能紧跟字母/数字，否则
+    「/flashlight」「useflashmodel」这种会被误判成触发词、还把 prompt 割坏。
+    中文触发词（如「用flash模型」以「型」收尾）不受此限——中文不用空格分词。
+    """
+    for k in _FLASH_KEYWORDS:
+        start = 0
+        while True:
+            i = low.find(k, start)
+            if i < 0:
+                break
+            after = low[i + len(k):i + len(k) + 1]
+            if not (k[-1].isascii() and k[-1].isalnum() and after.isalnum() and after.isascii()):
+                return i, k
+            start = i + 1
+    return None
+
+
 def _pick_model(text):
     """按本轮文本选模型（#117），返回 (model, cleaned_text)。
 
@@ -320,11 +340,10 @@ def _pick_model(text):
     """
     if not _OPENCODE_MODEL_FLASH or not text:
         return _OPENCODE_MODEL, text
-    low = text.lower()
-    hit = next((k for k in _FLASH_KEYWORDS if k in low), None)
-    if not hit:
+    found = _find_flash_trigger(text.lower())
+    if not found:
         return _OPENCODE_MODEL, text
-    i = low.index(hit)
+    i, hit = found
     cleaned = (text[:i] + text[i + len(hit):]).strip()
     if not cleaned:
         # 整句只有触发词、没有任务：摘完就空了，发空 prompt 没意义。当普通消息处理。

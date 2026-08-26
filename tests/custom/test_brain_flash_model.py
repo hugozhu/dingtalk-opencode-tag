@@ -76,7 +76,7 @@ def _cfg(**overrides):
            "_OPENCODE_ACTIVITY_POLL": 60, "_OPENCODE_IDLE_TIMEOUT": 300,
            "_OPENCODE_MAX_TIMEOUT": 0, "_OPENCODE_SOCK_TIMEOUT": None,
            "_OPENCODE_MODEL": _DEFAULT, "_OPENCODE_MODEL_FLASH": _FLASH,
-           "_FLASH_KEYWORDS": ["用flash模型", "用flash"]}
+           "_FLASH_KEYWORDS": ["use flash model", "用flash模型", "用flash", "/flash"]}
     cfg.update(overrides)
     return cfg
 
@@ -137,6 +137,44 @@ class TestPickModel(unittest.TestCase):
         model, cleaned = self._pick("帮我看下 flash模型 效果怎么样")
         self.assertEqual(model, _DEFAULT)
         self.assertEqual(cleaned, "帮我看下 flash模型 效果怎么样")
+
+    def test_slash_command_trigger(self):
+        model, cleaned = self._pick("/flash 打开浏览器抓股价")
+        self.assertEqual(model, _FLASH)
+        self.assertEqual(cleaned, "打开浏览器抓股价")
+
+    def test_english_trigger(self):
+        model, cleaned = self._pick("use flash model to scrape the page")
+        self.assertEqual(model, _FLASH)
+        self.assertEqual(cleaned, "to scrape the page")
+
+    def test_english_trigger_case_insensitive(self):
+        model, cleaned = self._pick("Use Flash Model 抓数据")
+        self.assertEqual(model, _FLASH)
+        self.assertEqual(cleaned, "抓数据")
+
+    def test_word_boundary_blocks_longer_word(self):
+        """/flashlight 不是 /flash——否则还会把 prompt 割成「light」。"""
+        model, cleaned = self._pick("这个 /flashlight 工具怎么用")
+        self.assertEqual(model, _DEFAULT)
+        self.assertEqual(cleaned, "这个 /flashlight 工具怎么用")
+
+    def test_word_boundary_blocks_glued_english(self):
+        model, cleaned = self._pick("useflashmodels 是什么")
+        self.assertEqual(model, _DEFAULT)
+        self.assertEqual(cleaned, "useflashmodels 是什么")
+
+    def test_skips_boundary_reject_finds_later_hit(self):
+        """前面有 /flashlight 不该挡住后面真正的 /flash。"""
+        model, cleaned = self._pick("先看下 /flashlight，再 /flash 抓数据")
+        self.assertEqual(model, _FLASH)
+        self.assertIn("/flashlight", cleaned)
+        self.assertNotIn("/flash ", cleaned)
+
+    def test_slash_command_only_not_switched(self):
+        model, cleaned = self._pick("/flash")
+        self.assertEqual(model, _DEFAULT)
+        self.assertEqual(cleaned, "/flash")
 
 
 class TestHttpPath(unittest.TestCase):
