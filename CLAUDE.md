@@ -128,6 +128,7 @@ Registered in `src/custom/capabilities/__init__.py`, controlled by `CAP_<NAME>_E
 - **TTL expiry** (`AGENT_SESSION_TTL=1800`): Idle 30min → rebuild
 - **LRU eviction** (`AGENT_SESSION_MAX=64`): Max concurrent sessions
 - **Reset keywords** (`AGENT_SESSION_RESET_KEYWORDS="/new,新话题"`): User triggers context clear
+- **Per-turn model switch bypasses reuse** (`AGENT_OPENCODE_MODEL_FLASH`, #117): a turn whose model differs from `AGENT_OPENCODE_MODEL` runs in its own one-shot session (created → posted → deleted) instead of joining the reused one. Provider prompt cache is per-model, so switching models inside a long reused session re-encodes the whole history (measured: `input` 303 → 57,557 in one turn). Trade-off: that turn sees no prior context. See ARCHITECTURE.md §8.
 - Credentials via `find_serve_credentials()` → caches to `.serve.{pid,port,pwd}`
 
 ### 3. Daemon + Self-Healing

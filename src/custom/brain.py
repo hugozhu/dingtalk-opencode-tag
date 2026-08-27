@@ -39,7 +39,10 @@ _CHAT_MODEL = os.environ.get("AGENT_CHAT_MODEL", "gpt-4o-mini")
 # opencode 后端用的模型（provider/model 格式；免鉴权可用 *-free）
 _OPENCODE_MODEL = os.environ.get("AGENT_OPENCODE_MODEL", "opencode/deepseek-v4-flash-free")
 # 便宜模型逐轮切换（#117）：消息带触发词 → 本轮改用 FLASH 模型。模型随每条 message POST
-# 传（见 _post_message），所以复用 session 也能逐轮换，不必重建会话。留空=特性关闭。
+# 传（见 _post_message），但**命中的这一轮不复用主会话**：provider 的 prompt cache 是按
+# 模型分桶的，在攒了长上下文的复用 session 里换模型 = 整段历史重新编码，比省下的还贵
+# （见 _brain_opencode_http 的实测数字）。故这一轮单独建一次性 session 跑完即删，代价是
+# 看不到前文。留空=特性关闭。
 # 触发词是**子串**匹配（修饰语跟在真实任务前），区别于 CANCEL/RESET 的整句严格匹配。
 _OPENCODE_MODEL_FLASH = os.environ.get("AGENT_OPENCODE_MODEL_FLASH", "")
 # 长的排前面：「用flash」是「用flash模型」的前缀，短的先匹配会在文本里留下孤零零的「模型」。
@@ -150,11 +153,15 @@ _SYSTEM_PROMPT = os.environ.get(
 _MAX_REPLY_CHARS = int(os.environ.get("AGENT_MAX_REPLY_CHARS", "12000"))
 
 
-def _oc_log(transport, model, elapsed, prompt, reply, ok, err=""):
+def _oc_log(transport, model, elapsed, prompt, reply, ok, err="", sess=""):
     """把一次 opencode 调用记到独立 opencode.log。
 
     成功记录仅在 AGENT_DEBUG=1 时写；失败（ok=False）恒记，不受开关影响，
     便于事后排查"回复为空/超时"到底断在 HTTP 还是 CLI。best-effort，写失败静默。
+
+    sess: 会话语义标记（reuse=复用主会话 / oneshot=一次性会话，含逐轮模型分流的轮次）。
+    **只能追加在 transport= 之后**：healthcheck 的熔断正则锚行首并限定 transport 取值
+    （bin/core/healthcheck.sh 的 _BRAIN_FAIL_PATTERN），插到前面会让计数器失效。
     """
     if ok and not _DEBUG:
         return
@@ -163,6 +170,8 @@ def _oc_log(transport, model, elapsed, prompt, reply, ok, err=""):
     line = (f"[{ts}] transport={transport} model={model} "
             f"elapsed={elapsed:.2f}s prompt_len={len(prompt or '')} "
             f"reply_len={len(reply or '')} ok={ok}")
+    if sess:
+        line += f" sess={sess}"
     if err:
         line += f" err={err[:160]!r}"
     if preview:
@@ -247,6 +256,9 @@ def _lookup_sid(conv_id, ctx=None):
                             "reasoning_tokens": rec.get("reasoning_tokens", 0),
                             "cache_read": rec.get("cache_read", 0),
                             "cache_write": rec.get("cache_write", 0),
+                            "flash_rounds": rec.get("flash_rounds", 0),
+                            "flash_input_tokens": rec.get("flash_input_tokens", 0),
+                            "flash_output_tokens": rec.get("flash_output_tokens", 0),
                             "model": _OPENCODE_MODEL,
                         }
                         summary = _format_session_summary(stats)
@@ -283,6 +295,11 @@ def _remember_sid(conv_id, sid, is_new=False):
                 "reasoning_tokens": 0,
                 "cache_read": 0,
                 "cache_write": 0,
+                # 逐轮模型（#117 跟进）分流到独立一次性 session 的轮次：单独计，不并进上面
+                # 的主计数器（那些数用来算本会话的窗口占用/缓存命中，flash 轮没进过主会话）
+                "flash_rounds": 0,
+                "flash_input_tokens": 0,
+                "flash_output_tokens": 0,
             }
         else:
             _conv_sessions[conv_id]["sid"] = sid
@@ -367,6 +384,25 @@ def _update_stats(conv_id, input_tokens=0, output_tokens=0, reasoning_tokens=0, 
             rec["last"] = time.time()
 
 
+def _update_flash_stats(conv_id, input_tokens=0, output_tokens=0):
+    """把「逐轮模型独立 session」轮次的用量记到该 conv 名下（#117 跟进）。
+
+    **单独计数、不并进主计数器**：这些 token 从没进过复用 session，并进去会把
+    _format_session_summary 的窗口占用/缓存命中率算歪（flash 轮是全量重编码，
+    一轮就能虚增几万 input），而这两个数正是用户判断该不该 /new 的依据。
+    也**不刷新 last**——主会话本轮没被用到，TTL 该照常走。
+    无记录时静默 no-op（无状态模式 / 主会话还没建）。
+    """
+    if not conv_id:
+        return
+    with _conv_meta_lock:
+        rec = _conv_sessions.get(conv_id)
+        if rec:
+            rec["flash_rounds"] = rec.get("flash_rounds", 0) + 1
+            rec["flash_input_tokens"] = rec.get("flash_input_tokens", 0) + (input_tokens or 0)
+            rec["flash_output_tokens"] = rec.get("flash_output_tokens", 0) + (output_tokens or 0)
+
+
 def _get_session_stats(conv_id):
     """获取会话统计信息。返回 dict 或 None。"""
     if not conv_id:
@@ -385,6 +421,9 @@ def _get_session_stats(conv_id):
             "reasoning_tokens": rec.get("reasoning_tokens", 0),
             "cache_read": rec.get("cache_read", 0),
             "cache_write": rec.get("cache_write", 0),
+            "flash_rounds": rec.get("flash_rounds", 0),
+            "flash_input_tokens": rec.get("flash_input_tokens", 0),
+            "flash_output_tokens": rec.get("flash_output_tokens", 0),
             "model": _OPENCODE_MODEL,
         }
 
@@ -428,6 +467,15 @@ def _format_session_summary(stats):
     input_str = _format_tokens(input_tokens)
     output_str = _format_tokens(output_tokens)
     lines.append(f"- 💬 **Tokens:** 输入 {input_str}↑ / 输出 {output_str}↓")
+
+    # 逐轮模型（#117 跟进）：这些轮跑在独立一次性 session，不占本会话窗口，单列一行——
+    # 免得 /stats 把它们的花费漏掉，又不污染下面窗口/缓存命中的口径。
+    flash_rounds = stats.get("flash_rounds", 0)
+    if flash_rounds > 0:
+        flash_in = _format_tokens(stats.get("flash_input_tokens", 0))
+        flash_out = _format_tokens(stats.get("flash_output_tokens", 0))
+        lines.append(f"- ⚡ **独立模型轮:** {flash_rounds} 轮"
+                     f"（输入 {flash_in}↑ / 输出 {flash_out}↓，不占本会话窗口）")
 
     # 推理 tokens（只在 > 0 时显示）
     if reasoning_tokens > 0:
@@ -981,6 +1029,9 @@ def _brain_opencode_http(prompt, ctx=None, model=None):
       - 开（#56）：同一 conv 复用 session（serve 自带多轮历史）。命中未过期 sid 直接复用；
         POST 遇 404（session 被 serve 清了/重启失效）→ 删记录、重建一次重试。会话闲置 TTL
         过期或 LRU 逐出时删远端 session。同一 conv 串行（_conv_lock），不同 conv 并行。
+      - 开 + 本轮模型 ≠ 默认（#117 跟进）：**不进**复用 session，单独建一个一次性 session
+        跑完即删。provider 的 prompt cache 按模型分桶，换模型 = 整段历史重编码（见下），
+        仍持 _conv_lock 保证同 conv 串行。
 
     两种模式都把 sid（连同来源 conv ctx）登记到 core.brain 注册表，供 text_reply 抑制 SSE
     业务通知 + question/permission 把提问/审批路由回来源群。若该轮 agent 调 question/permission
@@ -988,13 +1039,29 @@ def _brain_opencode_http(prompt, ctx=None, model=None):
 
     Returns: 回复文本（可能空串）；serve 不可用/出错返回 None（交给调用方回退 CLI）。
 
-    model: 本轮生效的模型（#117，None=用 _OPENCODE_MODEL）。逐轮传，不影响会话复用。
+    model: 本轮生效的模型（#117，None=用 _OPENCODE_MODEL）。非默认模型的轮次被分流到独立
+           一次性 session（见上），因此**看不到本会话前文**——这是明确接受的取舍。
     """
     pid, port, pwd = find_serve_credentials()
     if not port:
         return None  # serve 没起或凭据缺失 → 回退
     conv_id = (ctx or {}).get("conv_id", "")
+    # 逐轮换模型（#117 跟进）不进复用 session：provider 的 prompt cache **按模型分桶**，
+    # 主模型在复用 session 里攒下的长上下文对另一个模型一次都不命中，整段历史要重新编码。
+    # 线上实测同一 session：主模型轮 input=303/cache_read=59392，紧接的 flash 轮变成
+    # input=57557/cache_read=1024；而**全新** session 只需重编 system+tools 前缀（provider
+    # 侧跨 session 命中，实测 input 250~2700）。为省钱开的开关反而更贵，且 flash 轮继承历史
+    # 还会照抄上一轮答案。
+    # 判据是「≠ 默认模型」而非「== FLASH」：FLASH 误配成和默认同值时并没有换缓存桶，
+    # 不该白丢上下文；也能自然覆盖以后新增的逐轮模型。
+    # 仍持 _conv_lock：同 conv 的先后消息保持串行，_inflight 不会被并发轮次互相覆盖。
+    # （_http_oneshot 自身不取 _conv_lock，threading.Lock 非重入，此处不会自锁。）
     if _SESSION_REUSE and conv_id:
+        if model and model != _OPENCODE_MODEL:
+            log(f"brain: 本轮模型 {model} ≠ 默认，走独立一次性 session（不复用上下文）"
+                f" conv={conv_id[:12]}")
+            with _conv_lock(conv_id):
+                return _http_oneshot(port, pwd, prompt, ctx, model=model)
         return _http_reuse(port, pwd, conv_id, prompt, ctx, model=model)
     return _http_oneshot(port, pwd, prompt, ctx, model=model)
 
@@ -1007,20 +1074,29 @@ def _http_oneshot(port, pwd, prompt, ctx, model=None):
     t0 = time.time()
     sid = None
     title = _session_title(ctx, prompt)
+    if model != _OPENCODE_MODEL:
+        # 逐轮模型分流来的一次性 session：打个标，opencode 后台会话列表里一眼可辨，
+        # 不和复用主会话混在一起（#117 跟进）
+        title = f"⚡ {title}"
     try:
         sid = _create_session(port, pwd, title)
         _register_textreply_sid(sid, ctx)
         _mark_inflight(conv_id, sid, port, pwd, title)
         reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
-        _oc_log("http", model, time.time() - t0, prompt, reply, True)
+        _oc_log("http", model, time.time() - t0, prompt, reply, True, sess="oneshot")
         _stash_task_stats(conv_id, usage, time.time() - t0)
+        if model != _OPENCODE_MODEL:
+            # 逐轮模型分流轮：记进该 conv 的 flash_* 计数（无状态模式下没记录 → no-op）
+            _update_flash_stats(conv_id,
+                                input_tokens=usage.get("input_tokens", 0),
+                                output_tokens=usage.get("output_tokens", 0))
         return reply
     except _IdleAbort as e:
         # 活动感知超时 abort：终态失败，向上传播（_brain_opencode 判 failed 不回退 CLI）
-        _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
+        _oc_log("http", model, time.time() - t0, prompt, "", False, str(e), sess="oneshot")
         raise
     except Exception as e:
-        _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
+        _oc_log("http", model, time.time() - t0, prompt, "", False, str(e), sess="oneshot")
         log(f"brain opencode http err: {e}")
         return None  # 交给调用方回退 CLI
     finally:
@@ -1092,20 +1168,20 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx, model=None):
                          cache_read=usage.get("cache_read", 0),
                          cache_write=usage.get("cache_write", 0))
             _stash_task_stats(conv_id, usage, time.time() - t0)
-            _oc_log("http", model, time.time() - t0, prompt, reply, True)
+            _oc_log("http", model, time.time() - t0, prompt, reply, True, sess="reuse")
             return reply
         except _IdleAbort as e:
             # 活动感知超时 abort：会话已被 abort，丢记录 + 删远端，向上传播（不回退 CLI）
             _forget_sid(conv_id)
             _delete_session(port, pwd, sid)
-            _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
+            _oc_log("http", model, time.time() - t0, prompt, "", False, str(e), sess="reuse")
             log(f"brain: 活动感知超时 abort conv={conv_id[:12]}")
             raise
         except Exception as e:
             # 失败别把坏 sid 留在表里，避免后续消息一直命中坏会话
             _forget_sid(conv_id)
             _delete_session(port, pwd, sid)
-            _oc_log("http", model, time.time() - t0, prompt, "", False, str(e))
+            _oc_log("http", model, time.time() - t0, prompt, "", False, str(e), sess="reuse")
             log(f"brain opencode http err: {e}")
             return None  # 交给调用方回退 CLI
         finally:
