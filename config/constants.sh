@@ -95,7 +95,8 @@ export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-
 # system+tools 前缀（provider 侧跨 session 命中，约 1~8k）。故命中轮单开一次性 session
 # 跑完即删，代价是**看不到前文**（也顺带避免了 flash 轮照抄主会话上一轮答案）。
 # 判据是「≠ AGENT_OPENCODE_MODEL」：配成和默认同值时并没换缓存桶，不分流。
-# 留空=关闭本特性（所有消息都走 AGENT_OPENCODE_MODEL）。
+# 留空=关闭本特性（所有消息都走 AGENT_OPENCODE_MODEL）。示例（自建网关同厂同代的便宜档，
+# 单价约为 max 档的 1/12）：export AGENT_OPENCODE_MODEL_FLASH="local/qwen3-8-flash"
 export AGENT_OPENCODE_MODEL_FLASH="${AGENT_OPENCODE_MODEL_FLASH:-}"
 # 触发词，逗号分隔。**子串**匹配且大小写不敏感——触发词是跟在真实任务前的修饰语
 # （「/flash 打开浏览器抓一下股价」），不同于 CANCEL/RESET 关键词的整句严格匹配。
