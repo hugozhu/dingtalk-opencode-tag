@@ -242,6 +242,13 @@ start-digital-employee.sh
 # firecrawl 抓取的中间产物（报告数据缓存，勿提交）
 .firecrawl/
 
+# 告警状态跟踪（运行时状态，勿提交）
+.alert-state
+
+# 内容生产 / 抓取的中间产物（勿提交）
+runs/
+topgs/
+
 # digest 定时报告脚本（仅本地使用，勿提交）
 bin/custom/aliway_hot_report.sh
 bin/custom/aliway-hot-report.plist
