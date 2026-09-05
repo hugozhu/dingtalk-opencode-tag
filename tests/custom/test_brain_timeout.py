@@ -147,24 +147,84 @@ class TestActivityAwareTimeout(unittest.TestCase):
         """_activity_fingerprint 正确识别未完结 reasoning part，并给出静止指纹。"""
         def resp(msgs):
             return lambda method, port, pwd, path, body=None, timeout=8: msgs
-        # 未完结 reasoning（time 只有 start 无 end）→ (指纹, True)
+        # 未完结 reasoning（time 只有 start 无 end）→ (指纹, True, step)
         with patch.object(brain, "_serve_request",
                           side_effect=resp(_reasoning_msg(10, 1000, reasoning_start=123))):
-            fp, reasoning = brain._activity_fingerprint(4096, "pw", "s")
+            fp, reasoning, step = brain._activity_fingerprint(4096, "pw", "s")
         self.assertTrue(reasoning)
         self.assertEqual(fp, (1, 2, 10, 1000))       # 指纹数值静止（2 个 part：text+reasoning）
+        self.assertEqual(step, "思考中")             # 未完结 reasoning → 步骤=思考中
         # 已完结 reasoning（time.end 已置）→ 不算进行中 → (指纹, False)
         with patch.object(brain, "_serve_request",
                           side_effect=resp([{"info": {"time": {"completed": 5}},
                                              "parts": [
                                                  {"type": "reasoning", "text": "ok",
                                                   "time": {"start": 1, "end": 2}}]}])):
-            fp, reasoning = brain._activity_fingerprint(4096, "pw", "s")
+            fp, reasoning, _ = brain._activity_fingerprint(4096, "pw", "s")
         self.assertFalse(reasoning)
         self.assertEqual(fp, (1, 1, 2, 5))           # reasoning text 计入 textlen
         # GET 失败 → None（偏保活）
         with patch.object(brain, "_serve_request", side_effect=RuntimeError("boom")):
             self.assertIsNone(brain._activity_fingerprint(4096, "pw", "s"))
+
+    def test_fingerprint_step_desc_from_parts(self):
+        """_activity_fingerprint 的 step 按最后一条消息的 part 派生（#121 进度心跳）。"""
+        def resp(msgs):
+            return lambda method, port, pwd, path, body=None, timeout=8: msgs
+        # 进行中 tool（pending）→ 步骤=调用<tool>
+        with patch.object(brain, "_serve_request", side_effect=resp(
+                [{"info": {"time": {"updated": 9}},
+                  "parts": [{"type": "step-start", "snapshot": "x"},
+                            {"type": "tool", "tool": "bash",
+                             "state": {"status": "pending", "input": {}}}]}])):
+            _, _, step = brain._activity_fingerprint(4096, "pw", "s")
+        self.assertEqual(step, "调用执行命令")
+        # 已完成 tool → <tool>完成
+        with patch.object(brain, "_serve_request", side_effect=resp(
+                [{"info": {"time": {"completed": 9}},
+                  "parts": [{"type": "tool", "tool": "write",
+                             "state": {"status": "completed", "input": {}}}]}])):
+            _, _, step = brain._activity_fingerprint(4096, "pw", "s")
+        self.assertEqual(step, "写入文件完成")
+        # 只有 text → 生成内容
+        with patch.object(brain, "_serve_request", side_effect=resp(
+                [{"info": {"time": {"updated": 9}},
+                  "parts": [{"type": "text", "text": "hi"}]}])):
+            _, _, step = brain._activity_fingerprint(4096, "pw", "s")
+        self.assertEqual(step, "生成内容")
+        # 无信息量 part → ""
+        with patch.object(brain, "_serve_request", side_effect=resp(
+                [{"info": {"time": {"updated": 9}}, "parts": [{"type": "step-start"}]}])):
+            _, _, step = brain._activity_fingerprint(4096, "pw", "s")
+        self.assertEqual(step, "")
+
+    def test_watchdog_writes_step_to_inflight(self):
+        """长任务期间 watchdog 每轮把「当前步骤 + 已完成回合数」写进 _inflight（#121），ack 心跳可读。"""
+        fake = _FakeServe(activity="reasoning", block=True)
+        observed = []
+        # 后台等 watchdog 观察到步骤后解锁（记下读到的快照，供主线程断言）
+        def release():
+            for _ in range(60):
+                step, done = brain.current_work_progress("cidT")
+                if step:
+                    observed.append((step, done))
+                    fake.unblock.set()
+                    return
+                time.sleep(0.05)
+        threading.Timer(0.3, release).start()
+        threading.Timer(3.0, fake.unblock.set).start()   # 兜底解锁，避免测试空转
+        reply, status, cli = self._run(
+            fake, _OPENCODE_IDLE_TIMEOUT=30, _OPENCODE_ACTIVITY_POLL=1)
+        self.assertEqual(reply, "done")
+        self.assertEqual(status, STATUS_OK)
+        self.assertEqual(len(observed), 1)
+        step, done = observed[0]
+        self.assertEqual(step, "思考中", "watchdog 应把步骤写进 inflight")
+        self.assertIsInstance(done, int, "done 应为整数（已完成回合数）")
+        step2, done2 = brain.current_work_progress("cidT")
+        self.assertEqual(step2, "", "任务结束应清空步骤")
+        self.assertEqual(done2, 0, "任务结束应清空 done")
+        cli.assert_not_called()
 
     def test_max_timeout_abort_even_with_activity(self):
         """持续有活动但超 MAX → 仍 abort。"""

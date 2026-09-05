@@ -123,12 +123,16 @@ _ERROR = _parse_status(os.environ.get("ACK_ERROR"), "疑问", "未完成")
 #   ACK_PROGRESS_MESSAGE    是否额外发独立进度消息（默认开；关=只更新表情不发消息）
 #   ACK_PROGRESS_EMOJI      心跳阶段的表情名（默认「咖啡」）
 #   ACK_PROGRESS_EMOJI_TEXT 表情附带文字模板（{mins}=已耗时分钟；文字须能被 create-text-emotion 保存）
-#   ACK_PROGRESS_MSG        独立进度消息文案模板（{mins}=已耗时分钟）
+#   ACK_PROGRESS_MSG        独立进度消息文案模板（{mins}=已耗时分钟；{done}=已完成步骤数）
+#   ACK_PROGRESS_MSG_STEP   进度消息里的「当前步骤」前缀模板（{step}=brain 派生的步骤短语；
+#                           #121 长任务进度带步骤，如「调用执行命令」「写入文件完成」「思考中」；值为空时不加前缀）
 _PROGRESS_INTERVAL = float(os.environ.get("ACK_PROGRESS_INTERVAL", "300"))
 _PROGRESS_MESSAGE = env_flag("ACK_PROGRESS_MESSAGE", default=True)
 _PROGRESS_EMOJI = os.environ.get("ACK_PROGRESS_EMOJI", "咖啡")
 _PROGRESS_EMOJI_TEXT = os.environ.get("ACK_PROGRESS_EMOJI_TEXT", "处理中{mins}分钟")
-_PROGRESS_MSG = os.environ.get("ACK_PROGRESS_MSG", "⏳ 仍在处理中，已耗时约 {mins} 分钟，请稍候…")
+_PROGRESS_MSG = os.environ.get("ACK_PROGRESS_MSG", "⏳ 已耗时约 {mins} 分钟，任务仍在进行，请稍候…")
+_PROGRESS_MSG_DONE = os.environ.get("ACK_PROGRESS_MSG_DONE", "已完成 {done} 步，")
+_PROGRESS_MSG_STEP = os.environ.get("ACK_PROGRESS_MSG_STEP", "当前正在：{step}，")
 
 # 等"回复已发出"信号的上限秒数（brain 慢 / 空回复不发时兜底收尾）。默认覆盖到 opencode
 # 长任务上限（AGENT_OPENCODE_MAX_TIMEOUT，#75）之后仍留冗余，避免心跳中途被误收尾。
@@ -424,26 +428,49 @@ def _finalize(rec, ok):
     _set_status(rec, final)
 
 
-def _send_progress_message(conv_id, conv_type, mins):
-    """发一条独立进度消息（不触发 ack 收尾）。best-effort，失败只记日志。"""
+def _send_progress_message(conv_id, conv_type, mins, step="", done=0):
+    """发一条独立进度消息（不触发 ack 收尾）。best-effort，失败只记日志。
+
+    消息格式（从左到右按信息量叠加）：
+      [已完成 N 步，][当前正在：<步骤>，]⏳ 已耗时约 M 分钟，任务仍在进行，请稍候…
+
+    done>0 时前置「已完成 N 步」；step 非空时前置「当前正在：<步骤>」；
+    两者都为空时退回纯耗时文案。
+    """
     if not _PROGRESS_MESSAGE:
         return
     try:
         from custom.replier import send_notice   # 延迟导入避免 capabilities 载入期循环
     except ImportError:
         return
+    text = _PROGRESS_MSG.format(mins=mins)
+    if _PROGRESS_MSG_STEP and step:
+        text = _PROGRESS_MSG_STEP.format(step=step) + text
+    if _PROGRESS_MSG_DONE and done > 0:
+        text = _PROGRESS_MSG_DONE.format(done=done) + text
     try:
-        send_notice(conv_id, conv_type, _PROGRESS_MSG.format(mins=mins))
+        send_notice(conv_id, conv_type, text)
     except Exception as e:
         log(f"ack: 进度消息发送失败 {e}")
 
 
 def _progress_tick(rec, mins):
-    """一次进度心跳：原地更新消息上的文字表情（带已耗时分钟）+ 另发独立进度消息。"""
+    """一次进度心跳：原地更新消息上的文字表情（带已耗时分钟）+ 另发独立进度消息。
+
+    #121：独立进度消息从 brain 的在跑登记读「当前步骤 + 已完成回合数」快照（watchdog 每
+    poll 刷新），让心跳不只报耗时，还让用户知道已完成多少步、此刻在做什么。
+    step/done 取不到时退回纯耗时文案。
+    """
     _dlog("进度心跳 msgId=%s 已耗时=%d分钟" % (rec.msg_id or "-", mins))
     emoji_text = _PROGRESS_EMOJI_TEXT.format(mins=mins)
     _set_status(rec, (_PROGRESS_EMOJI, emoji_text))
-    _send_progress_message(rec.conv_id, rec.conv_type, mins)
+    step, done = "", 0
+    try:
+        from custom.brain import current_work_progress   # 延迟导入避免载入期循环
+        step, done = current_work_progress(rec.conv_id)
+    except Exception as e:
+        log(f"ack: 读当前步骤失败 {e}")
+    _send_progress_message(rec.conv_id, rec.conv_type, mins, step=step, done=done)
 
 
 def _ack_worker(rec):
