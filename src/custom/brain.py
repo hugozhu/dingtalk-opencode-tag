@@ -23,6 +23,7 @@ transport / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败。错�
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -50,9 +51,15 @@ _FLASH_KEYWORDS = sorted(
     (k.strip().lower()
      for k in os.environ.get("AGENT_OPENCODE_FLASH_KEYWORDS",
                              "用flash模型,use flash model,用flash,/flash").split(",")
-     if k.strip()),
+      if k.strip()),
     key=len, reverse=True,
 )
+# AI 表格工作流等来源的消息会在词间混入 Unicode 空格（U+2002 en space 等）与零宽字符，
+# 触发词是子串匹配，不归一会漏判（2026-08-30 实测「use\u2002flash\u2002model」未命中）。
+# 归一只在触发词匹配前做：零宽字符删掉、Unicode 空白（space separator，不含普通空格/换行）
+# 压成普通空格。只动这些「视觉等价」字符，不碰 ASCII 空格/tab/换行，避免改写正文。
+_FLASH_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+_FLASH_WS_RE = re.compile(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]+")
 _OPENCODE_BIN = os.environ.get("AGENT_OPENCODE_BIN", "opencode")
 # 长程任务超时（#75）：活动感知，不再一刀切墙钟硬超时。serve 的 message POST 是同步阻塞
 # 请求，任务跑完才返回，其间 socket 无字节流动，旧的 urllib socket 超时 = 任务总时长上限，
@@ -354,9 +361,14 @@ def _pick_model(text):
 
     未配置 FLASH 模型 = 特性关闭：原样返回，**也不摘触发词**——否则关掉特性反而会让
     用户的原话被悄悄改写。
+
+    匹配前先把零宽字符删掉、Unicode 空白（U+2002 等）归一成普通空格，否则
+    AI 表格工作流发来的「use\u2002flash\u2002model」会漏判（见 _FLASH_WS_RE）。
     """
     if not _OPENCODE_MODEL_FLASH or not text:
         return _OPENCODE_MODEL, text
+    text = _FLASH_ZERO_WIDTH_RE.sub("", text)
+    text = _FLASH_WS_RE.sub(" ", text)
     found = _find_flash_trigger(text.lower())
     if not found:
         return _OPENCODE_MODEL, text
@@ -795,6 +807,94 @@ class _ServeTurnError(Exception):
     """
 
 
+# tool 名 → 人类可读的步骤短语（进度心跳用；未命中用原名）
+_TOOL_LABELS = {
+    "bash": "执行命令", "write": "写入文件", "read": "读取文件",
+    "edit": "编辑文件", "grep": "搜索", "glob": "查找文件",
+    "webfetch": "抓取网页", "todowrite": "更新任务清单",
+    "question": "提问", "task": "调度子任务", "skill": "调用技能",
+}
+
+
+def _classify_tool(tool):
+    return _TOOL_LABELS.get(tool, tool or "工具")
+
+
+def _extract_tool_context(tool, inp):
+    """从 tool.state.input 抽出简短上下文片段，让步骤描述从「调用执行命令」
+    升级为「执行命令：git pull…」。
+
+    输入缺失/空 → ""，不抛，调用方按原 label 回退。
+    """
+    if not isinstance(inp, dict):
+        return ""
+    if tool == "bash":
+        cmd = str(inp.get("command", "")).strip()
+        if not cmd:
+            return ""
+        # 取第一行（多行 shell 脚本只看头部）并截断到合理长度
+        first = cmd.split("\n")[0].strip()
+        return first[:48].rstrip() + ("…" if len(first) > 48 else "")
+    if tool in ("read", "write", "edit"):
+        path = inp.get("filePath") or inp.get("path") or ""
+        return os.path.basename(str(path)) if path else ""
+    if tool == "skill":
+        return str(inp.get("name") or inp.get("skill") or "")
+    if tool in ("grep", "glob"):
+        pat = inp.get("pattern") or inp.get("query") or ""
+        return str(pat)[:32] if pat else ""
+    if tool == "webfetch":
+        url = str(inp.get("url") or "")
+        # 只留域名部分，避免超长 URL 占满消息
+        import urllib.parse
+        host = urllib.parse.urlparse(url).netloc
+        return host[:40] if host else url[:40]
+    return ""
+
+
+def _describe_step(msgs):
+    """从 GET /message 的 msgs 里提取「agent 当前正在做什么」的简短描述。
+
+    取最后一条（进行中的 assistant）消息，从最新 part 往回找最近一个有信息量的：
+      - 进行中/刚发出 tool → 调用<工具>[：<具体内容>]（#121 context 增强）
+      - 刚完成的 tool → <工具>完成[：<具体内容>]
+      - 未完结或已产出文本的 reasoning → 思考中
+      - 非空 text part → 生成内容
+    都没有 → ""。
+
+    面向用户的中文短语，稳定不刷屏；仅供进度心跳展示，不影响活动指纹判定。
+    """
+    if not isinstance(msgs, list) or not msgs:
+        return ""
+    last = msgs[-1] or {}
+    if (last.get("info", {}) or {}).get("role", "assistant") != "assistant":
+        return ""
+    for p in reversed(last.get("parts", []) or []):
+        if not isinstance(p, dict):
+            continue
+        ptype = p.get("type")
+        if ptype == "tool":
+            tool_name = p.get("tool")
+            label = _classify_tool(tool_name)
+            state = p.get("state", {}) or {}
+            status = state.get("status") or ""
+            ctx = _extract_tool_context(tool_name, state.get("input") or {})
+            suffix = f"：{ctx}" if ctx else ""
+            if status == "completed":
+                return f"{label}完成{suffix}"
+            if status == "error":
+                return f"{label}出错{suffix}"
+            return f"调用{label}{suffix}"
+        if ptype == "reasoning":
+            t = p.get("time", {}) or {}
+            if not t.get("end") or p.get("text"):   # 进行中 或 已产出推理文本
+                return "思考中"
+            continue   # 已完结且无文本的空 reasoning，跳过
+        if ptype == "text" and str(p.get("text", "")).strip():
+            return "生成内容"
+    return ""
+
+
 def _activity_fingerprint(port, pwd, sid):
     """探测 session 当前活动指纹；变化=agent 仍在产出。
 
@@ -802,19 +902,21 @@ def _activity_fingerprint(port, pwd, sid):
     (消息数, part 数, 文本总长, 最后更新时刻)。任一维变化即视为有活动。
     GET 失败返回 None：watchdog 据此**不判卡死**（偏向保活，降低误杀）。
 
-    返回 (fingerprint, reasoning_in_progress)。
+    返回 (fingerprint, reasoning_in_progress, step_desc)。
     reasoning_in_progress=True 表示最后一条 assistant 消息里有一个 **还没结束的
     reasoning part**（type=reasoning 且 time 只有 start 无 end）。这类 part 在
     GET /message 里 text 恒为空、time.updated/completed 也不置位，纯靠指纹数值
     变化会把它误判成「无活动」——模型其实还在深度推理（qwen3-8-max 单段推理
     可长达数百秒）。watchdog 见到该标记即视为仍在产出，不空转 idle。
+    step_desc 是同一份 msgs 派生出的「当前步骤」短语（#121 进度心跳），给 ack 展示
+    用；不参与活动判定。
     """
     try:
         msgs = _serve_request("GET", port, pwd, f"/session/{sid}/message", timeout=6)
     except Exception:
         return None
     if not isinstance(msgs, list) or not msgs:
-        return (0, 0, 0, 0), False
+        return (0, 0, 0, 0), False, ""
     last = msgs[-1] or {}
     info = last.get("info", {}) or {}
     t = info.get("time", {}) or {}
@@ -825,7 +927,7 @@ def _activity_fingerprint(port, pwd, sid):
         isinstance(p, dict) and p.get("type") == "reasoning"
         and ((p.get("time") or {}).get("start") and not (p.get("time") or {}).get("end"))
         for p in parts)
-    return (len(msgs), len(parts), textlen, updated), reasoning_in_progress
+    return (len(msgs), len(parts), textlen, updated), reasoning_in_progress, _describe_step(msgs)
 
 
 def _message_errored(port, pwd, sid):
@@ -855,11 +957,13 @@ def _message_errored(port, pwd, sid):
     return textlen == 0
 
 
-def _start_watchdog(port, pwd, sid, done, aborted):
+def _start_watchdog(port, pwd, sid, done, aborted, conv_id=""):
     """启动活动感知 watchdog 线程（#75）。返回线程或 None（关闭时）。
 
     - done：主线程 POST 结束后 set，watchdog 随即退出（POST 快返回时 0 次 GET 探测）。
     - aborted：单元素 list，watchdog 触发 abort 时置 [True]，主线程据此抛 _IdleAbort。
+    - conv_id：非空时 watchdog 每轮把最新「当前步骤」写进 _inflight（#121），供 ack
+      进度心跳读取；为空则只做活动判定（不写步骤）。
     IDLE<=0 且 MAX<=0 视为完全关闭，不启 watchdog（回退无超时兜底）。
     """
     idle, mx, poll = _OPENCODE_IDLE_TIMEOUT, _OPENCODE_MAX_TIMEOUT, max(_OPENCODE_ACTIVITY_POLL, 1)
@@ -879,7 +983,11 @@ def _start_watchdog(port, pwd, sid, done, aborted):
             else:
                 fp = _activity_fingerprint(port, pwd, sid)
                 if fp is not None:
-                    fingerprint, reasoning_in_progress = fp
+                    fingerprint, reasoning_in_progress, step_desc = fp
+                    # #121：每轮刷新「当前步骤 + 已完成回合数」快照，进度心跳据此展示。
+                    # fingerprint[0] = len(msgs) = 已完成 assistant 回合数（即已完成的步骤数）
+                    if conv_id and (step_desc or fingerprint[0]):
+                        _set_inflight_progress(conv_id, sid, step_desc, done=fingerprint[0])
                     # 仍在产出（指纹变化）或正进行未完结的 reasoning part：刷新活跃时刻
                     if reasoning_in_progress or fingerprint != prev:
                         prev, last_active = fingerprint, now
@@ -925,7 +1033,47 @@ def _mark_inflight(conv_id, sid, port, pwd, title=""):
             "sid": sid, "port": port, "pwd": pwd,
             "title": title or (prev or {}).get("title", ""),
             "started": (prev or {}).get("started") or time.time(),
+            "step": (prev or {}).get("step", ""),
+            "done": (prev or {}).get("done", 0),
         }
+
+
+def _set_inflight_progress(conv_id, sid, step, done=0):
+    """watchdog 每轮把最新活动步骤和已完成步数写进在跑登记（#121 进度心跳）。
+
+    done = fingerprint[0] = GET /message 返回的 msgs 条数，代表已完成的 assistant 回合数。
+    仅当 conv 现在跑的确实还是这个 sid 才写，避免上一轮 session 的陈旧数据落到新一轮头上。
+    conv_id/sid 空则跳过；step 空时只更新 done（任务初期尚无步骤时仍想展示回合数）。
+    """
+    if not conv_id or not sid:
+        return
+    with _inflight_lock:
+        rec = _inflight.get(conv_id)
+        if rec and rec.get("sid") == sid:
+            if step:
+                rec["step"] = step
+            if done:
+                rec["done"] = done
+
+
+def current_work_progress(conv_id):
+    """取该 conv 当前正在跑的 (step, done) 快照（#121 ack 进度心跳读）。
+
+    step: 当前步骤短语（"调用执行命令：git pull…"、"思考中" 等），无时为 ""。
+    done: 已完成 assistant 回合数（fingerprint[0] = msgs 长度），无时为 0。
+    无在跑任务 → ("", 0)。只读登记表，不发 GET。
+    """
+    if not conv_id:
+        return "", 0
+    with _inflight_lock:
+        rec = _inflight.get(conv_id) or {}
+        return rec.get("step", ""), rec.get("done", 0)
+
+
+def current_work_step(conv_id):
+    """向后兼容包装，返回 step 字符串。新代码用 current_work_progress。"""
+    step, _ = current_work_progress(conv_id)
+    return step
 
 
 def _clear_inflight(conv_id, sid=None):
@@ -966,17 +1114,18 @@ def cancel_inflight(conv_id):
     return True
 
 
-def _post_message(port, pwd, sid, prompt, provider, model_id):
+def _post_message(port, pwd, sid, prompt, provider, model_id, conv_id=""):
     """向 session 发一条 message，拼接 text parts 返回回复文本和统计信息。
 
     返回 (reply_text, usage_dict)，usage_dict 包含 input/output/reasoning/cache tokens。
 
     活动感知超时（#75）：POST socket 超时放大到 MAX 兜底，外挂 watchdog 轮询 session 活动；
     只要仍在产出就不 abort。watchdog 触发 abort → 抛 _IdleAbort（上层判 failed，不回退 CLI）。
+    conv_id 非空时传给 watchdog，让它每轮把「当前步骤」写进 _inflight（#121）。
     """
     done = threading.Event()
     aborted = [False]
-    wd = _start_watchdog(port, pwd, sid, done, aborted)
+    wd = _start_watchdog(port, pwd, sid, done, aborted, conv_id=conv_id)
     try:
         d = _serve_request(
             "POST", port, pwd, f"/session/{sid}/message",
@@ -1096,7 +1245,7 @@ def _http_oneshot(port, pwd, prompt, ctx, model=None):
         sid = _create_session(port, pwd, title)
         _register_textreply_sid(sid, ctx)
         _mark_inflight(conv_id, sid, port, pwd, title)
-        reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+        reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id=conv_id)
         _oc_log("http", model, time.time() - t0, prompt, reply, True, sess="oneshot")
         _stash_task_stats(conv_id, usage, time.time() - t0)
         if model != _OPENCODE_MODEL:
@@ -1133,7 +1282,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx, model=None):
             _register_textreply_sid(sid, ctx)   # 刷新 conv ctx（回程路由用最新来源）
             _mark_inflight(conv_id, sid, port, pwd, title)
             try:
-                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id=conv_id)
             except urllib.error.HTTPError as he:
                 # 复用的 session 已被 serve 清（重启/GC）→ 丢记录、重建一次重试
                 if reused and he.code == 404:
@@ -1142,7 +1291,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx, model=None):
                     sid = _create_session(port, pwd, title)
                     _register_textreply_sid(sid, ctx)
                     _mark_inflight(conv_id, sid, port, pwd, title)
-                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id=conv_id)
                     reused = False  # 重建了，视为新会话
                 else:
                     raise
@@ -1156,7 +1305,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx, model=None):
                     sid = _create_session(port, pwd, title)
                     _register_textreply_sid(sid, ctx)
                     _mark_inflight(conv_id, sid, port, pwd, title)
-                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                    reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id=conv_id)
                     reused = False
                 else:
                     raise
@@ -1169,7 +1318,7 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx, model=None):
                 sid = _create_session(port, pwd, title)
                 _register_textreply_sid(sid, ctx)
                 _mark_inflight(conv_id, sid, port, pwd, title)
-                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id)
+                reply, usage = _post_message(port, pwd, sid, prompt, provider, model_id, conv_id=conv_id)
                 reused = False  # 重建了，按新会话登记（下面 is_new=True）
             # 成功：登记/刷新 last，处理 LRU 逐出（删被挤掉会话的远端 session）
             for _cid, _sid in _remember_sid(conv_id, sid, is_new=(not reused)):

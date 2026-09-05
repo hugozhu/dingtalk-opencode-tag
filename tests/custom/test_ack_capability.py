@@ -646,6 +646,73 @@ class TestProgressHeartbeat(unittest.TestCase):
         self.assertEqual(fired, [], "send_notice 不应广播 reply-sent")
 
 
+class TestProgressMessageStep(unittest.TestCase):
+    """#121 长任务进度消息带「已完成步数 + 当前步骤」：done>0 拼 done 前缀，step 非空拼步骤前缀，空则纯耗时。"""
+
+    def _notice(self):
+        notices = []
+        p = patch("custom.replier.send_notice",
+                  lambda cid, ct, text: notices.append((cid, ct, text)))
+        return notices, p
+
+    def test_step_prepended_when_present(self):
+        notices, p = self._notice()
+        with p, patch.object(ack, "_PROGRESS_MESSAGE", True), \
+             patch.object(ack, "_PROGRESS_MSG", "⏳ 已耗时 {mins} 分钟"), \
+             patch.object(ack, "_PROGRESS_MSG_STEP", "当前正在：{step}，"), \
+             patch.object(ack, "_PROGRESS_MSG_DONE", ""):
+            ack._send_progress_message("cH==", "1", 5, step="调用执行命令")
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0][0], "cH==")
+        self.assertIn("当前正在：调用执行命令", notices[0][2])
+        self.assertIn("⏳ 已耗时 5 分钟", notices[0][2])
+
+    def test_no_prefix_when_step_empty(self):
+        notices, p = self._notice()
+        with p, patch.object(ack, "_PROGRESS_MESSAGE", True), \
+             patch.object(ack, "_PROGRESS_MSG", "⏳ 已耗时 {mins} 分钟"), \
+             patch.object(ack, "_PROGRESS_MSG_STEP", "当前正在：{step}，"), \
+             patch.object(ack, "_PROGRESS_MSG_DONE", ""):
+            ack._send_progress_message("cH==", "1", 5, step="")
+        self.assertEqual(len(notices), 1)
+        self.assertNotIn("当前正在", notices[0][2])
+        self.assertEqual(notices[0][2], "⏳ 已耗时 5 分钟")
+
+    def test_step_stripped_when_disabled(self):
+        # 模拟生产：`_PROGRESS_MSG_STEP` 置空 → 即使给了 step 也不拼前缀
+        notices, p = self._notice()
+        with p, patch.object(ack, "_PROGRESS_MESSAGE", True), \
+             patch.object(ack, "_PROGRESS_MSG", "⏳ {mins}"), \
+             patch.object(ack, "_PROGRESS_MSG_STEP", ""), \
+             patch.object(ack, "_PROGRESS_MSG_DONE", ""):
+            ack._send_progress_message("cH==", "1", 5, step="写入文件完成")
+        self.assertEqual(notices[0][2], "⏳ 5")
+
+    def test_done_prepended_when_positive(self):
+        # done>0 → 最前面拼「已完成 N 步，」；step 也有时两者都拼
+        notices, p = self._notice()
+        with p, patch.object(ack, "_PROGRESS_MESSAGE", True), \
+             patch.object(ack, "_PROGRESS_MSG", "⏳ {mins} 分钟"), \
+             patch.object(ack, "_PROGRESS_MSG_STEP", "当前正在：{step}，"), \
+             patch.object(ack, "_PROGRESS_MSG_DONE", "已完成 {done} 步，"):
+            ack._send_progress_message("cH==", "1", 10, step="执行命令：git pull", done=12)
+        self.assertEqual(len(notices), 1)
+        text = notices[0][2]
+        self.assertTrue(text.startswith("已完成 12 步，"), f"期望 done 最前；实际：{text!r}")
+        self.assertIn("当前正在：执行命令：git pull", text)
+        self.assertIn("⏳ 10 分钟", text)
+
+    def test_done_zero_not_prepended(self):
+        # done=0 时不加 done 前缀
+        notices, p = self._notice()
+        with p, patch.object(ack, "_PROGRESS_MESSAGE", True), \
+             patch.object(ack, "_PROGRESS_MSG", "⏳ {mins}"), \
+             patch.object(ack, "_PROGRESS_MSG_STEP", ""), \
+             patch.object(ack, "_PROGRESS_MSG_DONE", "已完成 {done} 步，"):
+            ack._send_progress_message("cH==", "1", 5, done=0)
+        self.assertNotIn("已完成", notices[0][2])
+
+
 class TestDispatchReplySent(unittest.TestCase):
     def test_dispatch_calls_on_reply_sent(self):
         import core.capabilities as C
