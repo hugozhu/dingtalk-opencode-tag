@@ -801,20 +801,31 @@ def _activity_fingerprint(port, pwd, sid):
     读 GET /session/{sid}/message，取最后一条（进行中的 assistant）消息的
     (消息数, part 数, 文本总长, 最后更新时刻)。任一维变化即视为有活动。
     GET 失败返回 None：watchdog 据此**不判卡死**（偏向保活，降低误杀）。
+
+    返回 (fingerprint, reasoning_in_progress)。
+    reasoning_in_progress=True 表示最后一条 assistant 消息里有一个 **还没结束的
+    reasoning part**（type=reasoning 且 time 只有 start 无 end）。这类 part 在
+    GET /message 里 text 恒为空、time.updated/completed 也不置位，纯靠指纹数值
+    变化会把它误判成「无活动」——模型其实还在深度推理（qwen3-8-max 单段推理
+    可长达数百秒）。watchdog 见到该标记即视为仍在产出，不空转 idle。
     """
     try:
         msgs = _serve_request("GET", port, pwd, f"/session/{sid}/message", timeout=6)
     except Exception:
         return None
     if not isinstance(msgs, list) or not msgs:
-        return (0, 0, 0, 0)
+        return (0, 0, 0, 0), False
     last = msgs[-1] or {}
     info = last.get("info", {}) or {}
     t = info.get("time", {}) or {}
     updated = t.get("updated") or t.get("completed") or 0
     parts = last.get("parts", []) or []
     textlen = sum(len(p.get("text", "")) for p in parts if isinstance(p, dict))
-    return (len(msgs), len(parts), textlen, updated)
+    reasoning_in_progress = any(
+        isinstance(p, dict) and p.get("type") == "reasoning"
+        and ((p.get("time") or {}).get("start") and not (p.get("time") or {}).get("end"))
+        for p in parts)
+    return (len(msgs), len(parts), textlen, updated), reasoning_in_progress
 
 
 def _message_errored(port, pwd, sid):
@@ -867,9 +878,12 @@ def _start_watchdog(port, pwd, sid, done, aborted):
                 reason = f"总时长 {int(now - start)}s(>{mx}s) 超上限"
             else:
                 fp = _activity_fingerprint(port, pwd, sid)
-                if fp is not None and fp != prev:
-                    prev, last_active = fp, now       # 仍在产出：刷新活跃时刻，不空闲超时
-                    continue
+                if fp is not None:
+                    fingerprint, reasoning_in_progress = fp
+                    # 仍在产出（指纹变化）或正进行未完结的 reasoning part：刷新活跃时刻
+                    if reasoning_in_progress or fingerprint != prev:
+                        prev, last_active = fingerprint, now
+                        continue
                 # 活动已停：若回合终态但坏（error/completed-空），立即 abort，不干等满 idle
                 if _OPENCODE_ERROR_ABORT and _message_errored(port, pwd, sid):
                     reason = "助手消息 completed-with-error/空"

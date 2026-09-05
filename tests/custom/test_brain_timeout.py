@@ -28,7 +28,7 @@ if SRC_DIR not in sys.path:
 
 from custom import brain
 from core import inbound
-from core.brain import STATUS_FAILED
+from core.brain import STATUS_FAILED, STATUS_OK
 
 import tempfile
 brain._OPENCODE_LOG = os.path.join(tempfile.gettempdir(), "opencode_test.log")
@@ -40,11 +40,22 @@ def _msg_list(textlen, updated):
              "parts": [{"type": "text", "text": "x" * textlen}]}]
 
 
+def _reasoning_msg(textlen, updated, reasoning_start=1000):
+    """含一个**未完结 reasoning part** 的 assistant 消息（time 只有 start 无 end）。
+
+    模拟 qwen3-8-max 长时间纯推理：GET 探测期间 part.text 恒为空、
+    time.end 不置位，真实日志里指纹因此完全静止。"""
+    return [{"info": {"time": {"updated": updated}},
+             "parts": [{"type": "text", "text": "x" * textlen},
+                       {"type": "reasoning", "text": "",
+                        "time": {"start": reasoning_start}}]}]
+
+
 class _FakeServe:
     """可配置的假 serve。POST message 阻塞直到 unblock 事件；GET 返回可变/静止指纹。"""
 
     def __init__(self, *, activity="static", block=True, reply="done"):
-        self.activity = activity          # "static" | "growing"
+        self.activity = activity          # "static" | "growing" | "reasoning"
         self.block = block                # POST message 是否阻塞到 unblock
         self.reply = reply
         self.unblock = threading.Event()  # 由 abort 或测试主动 set 解阻塞
@@ -67,6 +78,9 @@ class _FakeServe:
                 self._tick += 1
             if self.activity == "growing":
                 return _msg_list(10 * self._tick, 1000 + self._tick)
+            if self.activity == "reasoning":
+                # 指纹数值静止，但带一个未完结 reasoning part
+                return _reasoning_msg(10, 1000, reasoning_start=1000)
             return _msg_list(10, 1000)    # static
         if method == "POST" and path.endswith("/message"):
             if self.block:
@@ -117,6 +131,40 @@ class TestActivityAwareTimeout(unittest.TestCase):
         self.assertEqual(status, STATUS_FAILED)
         self.assertTrue(any(p.endswith("/abort") for _, p in fake.calls), "应触发 abort")
         cli.assert_not_called()
+
+    def test_reasoning_in_progress_not_killed(self):
+        """指纹数值静止但带未完结 reasoning part → 视为仍在产出，不 idle abort。"""
+        fake = _FakeServe(activity="reasoning", block=True)
+        threading.Timer(0.25, fake.unblock.set).start()   # 模拟推理阶段结束后任务完成
+        reply, status, cli = self._run(
+            fake, _OPENCODE_IDLE_TIMEOUT=1, _OPENCODE_ACTIVITY_POLL=1)
+        self.assertEqual(reply, "done")
+        self.assertEqual(status, STATUS_OK)                 # 未 abort
+        self.assertNotIn(("POST", "/session/ses_1/abort"), fake.calls)
+        cli.assert_not_called()
+
+    def test_activity_fingerprint_reasoning_flag(self):
+        """_activity_fingerprint 正确识别未完结 reasoning part，并给出静止指纹。"""
+        def resp(msgs):
+            return lambda method, port, pwd, path, body=None, timeout=8: msgs
+        # 未完结 reasoning（time 只有 start 无 end）→ (指纹, True)
+        with patch.object(brain, "_serve_request",
+                          side_effect=resp(_reasoning_msg(10, 1000, reasoning_start=123))):
+            fp, reasoning = brain._activity_fingerprint(4096, "pw", "s")
+        self.assertTrue(reasoning)
+        self.assertEqual(fp, (1, 2, 10, 1000))       # 指纹数值静止（2 个 part：text+reasoning）
+        # 已完结 reasoning（time.end 已置）→ 不算进行中 → (指纹, False)
+        with patch.object(brain, "_serve_request",
+                          side_effect=resp([{"info": {"time": {"completed": 5}},
+                                             "parts": [
+                                                 {"type": "reasoning", "text": "ok",
+                                                  "time": {"start": 1, "end": 2}}]}])):
+            fp, reasoning = brain._activity_fingerprint(4096, "pw", "s")
+        self.assertFalse(reasoning)
+        self.assertEqual(fp, (1, 1, 2, 5))           # reasoning text 计入 textlen
+        # GET 失败 → None（偏保活）
+        with patch.object(brain, "_serve_request", side_effect=RuntimeError("boom")):
+            self.assertIsNone(brain._activity_fingerprint(4096, "pw", "s"))
 
     def test_max_timeout_abort_even_with_activity(self):
         """持续有活动但超 MAX → 仍 abort。"""
