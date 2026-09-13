@@ -188,6 +188,29 @@ class TestPickModel(unittest.TestCase):
         self.assertEqual(model, _DEFAULT)
         self.assertEqual(cleaned, "/flash")
 
+    def test_unicode_space_trigger(self):
+        """AI 表格工作流消息词间是 U+2002 en space：归一后仍要命中（2026-08-30 线上漏判）。"""
+        model, cleaned = self._pick("use\u2002flash\u2002model 抓数据")
+        self.assertEqual(model, _FLASH)
+        self.assertEqual(cleaned, "抓数据")
+
+    def test_zero_width_joiner_in_trigger(self):
+        """零宽字符（U+200D 等）混进触发词也要命中。"""
+        model, cleaned = self._pick("use flash\u200d model 抓数据")
+        self.assertEqual(model, _FLASH)
+        self.assertEqual(cleaned, "抓数据")
+
+    def test_nbsp_trigger(self):
+        model, cleaned = self._pick("用flash模型\u00a0打开浏览器")
+        self.assertEqual(model, _FLASH)
+        self.assertEqual(cleaned, "打开浏览器")
+
+    def test_unicode_space_miss_still_normalized(self):
+        """未命中触发词时不改模型；归一只动视觉等价字符，正文可见内容不变。"""
+        model, cleaned = self._pick("帮我\u2002总结一下")
+        self.assertEqual(model, _DEFAULT)
+        self.assertEqual(cleaned, "帮我 总结一下")
+
 
 class TestHttpPath(unittest.TestCase):
     """HTTP 主路径：POST body 里带的模型与 prompt。"""

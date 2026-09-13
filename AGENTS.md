@@ -220,6 +220,10 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 数字员工收到自动化事件推送（监控告警、数据推送、安全封禁等）时，按 [docs/EVENT_HANDLING_POLICY.md](./docs/EVENT_HANDLING_POLICY.md) 执行分类过滤与升级策略。核心：默认静默，SSH 封禁永久忽略，监控连续 ≥6h 升级，价格异常波动（≥5%）立即告警。
 
+**判定前必须先读状态文件续算**（历史上三次「跟踪断档」都源于跳过这一步、用「单次未达 6h」当理由）：
+- 监控告警（watchdog 重启 / 代理失败 / exit-node 重置等）→ 读 [docs/alert_state.md](./docs/alert_state.md)，按「同设备+同服务」既有跟踪行与冷却线续算；冷却已过 → 下次报警即升级。
+- 行情数据推送（黄金 / BTC / 股价）→ 读 [docs/price_state.md](./docs/price_state.md) 取上次基线算环比，并把本次数值追加回该表（黄金用「国内 元/克」、BTC 用「美元/枚」，推送自带的人民币折算不可作阈值判据）。
+
 ## 指令约定：「存入notes」
 
 用户（hugozhu）发送「存入notes」时，把**最近一条消息**的内容（链接则抓取正文、文本则原文）存入**钉钉知识库 wiki**，而不是本地/第三方 notepad：
@@ -227,6 +231,10 @@ systemctl --user start dingtalk-agent.service     # 启动
 - 目标空间：`hugozhu的知识库`（workspaceId=`r98znONN9JrLXLxn`），`notes` 文件夹（nodeId=`XPwkYGxZV3eG6jaAF9OD1E168AgozOKL`）
 - 必须用 hugozhu 本人 profile `dinga626d60c1128d449:0420506555`（数字员工 profile 无该 wiki 权限）
 - 流程：抓取正文 → 清洗（去微信/网页噪声）→ `dws doc create --workspace r98znONN9JrLXLxn --folder XPwkYGxZV3eG6jaAF9OD1E168AgozOKL --name "<标题>" --content-file <tmp.md>` → `dws doc read` 回读验证 → 回复 docUrl
+
+## 公众号画像（Agent 记忆）
+
+回答公众号人群/流量/选题相关问题、或为公众号写内容前，先读 [docs/wechat-mp-audience-profile.md](./docs/wechat-mp-audience-profile.md)（2026-08-31 快照：人群属性 + 地域 + 流量来源结构 + 内容策略含义）。数据过期时重新抓取公众号后台数据并更新该文件。
 
 ## 不要做的事
 
