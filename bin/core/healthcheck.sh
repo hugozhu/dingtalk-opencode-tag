@@ -50,8 +50,9 @@ COMPONENT_NAME="healthcheck"
 # 数据源是 brain._oc_log 的 ok=False 行（失败恒记，不受 AGENT_DEBUG 开关影响）。
 : "${AGENT_OPENCODE_LOG:=$SCRIPT_DIR/opencode.log}"
 : "${BRAIN_FAIL_OFFSET_FILE:=$SCRIPT_DIR/.opencode-log.offset}"
+: "${BRAIN_PENDING_FILE:=$SCRIPT_DIR/.brain-fail.pending}"
 : "${HEALTHCHECK_BRAIN_CHECK_ENABLED:=1}"
-: "${HEALTHCHECK_BRAIN_FAIL_THRESHOLD:=3}"
+: "${HEALTHCHECK_BRAIN_FAIL_THRESHOLD:=2}"
 : "${HEALTHCHECK_BRAIN_PROBE_TIMEOUT:=60}"
 
 # 匹配 _oc_log 的失败行。**必须锚定行首**：AGENT_DEBUG=1 时同一文件里还混着
@@ -153,27 +154,40 @@ check_serve_http() {
 # 为什么需要它：检查 5/6 只能证明「serve 进程在」「HTTP 监听器会应答」——都不碰模型。
 # 2026-08-08 大脑与模型网关失联 16 分钟，这两项全程 OK，任何请求都答不出来。
 #
-# 触发式设计：只有当「距上次检查以来」新增的失败条数 ≥ 阈值时，才真发一次模型调用。
-# 健康时一次请求都不发（零 token），坏了则在一个检查周期内就能被抓到。
+# 触发式设计：只有当「未消失败」（本次窗口新增 + 上次探针通过后攒下的，存
+# BRAIN_PENDING_FILE）≥ 阈值时，才真发一次模型调用，健康时一次请求都不发（零 token）。
+#
+# 为什么必须**跨窗口累计**而不是单窗口计数：低频部署（单聊几小时一条消息）一条消息
+# 彻底失败只记 2 条 ok=False（http + cli 回退各一），旧「单窗口条数 ≥ 3」语义在每个
+# 检查窗口里最多看到 2 条、阈值永远凑不满——2026-09-17 网关间歇不可达 7 小时，9 条
+# 消息全失败（18 行），探针一次没触发，healthcheck 全程每 5 分钟报「健康」。
+# 失败证据只被「探针通过」消费（清零），不被时间流逝消费；探针 FAIL/WARN 时证据
+# 保留，下个周期 total 仍 ≥ 阈值 → 继续探。默认阈值 2 = 一条消息彻底失败（两行）
+# 立刻探针；被 CLI 回退救回的瞬时抖动只记 1 行，攒到第二次才探，不误报。
 check_brain() {
     case "$HEALTHCHECK_BRAIN_CHECK_ENABLED" in
         1|true|yes|on) ;;
         *) echo "SKIP: 未启用"; return ;;
     esac
 
-    local out n
+    local out n pending total
     out=$(count_new_matches "$AGENT_OPENCODE_LOG" "$BRAIN_FAIL_OFFSET_FILE" \
                             "$_BRAIN_FAIL_PATTERN" "$consume")
     n=$(echo "$out" | awk '{print $3}')
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    pending=$(cat "$BRAIN_PENDING_FILE" 2>/dev/null || echo 0)
+    [[ "$pending" =~ ^[0-9]+$ ]] || pending=0
+    total=$((pending + n))
 
-    if [[ "$n" -lt "$HEALTHCHECK_BRAIN_FAIL_THRESHOLD" ]]; then
-        echo "OK: 新增失败 ${n}(<${HEALTHCHECK_BRAIN_FAIL_THRESHOLD})"
+    if [[ "$total" -lt "$HEALTHCHECK_BRAIN_FAIL_THRESHOLD" ]]; then
+        echo "OK: 未消失败 ${total}(<${HEALTHCHECK_BRAIN_FAIL_THRESHOLD})"
+        if [[ -n "$consume" ]]; then echo "$total" > "$BRAIN_PENDING_FILE"; fi
         return
     fi
 
     if ! declare -F brain_probe >/dev/null 2>&1; then
-        echo "WARN: 新增失败 ${n} 但未实现 brain_probe 探针"
+        echo "WARN: 未消失败 ${total} 但未实现 brain_probe 探针"
+        if [[ -n "$consume" ]]; then echo "$total" > "$BRAIN_PENDING_FILE"; fi
         return
     fi
 
@@ -181,18 +195,27 @@ check_brain() {
     # 「探针挂了」和「大脑挂了」不能混为一谈，所以宁可多包一层。
     # 把本脚本已解析出的 port/pwd 传下去：否则探针会自己再发现一遍凭据，两边可能指向
     # **不同的 serve 实例**，出现「serve_http 说不通、探针说通」这种自相矛盾的裁决。
-    local rc probe_out
+    # `|| rc=$?` 防 set -e：探针非零退出时裸的 var=$(cmd) 会当场杀掉整个脚本，
+    # FAIL 文案和下面的累计状态持久化全被跳过，只剩一个裸退出码。
+    local rc=0 probe_out=""
     probe_out=$(AGENT_PROBE_PORT="$(cat "$SERVE_PORT_FILE" 2>/dev/null || echo "")" \
                 AGENT_PROBE_PWD="$(cat "$SERVE_PWD_FILE" 2>/dev/null || echo "")" \
-                run_with_timeout "$((HEALTHCHECK_BRAIN_PROBE_TIMEOUT + 15))" brain_probe 2>&1)
-    rc=$?
+                run_with_timeout "$((HEALTHCHECK_BRAIN_PROBE_TIMEOUT + 15))" brain_probe 2>&1) || rc=$?
     case "$rc" in
-        0) echo "OK: 探针通过 (新增失败 ${n})" ;;
-        # 无凭据不硬失败：那是 check_serve_http 的地盘，同一个根因报两次只会让消息更难读
+        0) echo "OK: 探针通过 (未消失败 ${total})" ;;
+        # 无凭据不硬失败：那是 check_serve_http 的地盘，同一个根因报两次只会让消息更难读。
+        # 失败证据保留，凭据恢复后自动补探。
         2) echo "WARN: 探针无法运行（serve 凭据缺失，见 serve_http）" ;;
-        124) echo "FAIL: 大脑自检超时 (新增失败 ${n})" ;;
-        *) echo "FAIL: 大脑自检失败 (新增失败 ${n}, $(printf '%s' "$probe_out" | tail -1 | cut -c1-80))" ;;
+        124) echo "FAIL: 大脑自检超时 (未消失败 ${total})" ;;
+        *) echo "FAIL: 大脑自检失败 (未消失败 ${total}, $(printf '%s' "$probe_out" | tail -1 | cut -c1-80))" ;;
     esac
+    # 失败证据只有探针通过才清零（上面 rc=0 分支之外都原样保留）。**FAIL 也必须持久化**：
+    # 本窗口的 offset 已被 count_new_matches 消费，不写回的话下个周期 total 回落 < 阈值，
+    # 大脑还挂着 healthcheck 却报 OK，熔断的连续失败计数会被搅成 OK/FAIL 交替。
+    if [[ -n "$consume" ]]; then
+        if [[ "$rc" == "0" ]]; then echo 0 > "$BRAIN_PENDING_FILE"
+        else echo "$total" > "$BRAIN_PENDING_FILE"; fi
+    fi
 }
 
 # 是否消费「距上次检查以来」的计数窗口（--consume）。**默认 peek 不写状态**：

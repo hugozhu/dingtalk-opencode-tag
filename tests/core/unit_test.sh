@@ -267,6 +267,52 @@ assert_eq "日志不存在时返回 0 且不报错" "0" \
     "$(count_new_matches /nonexistent/nope.log "$CNT_OFF" "$_BP" | awk '{print $3}')"
 rm -f "$CNT_LOG" "$CNT_OFF"
 
+echo ""
+echo "Testing 大脑自检跨窗口累计（check_brain）..."
+
+# 提取 check_brain 单个函数做隔离测试——healthcheck.sh 顶层有 main "$@"，不能整文件 source
+eval "$(sed -n '/^check_brain()/,/^}$/p' "$SCRIPT_DIR/bin/core/healthcheck.sh")"
+
+CB_LOG=$(mktemp); CB_OFF="$CB_LOG.off"; CB_PEND="$CB_LOG.pend"
+rm -f "$CB_OFF" "$CB_PEND"
+_cb_fail() { printf '[2026-09-17 03:01:46] transport=http model=m elapsed=65s prompt_len=1 reply_len=0 ok=False err=x\n' >> "$CB_LOG"; }
+CB_PROBE_RC=0
+brain_probe() { return "$CB_PROBE_RC"; }
+AGENT_OPENCODE_LOG="$CB_LOG"
+BRAIN_FAIL_OFFSET_FILE="$CB_OFF"
+BRAIN_PENDING_FILE="$CB_PEND"
+HEALTHCHECK_BRAIN_CHECK_ENABLED=1
+HEALTHCHECK_BRAIN_FAIL_THRESHOLD=2
+HEALTHCHECK_BRAIN_PROBE_TIMEOUT=1
+SERVE_PORT_FILE=""
+SERVE_PWD_FILE=""
+
+consume=1
+assert_eq "首次运行建基线（0 失败 0 累计）" "OK: 未消失败 0(<2)" "$(check_brain)"
+_cb_fail
+assert_eq "单条失败（CLI 回退救回的瞬时抖动）未达阈值不探针" "OK: 未消失败 1(<2)" "$(check_brain)"
+assert_eq "无新增时失败证据跨窗口保留（2026-09-17 事故根因）" "OK: 未消失败 1(<2)" "$(check_brain)"
+_cb_fail
+assert_eq "累计达阈值触发探针（探针通过）" "OK: 探针通过 (未消失败 2)" "$(check_brain)"
+assert_eq "探针通过清零未消失败" "0" "$(cat "$CB_PEND")"
+assert_eq "清零后无新增归零" "OK: 未消失败 0(<2)" "$(check_brain)"
+
+_cb_fail; _cb_fail
+CB_PROBE_RC=1
+assert_eq "探针失败报 FAIL" "FAIL: 大脑自检失败 (未消失败 2, )" "$(check_brain)"
+assert_eq "探针失败保留失败证据（不摁下熔断连续计数）" "2" "$(cat "$CB_PEND")"
+CB_PROBE_RC=0
+assert_eq "证据保留使下个周期继续探针" "OK: 探针通过 (未消失败 2)" "$(check_brain)"
+
+_cb_fail
+echo 1 > "$CB_PEND"    # 模拟上一周期攒下 1 条未消失败
+consume=""
+CB_PEEK_OUT=$(check_brain)
+assert_eq "peek 也按累计值裁决（1 攒 + 1 新 = 2 ≥ 阈值）" "OK: 探针通过 (未消失败 2)" "$CB_PEEK_OUT"
+assert_eq "peek 不消费累计状态（startup_report/e2e 门禁只看不改）" "1" "$(cat "$CB_PEND")"
+consume=1
+rm -f "$CB_LOG" "$CB_OFF" "$CB_PEND"
+
 assert_eq "brain 检查已接进硬失败判定列表" "0" \
     "$(grep -q '"brain|\$r_brain"' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
 assert_eq "healthcheck 支持 --consume" "0" \
@@ -275,6 +321,10 @@ assert_eq "monitor 守护循环传 --consume" "0" \
     "$(grep -q 'healthcheck.sh" --consume' "$SCRIPT_DIR/bin/core/monitor.sh" && echo 0 || echo 1)"
 assert_eq "offset 文件登记进可清理状态表" "0" \
     "$(grep -q '.opencode-log.offset' "$SCRIPT_DIR/bin/core/lib.sh" && echo 0 || echo 1)"
+assert_eq "brain 失败累计文件登记进可清理状态表" "0" \
+    "$(grep -q '.brain-fail.pending' "$SCRIPT_DIR/bin/core/lib.sh" && echo 0 || echo 1)"
+assert_eq "check_brain 持久化累计状态（跨窗口累计修复）" "0" \
+    "$(grep -q 'BRAIN_PENDING_FILE' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
 assert_eq "brain_probe.py 语法正确" "0" \
     "$(python3 -m py_compile "$SCRIPT_DIR/bin/custom/brain_probe.py" 2>&1; echo $?)"
 

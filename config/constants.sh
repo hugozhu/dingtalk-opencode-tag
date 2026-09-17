@@ -32,12 +32,14 @@ export HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-120}"  # monitor 包裹单次
 export HEALTHCHECK_HTTP_TIMEOUT="${HEALTHCHECK_HTTP_TIMEOUT:-8}"  # check_serve_http 的 curl
 
 # 大脑真实自检（检查7）。进程活着 + HTTP 200 **不等于**大脑活着——前两者都不碰模型。
-# 触发式：每次健康检查统计 $AGENT_OPENCODE_LOG 里「距上次检查以来」新增的 ok=False 条数，
-# ≥ 阈值才真发一次模型调用（"1+1"）。失败即硬失败 → monitor 重启 serve；
-# 连续 MAX_FAILURES 次 → 熔断告警。零失败时不发任何请求 → 稳态零 token 成本。
-# 注：一次失败的对话可能记两条（HTTP 一条 + CLI 回退一条），故阈值 3 约等于 2 轮失败。
+# 触发式：每次健康检查把 $AGENT_OPENCODE_LOG 新增的 ok=False 条数**跨窗口累计**进
+# .brain-fail.pending（只在探针真发一次模型调用"1+1"且通过时清零），累计 ≥ 阈值才发
+# 探针。失败即硬失败 → monitor 重启 serve；连续 MAX_FAILURES 次 → 熔断告警。
+# 零失败时不发任何请求 → 稳态零 token 成本。
+# 阈值单位是「未消失败行数」：一条消息彻底失败记 2 条（HTTP + CLI 回退各一），默认 2
+# 即「一条消息真失败了立刻探针」；被 CLI 回退救回的瞬时抖动只记 1 条，不会立刻触发。
 export HEALTHCHECK_BRAIN_CHECK_ENABLED="${HEALTHCHECK_BRAIN_CHECK_ENABLED:-1}"
-export HEALTHCHECK_BRAIN_FAIL_THRESHOLD="${HEALTHCHECK_BRAIN_FAIL_THRESHOLD:-3}"
+export HEALTHCHECK_BRAIN_FAIL_THRESHOLD="${HEALTHCHECK_BRAIN_FAIL_THRESHOLD:-2}"
 export HEALTHCHECK_BRAIN_PROBE_TIMEOUT="${HEALTHCHECK_BRAIN_PROBE_TIMEOUT:-60}"
 export KICKSTART_RETRY_INTERVAL="${KICKSTART_RETRY_INTERVAL:-10}"
 export LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.example.agent-connect}"

@@ -191,10 +191,11 @@ HARNESS_COMP_PATTERNS=("agent-serve" "agent-connect.*--unified-app-id" "event_wa
 
 # monitor 自身的运行时状态文件（reboot 清理时用）
 HARNESS_MONITOR_LOCK="${LOCK_FILE:-/tmp/agent-monitor.lock}"
-# .opencode-log.offset 必须在这张表里：stop/reboot 时删掉它，下次启动才会以当前日志大小
-# 重新建基线；否则重启后会把停机前积压的失败当成"刚刚新增的"，一起步就误判为大脑坏了。
+# .opencode-log.offset / .brain-fail.pending 必须在这张表里：stop/reboot 时删掉它们，
+# 下次启动才会以当前日志大小重新建基线 / 失败证据从零累计；否则重启后会把停机前
+# 积压的失败当成"刚刚新增的"，一起步就误判为大脑坏了。
 # .ext-sessions 同理 —— 探针崩溃留下的残留 sid 要能被清掉。
-HARNESS_EXTRA_STATE_BASENAMES=(".next-check" ".serve.port" ".serve.pwd" ".opencode-connect-status.json" ".opencode-log.offset" ".ext-sessions")
+HARNESS_EXTRA_STATE_BASENAMES=(".next-check" ".serve.port" ".serve.pwd" ".opencode-connect-status.json" ".opencode-log.offset" ".brain-fail.pending" ".ext-sessions")
 
 # ---------------------------------------------------------------------------
 # 服务控制共享函数 — start.sh / stop.sh / reboot.sh 共享逻辑，避免重复
