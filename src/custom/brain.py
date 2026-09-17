@@ -415,6 +415,63 @@ def _update_flash_stats(conv_id, input_tokens=0, output_tokens=0):
             rec["flash_output_tokens"] = rec.get("flash_output_tokens", 0) + (output_tokens or 0)
 
 
+def _collect_subagent_flash_usage(port, pwd, sid, conv_id, since_ts):
+    """把本轮内子代理（Task 委派，#123 flash-worker）跑掉的 flash 用量补记进统计。
+
+    skill 委派路线（与 #117 逐轮换模型互补）：主模型留在复用 session，把浏览器操作/
+    批量排版这类机械重活委派给便宜模型子代理（opencode.json 的 agent 配置，model
+    取 AGENT_OPENCODE_MODEL_FLASH）。子代理跑在独立 child session——不进主会话
+    上下文（主轮 cache 不被污染），token 也不在主轮 POST 响应的 info.tokens 里。
+    回合结束后扫主 session 的 child sessions，把 flash 模型 assistant 消息的用量累进
+    该 conv 的 flash_* 计数；主计数器（rounds/input/cache 命中）只含主轮自身，不受委派
+    影响——这正是验收点「复用 session 的主轮 cache_read 不因委派劣化」的机制保证。
+
+    细节：
+      - child 按 time.created > since_ts 过滤：复用 session 的 children 跨轮累积，
+        不过滤会把上一轮的委派重复计。serve 与 brain 同机同时钟，比较安全。
+      - 只认 modelID == FLASH 的 assistant 消息：主模型自己 @ 出来的子代理
+        （继承主模型）不计——判据与 #117 的「≠ 默认模型」一致；FLASH 未配置或
+        与默认同值时整体跳过。
+      - 一个 child session = 一次委派 = flash_rounds +1；其内多条 assistant 消息
+        的 tokens 累加成这一轮。
+      - best-effort：查询失败 / 数据缺字段一律静默跳过，绝不影响主回复路径。
+    """
+    if (not conv_id or not sid or not _OPENCODE_MODEL_FLASH
+            or _OPENCODE_MODEL_FLASH == _OPENCODE_MODEL):
+        return
+    flash_model_id = _OPENCODE_MODEL_FLASH.split("/", 1)[-1]
+    try:
+        children = _serve_request("GET", port, pwd, f"/session/{sid}/children", timeout=6)
+    except Exception:
+        return
+    if not isinstance(children, list):
+        return
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        # serve 的 time.created 是毫秒；只统计本轮开始之后新建的 child
+        if ((child.get("time", {}) or {}).get("created", 0) or 0) / 1000 <= since_ts:
+            continue
+        child_sid = child.get("id") or ""
+        if not child_sid:
+            continue
+        try:
+            msgs = _serve_request("GET", port, pwd, f"/session/{child_sid}/message", timeout=6)
+        except Exception:
+            continue
+        input_tokens = output_tokens = 0
+        for m in msgs or []:
+            info = (m or {}).get("info", {}) or {}
+            if info.get("role") != "assistant" or info.get("modelID") != flash_model_id:
+                continue
+            tokens = info.get("tokens", {}) or {}
+            input_tokens += tokens.get("input") or 0
+            output_tokens += tokens.get("output") or 0
+        if input_tokens or output_tokens:
+            _update_flash_stats(conv_id, input_tokens=input_tokens,
+                                output_tokens=output_tokens)
+
+
 def _get_session_stats(conv_id):
     """获取会话统计信息。返回 dict 或 None。"""
     if not conv_id:
@@ -1253,6 +1310,8 @@ def _http_oneshot(port, pwd, prompt, ctx, model=None):
             _update_flash_stats(conv_id,
                                 input_tokens=usage.get("input_tokens", 0),
                                 output_tokens=usage.get("output_tokens", 0))
+        # 本轮内 Task 委派出去的子代理 flash 用量（#123；无 conv 记录/无委派时 no-op）
+        _collect_subagent_flash_usage(port, pwd, sid, conv_id, t0)
         return reply
     except _IdleAbort as e:
         # 活动感知超时 abort：终态失败，向上传播（_brain_opencode 判 failed 不回退 CLI）
@@ -1331,6 +1390,10 @@ def _http_reuse(port, pwd, conv_id, prompt, ctx, model=None):
                          cache_read=usage.get("cache_read", 0),
                          cache_write=usage.get("cache_write", 0))
             _stash_task_stats(conv_id, usage, time.time() - t0)
+            # 本轮内 Task 委派出去的子代理 flash 用量（#123，best-effort 不影响主回复）。
+            # 主计数器上面 _update_stats 只含主轮自身用量——子代理在独立 child session，
+            # 主轮 cache_read 不因委派劣化。
+            _collect_subagent_flash_usage(port, pwd, sid, conv_id, t0)
             _oc_log("http", model, time.time() - t0, prompt, reply, True, sess="reuse")
             return reply
         except _IdleAbort as e:

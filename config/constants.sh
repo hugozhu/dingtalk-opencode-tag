@@ -99,6 +99,9 @@ export AGENT_OPENCODE_MODEL="${AGENT_OPENCODE_MODEL:-opencode/deepseek-v4-flash-
 # 判据是「≠ AGENT_OPENCODE_MODEL」：配成和默认同值时并没换缓存桶，不分流。
 # 留空=关闭本特性（所有消息都走 AGENT_OPENCODE_MODEL）。示例（自建网关同厂同代的便宜档，
 # 单价约为 max 档的 1/12）：export AGENT_OPENCODE_MODEL_FLASH="local/qwen3-8-flash"
+# 同一个变量也是 opencode.json 里 flash-worker 子代理的 model（#123：skill 用 Task 把
+# 机械重活委派给它，主模型不动、独立 child session 不污染主会话；留空时该子代理回落
+# 主模型，skill 委派指引自动失效，不会报错）。
 export AGENT_OPENCODE_MODEL_FLASH="${AGENT_OPENCODE_MODEL_FLASH:-}"
 # 触发词，逗号分隔。**子串**匹配且大小写不敏感——触发词是跟在真实任务前的修饰语
 # （「/flash 打开浏览器抓一下股价」），不同于 CANCEL/RESET 关键词的整句严格匹配。

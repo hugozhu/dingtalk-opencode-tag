@@ -4,6 +4,13 @@
   ],
   "mcp": {
   },
+  "agent": {
+    "flash-worker": {
+      "description": "便宜模型（flash）重活执行器：跑 token 量大但推理深度要求不高的机械步骤——浏览器自动化操作序列、批量格式转换/排版、按既定 SOP 逐步执行命令并如实汇报输出与判据结果。主 agent 保持当前模型，用 Task 工具把这类自包含的步骤段委派给本子代理。需要跨步骤决策、深度推理、综合多源信息做判断的活不要委派。",
+      "mode": "subagent",
+      "model": "{env:AGENT_OPENCODE_MODEL_FLASH}"
+    }
+  },
   "permission": {
     "external_directory": {
       "~/.agents/**": "allow",

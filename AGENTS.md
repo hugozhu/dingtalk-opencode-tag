@@ -173,7 +173,7 @@ systemctl --user start dingtalk-agent.service     # 启动
 
 ## 常见坑
 
-1. **会话复用只按 conv_id，不按工作目录**——一个目录下会有上百个 session，「最近活跃的那个」未必属于当前这场对话，按目录复用会串上下文。复用逻辑统一在 `custom/brain.py`（`AGENT_SESSION_REUSE`），能力侧只需在 ctx 里带上 `conv_id`。**例外**：逐轮换模型（`/flash`，#117）的那一轮单开一次性 session，不进主会话——provider 的 prompt cache 按模型分桶，在长上下文的复用 session 里换模型反而更贵，详见 ARCHITECTURE.md 第 8 节
+1. **会话复用只按 conv_id，不按工作目录**——一个目录下会有上百个 session，「最近活跃的那个」未必属于当前这场对话，按目录复用会串上下文。复用逻辑统一在 `custom/brain.py`（`AGENT_SESSION_REUSE`），能力侧只需在 ctx 里带上 `conv_id`。**例外**：逐轮换模型（`/flash`，#117）的那一轮单开一次性 session，不进主会话——provider 的 prompt cache 按模型分桶，在长上下文的复用 session 里换模型反而更贵，详见 ARCHITECTURE.md 第 8 节；skill 用 Task 委派给 `flash-worker` 子代理（#123，`opencode.json` 定义，model 取 `AGENT_OPENCODE_MODEL_FLASH`）的轮次同理走独立 child session，用量由 `_collect_subagent_flash_usage` 记进 flash_* 统计，主轮 cache 不受影响
 2. **进程活着 + HTTP 200 ≠ 大脑活着**——`check_serve`/`check_serve_http` 都不碰模型。2026-08-08 大脑与模型网关失联 16 分钟，这两项全程 OK、healthcheck 每 5 分钟报「健康」，任何请求都答不出来，只能靠人在钉钉里发现。故新增检查7 `check_brain`：按 `opencode.log` 里新增的 `ok=False` **跨窗口累计**（存 `.brain-fail.pending`，仅探针通过清零）触发一次**真实模型调用**自检（阈值 `HEALTHCHECK_BRAIN_FAIL_THRESHOLD`，默认 2 = 一条消息彻底失败的两行），健康时零请求零成本。**必须累计**：旧「单窗口条数 ≥3」在低频部署下一个窗口最多 2 条（http+cli 各 1），阈值永远凑不满——2026-09-17 网关间歇不可达 7 小时全程误报「健康」
 3. **asked_ts buffer 设 5s**——依赖服务写日志时刻 vs serve POST 时刻有微小偏差
 4. **轮询 do-while 风格**（先调一次再判断）——保证至少调一次，避免常量 patch 为 0 时跳过整个循环
@@ -209,6 +209,7 @@ systemctl --user start dingtalk-agent.service     # 启动
   - **业务 e2e（合并转发路径）**：`dws chat message forward` 触发 → 监控日志 → 拉群校验，见 `tests/custom/e2e_test.sh`。
   - **合并转发混合消息 e2e（本地冒烟，无需真发）**：钉钉 `combine-forward` 只能转发已存在 msgId、`send --msg-type image` 又需预置 mediaId，故真造一条 2图+1文件+3文本的转发不可行。改用**合成 fixture 驱动真实代码路径**：真实 `list-by-ids` 结构 + **真实 serve+gemini 视觉识别本地图** + 真实摘要发送人解析 + 真实 brain，只 stub 转发源/媒体下载/发送三处 I/O。断言 6 条全在、类型都解析对、发送人从外层摘要对齐、图片走 serve+gemini（非 `_proxy_vision`）、回复带 `ctx.conv_id` 进主 session。见 `tests/custom/e2e_forward_mixed.py`（serve 在跑即真识别图片）。
   - **文本回复 HTTP e2e（本地冒烟，无需钉钉）**：起临时 serve → 直接调 `brain.generate_reply("u","1+1")` 断言回复 + `opencode.log` 有 `transport=http`，见 `tests/custom/e2e_text_http_test.sh`。
+  - **flash-worker 子代理委派 e2e（本地冒烟，无需钉钉，#123）**：起临时 serve（env 带 `AGENT_OPENCODE_MODEL_FLASH`，flash-worker 才有独立模型）→ 调 `brain.generate_reply_ex` 要求主模型用 Task 委派 flash-worker → 断言 child session 里 flash 模型有真实用量、`flash_*` 统计已记账且主会话 `rounds=1`（委派不进主会话窗口）。未配置 FLASH / 与主模型同值则 SKIP。见 `tests/custom/e2e_flash_subagent_test.sh`。
   - **@我(AT) 订阅 e2e**：验证 `user_im_message_receive_at` 订阅 → bridge(convType=2) → inbound → 能力分发全链，末段 LIVE 用 `dws event consume ...receive_at --duration` 抓 `[event] ready` 证明真实建联（只读不发消息，无 dws/未登录则 SKIP）。见 `tests/custom/e2e_at_test.sh`。开启订阅：`config/constants.local.sh` 设 `DWS_EVENT_AT=1`。
   - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）；群聊场景可回退 `list-by-sender`（按发送者拉）。**但 o2o 私聊回复实测 `list-by-sender` 索引不到**——私聊校验必须用 `list --group <o2o-convId>`（convId 从 connect log 入站行 `convId=…` 取）。`e2e_text_reply_test.sh` 的 V4 即如此。
   - **坑#2**：实时订阅（connect 日志）**不回显当前登录用户自己发的消息**——数字员工的回复不会出现在它自己的接收流里，别把"connect 日志没看到回复"误判为没发出去；用校验 B 的 DWS 拉取确认。
