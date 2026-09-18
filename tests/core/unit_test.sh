@@ -336,6 +336,48 @@ assert_eq "custom 定义 brain_probe 钩子" "0" \
 assert_eq "custom 定义 notify_alert_handler 钩子（熔断告警不再静默）" "0" \
     "$(declare -F notify_alert_handler >/dev/null 2>&1 && echo 0 || echo 1)"
 
+echo ""
+echo "Testing 事件流新鲜度检查（check_event_freshness）..."
+
+# 提取单个函数做隔离测试（同 check_brain 模式——healthcheck.sh 顶层有 main "$@"）
+eval "$(sed -n '/^check_event_freshness()/,/^}$/p' "$SCRIPT_DIR/bin/core/healthcheck.sh")"
+
+EF_LOG=$(mktemp)
+MONITOR_LOG="$EF_LOG"
+# 造「N 秒前」的入站时间戳（macOS date -r / Linux date -d @ 双写法）
+_ef_ts_ago() {
+    local e=$(( $(date +%s) - $1 ))
+    date -r "$e" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$e" '+%Y-%m-%d %H:%M:%S'
+}
+_ef_mk_inbound() {
+    echo "[$(_ef_ts_ago "$1")] [agent] inbound: msgId=msg-$2 kind=text user=PiBot" >> "$EF_LOG"
+}
+
+EVENT_FRESHNESS_THRESHOLD=0
+assert_eq "阈值为 0 → SKIP（禁用开关）" "SKIP: 未启用" "$(check_event_freshness)"
+
+EVENT_FRESHNESS_THRESHOLD=7200
+: > "$EF_LOG"
+assert_eq "无入站记录 → SKIP（新部署不误报）" "SKIP: 尚无入站消息记录" "$(check_event_freshness)"
+
+_ef_mk_inbound 100
+assert_eq "100s 前有入站 → OK" "1" \
+    "$(check_event_freshness | grep -q '^OK: 100s 前有入站$' && echo 1 || echo 0)"
+
+: > "$EF_LOG"
+_ef_mk_inbound 8000
+assert_eq "8000s 无入站 → FAIL（2026-09-18 事故场景）" "1" \
+    "$(check_event_freshness | grep -qE '^FAIL: 事件流 8000s 无入站消息' && echo 1 || echo 0)"
+
+rm -f "$EF_LOG"
+
+assert_eq "freshness 检查已接进硬失败判定列表" "0" \
+    "$(grep -q '"freshness|\$r_freshness"' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
+assert_eq "freshness 检查进 JSON checks 输出" "0" \
+    "$(grep -q '"event_freshness"' "$SCRIPT_DIR/bin/core/healthcheck.sh" && echo 0 || echo 1)"
+assert_eq "monitor 的 run_healthcheck 保留 WARN/FAIL 输出（修 WARN 三重静默）" "0" \
+    "$(grep -q "grep -E 'WARN|FAIL'" "$SCRIPT_DIR/bin/core/monitor.sh" && echo 0 || echo 1)"
+
 # 报告
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

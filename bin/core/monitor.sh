@@ -134,7 +134,17 @@ warmup() {
 # healthcheck、startup_report 的门禁、各 e2e 脚本都走默认的 peek，不会把窗口清掉
 # （否则它们会把真实失败对下一次守护检查静默掩盖）。
 run_healthcheck() {
-    run_with_timeout "$HEALTHCHECK_TIMEOUT" bash "$SCRIPT_DIR/bin/core/healthcheck.sh" --consume
+    # healthcheck 输出不再整体丢弃：WARN/FAIL 行落 monitor.log。2026-09-18 事故
+    # 暴露的「WARN 三重静默」——check_log_activity 连报 2 小时 WARN（日志无活动），
+    # 但输出被本函数丢弃、一行都没进日志、无通知通道，事后连诊断线索都没有。
+    # 健康时的 OK 行仍不打（每 5 分钟一轮会刷屏）。
+    local out rc=0 notable
+    out="$(run_with_timeout "$HEALTHCHECK_TIMEOUT" bash "$SCRIPT_DIR/bin/core/healthcheck.sh" --consume 2>&1)" || rc=$?
+    notable="$(printf '%s' "$out" | grep -E 'WARN|FAIL' || true)"
+    if [[ -n "$notable" ]]; then
+        log "healthcheck 异常项: $(printf '%s' "$notable" | tr '\n' '; ')"
+    fi
+    return "$rc"
 }
 
 # 熔断告警（用户实现 notify_alert <msg>）

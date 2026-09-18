@@ -55,6 +55,12 @@ COMPONENT_NAME="healthcheck"
 : "${HEALTHCHECK_BRAIN_FAIL_THRESHOLD:=2}"
 : "${HEALTHCHECK_BRAIN_PROBE_TIMEOUT:=60}"
 
+# --- 检查8（事件流新鲜度）相关 ---
+# 数据源是 monitor.log 的 [agent] inbound 行（event_watcher 每收一条消息必记，
+# 跨部署统一，不受 connect 日志无关写入的 mtime 污染）。
+: "${MONITOR_LOG:=$SCRIPT_DIR/monitor.log}"
+: "${EVENT_FRESHNESS_THRESHOLD:=7200}"   # 秒；0 = 禁用本检查
+
 # 匹配 _oc_log 的失败行。**必须锚定行首**：AGENT_DEBUG=1 时同一文件里还混着
 # `[ts] <<< RESP ... body={...}` 这类整段模型输出，不锚定的话 body 里出现 "ok=False"
 # 就能伪造计数。限定 transport=http|cli 也顺带保证探针自身永远喂不回计数器。
@@ -218,6 +224,58 @@ check_brain() {
     fi
 }
 
+# 检查8: 事件流新鲜度（最后一条入站消息距今多久，硬失败）
+#
+# 背景（2026-09-18 事故）：dws event 长连接静默失活 2h15m，进程全活、
+# check_connect 恒 OK、check_brain 因「没消息进来 = 没失败记录」恒 OK——
+# 此前的 7 项检查没有任何一项探测「流是否还在投递」。本检查读 monitor.log
+# 最后一条 [agent] inbound 的时间戳补该盲区。
+#
+# 判 FAIL（→ monitor 全量重启自愈，重建事件流连接）注意：纯本地视角无法
+# 区分「投递停滞」与「真静默」（深夜无人发消息）。默认 7200s 取两者分界：
+# 有心跳/定时消息的数字员工部署日常静默远小于 2h；真静默误判的代价是一次
+# 无害重启（连续 3 次熔断才停服）。低流量部署请调大 EVENT_FRESHNESS_THRESHOLD
+# 或置 0 禁用；有 DWS 侧交叉验证条件的部署可用 custom 层零误报完整版
+# （DWS 独立拉取确认「服务端有新消息而本地没收到」才动作）。
+check_event_freshness() {
+    if [[ "${EVENT_FRESHNESS_THRESHOLD:-0}" =~ ^[0-9]+$ ]] \
+       && [[ "${EVENT_FRESHNESS_THRESHOLD}" -le 0 ]]; then
+        echo "SKIP: 未启用"
+        return
+    fi
+    if [[ ! -f "$MONITOR_LOG" ]]; then
+        echo "SKIP: monitor 日志不存在"
+        return
+    fi
+    local line ts epoch age now
+    line="$(grep '\[agent\] inbound' "$MONITOR_LOG" 2>/dev/null | tail -1)" || true
+    if [[ -z "$line" ]]; then
+        echo "SKIP: 尚无入站消息记录"
+        return
+    fi
+    ts="$(printf '%s' "$line" | sed -nE 's/^\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\].*/\1/p')"
+    if [[ -z "$ts" ]]; then
+        echo "SKIP: 入站行无时间戳"
+        return
+    fi
+    # macOS BSD date / Linux GNU date 双写法（同本文件 stat 的双写法惯例）
+    epoch="$(date -j -f '%Y-%m-%d %H:%M:%S' "$ts" +%s 2>/dev/null)" || epoch=""
+    if [[ -z "$epoch" ]]; then
+        epoch="$(date -d "$ts" +%s 2>/dev/null)" || epoch=""
+    fi
+    if ! [[ "$epoch" =~ ^[0-9]+$ ]]; then
+        echo "SKIP: 时间戳解析失败"
+        return
+    fi
+    now="$(date +%s)"
+    age=$(( now - epoch ))
+    if (( age > EVENT_FRESHNESS_THRESHOLD )); then
+        echo "FAIL: 事件流 ${age}s 无入站消息（阈值 ${EVENT_FRESHNESS_THRESHOLD}s）"
+    else
+        echo "OK: ${age}s 前有入站"
+    fi
+}
+
 # 是否消费「距上次检查以来」的计数窗口（--consume）。**默认 peek 不写状态**：
 # 本脚本还被 startup_report 和多个 e2e 当门禁调用，若它们也消费窗口，会把真实失败
 # 对下一次 monitor 检查静默掩盖。只有 monitor 的守护循环传 --consume。
@@ -240,7 +298,7 @@ main() {
     # 注意：用普通变量而非关联数组（declare -A）——macOS 自带 /bin/bash 是 3.2，
     # 不支持关联数组，monitor.sh 经 /bin/bash 调本脚本会 declare 报错、set -e 退出，
     # 导致 monitor 误判"不健康"进入全量重启/熔断循环。保持 bash 3.2 兼容。
-    local r_connect r_log_activity r_log_fatal r_event_watcher r_serve r_serve_http r_brain
+    local r_connect r_log_activity r_log_fatal r_event_watcher r_serve r_serve_http r_brain r_freshness
     r_connect=$(check_connect)
     r_log_activity=$(check_log_activity)
     r_log_fatal=$(check_log_fatal)
@@ -249,12 +307,13 @@ main() {
     r_serve_http=$(check_serve_http)
     # 只有这一项的消息里可能嵌入模型返回的自由文本 → 去掉引号和换行，避免撑坏 JSON 输出
     r_brain=$(check_brain | tr -d '"' | tr '\n' ' ')
+    r_freshness=$(check_event_freshness)
 
-    # 判定：硬失败 → 不健康（connect / log_fatal / serve / serve_http / brain）
+    # 判定：硬失败 → 不健康（connect / log_fatal / serve / serve_http / brain / freshness）
     local healthy=1
     local message=""
     local pair key val
-    for pair in "connect|$r_connect" "log_fatal|$r_log_fatal" "serve|$r_serve" "serve_http|$r_serve_http" "brain|$r_brain"; do
+    for pair in "connect|$r_connect" "log_fatal|$r_log_fatal" "serve|$r_serve" "serve_http|$r_serve_http" "brain|$r_brain" "freshness|$r_freshness"; do
         key="${pair%%|*}"
         val="${pair#*|}"
         if [[ "$val" == FAIL* ]]; then
@@ -278,7 +337,8 @@ main() {
     "event_watcher": "$r_event_watcher",
     "serve": "$r_serve",
     "serve_http": "$r_serve_http",
-    "brain": "$r_brain"
+    "brain": "$r_brain",
+    "event_freshness": "$r_freshness"
   }
 }
 EOF
@@ -291,6 +351,7 @@ EOF
             echo "  serve: $r_serve"
             echo "  serve_http: $r_serve_http"
             echo "  brain: $r_brain"
+            echo "  event_freshness: $r_freshness"
         fi
         if [[ "$healthy" == "1" ]]; then
             echo "✅ 健康"
