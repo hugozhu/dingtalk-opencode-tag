@@ -171,5 +171,25 @@ fi
 # 启动日志（不打敏感 group/users，只记开了哪些）
 echo "[connect] dws-connect 启动: group=$_want_group o2o=$_want_o2o at=$_want_at" >> "$CONNECT_LOG"
 
+# 事件流新鲜度看门狗（2026-09-18 投递停滞 2h15m 无告警事故的兜底，healthcheck
+# 只查进程存活探测不了「连接活着但不投递」）：作为本脚本子进程，生命周期与
+# connect 一致，被 kill_tree 连带清理；派生 reboot 时自行脱离进程树。
+# 疑似停滞 → DWS 独立拉取交叉验证 → 确凿才告警 + 自愈。EVENT_STALL_WATCHDOG=0 可关。
+# 详见 event_freshness_watchdog.sh 头注释。
+# trap 收尾：consumer 崩溃 → 本脚本退出时若不显式杀 watchdog，它会被甩成孤儿，
+# monitor 拉起新 connect 后出现双看门狗（kill_tree 正常路径杀得到它，trap 兜底
+# 进程树断裂的场景）。
+_WATCHDOG_PID=""
+if _is_on "${EVENT_STALL_WATCHDOG:-1}"; then
+    bash "$SCRIPT_DIR/bin/custom/event_freshness_watchdog.sh" &
+    _WATCHDOG_PID=$!
+fi
+_watchdog_cleanup() {
+    [[ -n "$_WATCHDOG_PID" ]] && kill "$_WATCHDOG_PID" 2>/dev/null
+    return 0
+}
+trap '_watchdog_cleanup' EXIT
+trap '_watchdog_cleanup; exit 143' TERM INT
+
 # 所有 consumer 合流 → bridge → CONNECT_LOG
 _run_consumers | python3 "$BRIDGE" >> "$CONNECT_LOG" 2>>"$CONNECT_LOG"

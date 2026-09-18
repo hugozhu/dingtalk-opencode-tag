@@ -93,6 +93,7 @@ launchctl load -w ~/Library/LaunchAgents/com.<your-org>.<your-agent>.plist
 bash tests/core/unit_test.sh                 # shell 单测（core，不改）
 python3 tests/core/test_agent_common.py      # Python 单测（core，不改）
 bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路）
+bash tests/custom/test_event_freshness_watchdog.sh   # 事件流看门狗单测（纯 mock，不碰网络）
 ```
 
 ## 关键文件 / 函数索引
@@ -106,6 +107,8 @@ bash tests/custom/e2e_test.sh                 # 端到端（需要真实链路�
 | `bin/core/stop.sh` | @core | (脚本本身) | 停止服务（launchd/nohup） |
 | `bin/core/reboot.sh` | @core | (脚本本身) | /reboot 指令执行体（委托 stop + start） |
 | `bin/custom/agent-template.plist` | @custom | (plist 本身) | launchd 配置模板 |
+| `bin/custom/dws-connect.sh` | @custom | `_run_consumers` / `_kill_subtree` / `_watchdog_cleanup` | dws event consume → bridge 管道 + 看门狗拉起 |
+| `bin/custom/event_freshness_watchdog.sh` | @custom | `_wd_check_once` / `_wd_count_newer` / `_wd_spawn_reboot` | 事件流新鲜度看门狗（投递停滞检测 + 自愈，2026-09-18 事故） |
 | `src/core/agent_common.py` | @core | `find_serve_credentials` / `serve_request` / `_proxy_vision` / `_clean_session_title` | 共享 Python 工具 |
 | `src/core/event_watcher.py` | @core | `connect_sse` / `log_tail_thread` / `format_and_forward` | 事件流主进程（调用 custom.routes 的 hook） |
 | `src/custom/handler.py` | @custom | `fetch_attachments` / `render_prompt` / `_lookup_senders_batch` / `match_business_line` | 业务 handler（FDE 改这里） |
@@ -187,6 +190,7 @@ systemctl --user start dingtalk-agent.service     # 启动
 12. **/reboot 必须用干净环境重启**（#71）——`reboot.sh` 由老 event_watcher 派生，继承老 monitor 启动时的全部 env。若直接透传，config 里 `export VAR="${VAR:-新值}"` 风格的赋值会被继承的旧值压住——改完 `config/constants.local.sh` 后 /reboot 不生效（新 monitor / serve 仍带旧 env）。`reboot.sh` 用 `env -i`（仅保留 HOME/USER/PATH 等基本量）跑 stop.sh + start.sh，让 config 成为 env 的唯一来源，行为与「开新终端手工全停全起」一致。PATH 依赖 `constants.local.sh` 里 `export PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin"` 补回 dws / opencode。
 13. **macOS keychain 锁定会让 `dws profile list` 返回空**（#71）——e2e 冒烟的发送方自动探测会因此 SKIP，容易误判为"没登录"。解锁：`security unlock-keychain ~/Library/Keychains/login.keychain-db`；或显式 `E2E_SENDER_PROFILE="<corpId>:<真人userId>"` 绕过探测。`start.sh` 启动时已做 keychain 预检并打印提示。
 14. **e2e 冒烟别依赖硬编码免费模型**（#71）——`opencode/deepseek-v4-flash-free` 等免费模型会失效/超时，未 source 配置时 e2e 会 HTTP 90s + CLI 90s = 180s 慢失败，易误判为链路问题。`e2e_text_http_test.sh` 约定：未显式设 `AGENT_OPENCODE_MODEL` 时先 source `config/constants.local.sh` 取真实可用模型，且起临时 serve 后**轮询 /session 就绪探测**（最多 30s）再发请求，不裸 sleep。
+15. **进程活着 + 连接活着 ≠ 流活着**（2026-09-18 事故）——`dws event consume` 长连接静默失活时进程全活，healthcheck 27 轮全绿 2h15m 无告警无自愈：`check_connect` 只 `verify_pid` 查进程存活；`check_log_activity` 的 WARN **三重静默**（不算硬失败 / 输出被 monitor 丢弃不进日志 / 无通知通道）；`check_brain` 只探测「调了但失败」，没消息进来 = 没失败记录 = 恒 OK。判定投递停滞的唯一确凿证据是 **DWS 侧独立拉取交叉验证**（服务端有新消息而本地没收到）。已由 `bin/custom/event_freshness_watchdog.sh`（dws-connect 拉起的子进程）兜底：本地 inbound 超 45min → DWS 拉取过滤「自己发的 + msgId 已入站的」→ 确凿才告警 + reboot 自愈（防抖 30min / 上限 3 次，状态文件 `.event-stall.state`）。诊断捷径：connect log 里最后一条「收到」与 DWS 拉到的最新消息时间戳错位 = 停滞实锤。另注意 bash 管道的 env 前缀陷阱：`VAR=x cmd | python3` 的 VAR 只进 cmd 不进 python，过滤变量全空不报错、只是静默失效（单测能抓到）。
 
 ## 测试约定
 
@@ -213,7 +217,7 @@ systemctl --user start dingtalk-agent.service     # 启动
   - **@我(AT) 订阅 e2e**：验证 `user_im_message_receive_at` 订阅 → bridge(convType=2) → inbound → 能力分发全链，末段 LIVE 用 `dws event consume ...receive_at --duration` 抓 `[event] ready` 证明真实建联（只读不发消息，无 dws/未登录则 SKIP）。见 `tests/custom/e2e_at_test.sh`。开启订阅：`config/constants.local.sh` 设 `DWS_EVENT_AT=1`。
   - **坑#1**：`dws chat message list --group` 对某些群报 `openCid or cid is required`（`list_conversation_message_v2` 的权限/参数怪癖）；群聊场景可回退 `list-by-sender`（按发送者拉）。**但 o2o 私聊回复实测 `list-by-sender` 索引不到**——私聊校验必须用 `list --group <o2o-convId>`（convId 从 connect log 入站行 `convId=…` 取）。`e2e_text_reply_test.sh` 的 V4 即如此。
   - **坑#2**：实时订阅（connect 日志）**不回显当前登录用户自己发的消息**——数字员工的回复不会出现在它自己的接收流里，别把"connect 日志没看到回复"误判为没发出去；用校验 B 的 DWS 拉取确认。
-  - **坑#3**：`dws event` 订阅偶发**投递停滞**——`dws event consume` 子进程还活着（healthcheck 只查进程存活会误判"健康"），但连接静默失活、消息迟迟不进 connect log，只延到下次重启。跑基础文本 e2e 时若 V2 超时未见入站，先 `bash bin/core/reboot.sh` 重建订阅再跑。
+  - **坑#3**：`dws event` 订阅偶发**投递停滞**——`dws event consume` 子进程还活着（healthcheck 只查进程存活会误判"健康"），但连接静默失活、消息迟迟不进 connect log，只延到下次重启。跑基础文本 e2e 时若 V2 超时未见入站，先 `bash bin/core/reboot.sh` 重建订阅再跑。常态兜底见「常见坑#15」：`event_freshness_watchdog.sh` 已自动检测（DWS 交叉验证）+ 告警 + 自愈。
   - **所有能力共走同一条后端路**：文本回复、合并转发、图片、文件都调 `core.brain.generate_reply(ctx={"conv_id": ...})` → `brain._brain_opencode` → **serve HTTP `POST /session/{id}/message`（优先，复用常驻进程省冷启动，实测 ~3x）**，serve 不可用时自动回退 `opencode run` CLI。因为共享同一个 conv 的 session，**转发完再追问能接上上下文**。都依赖 serve 常驻（`start_serve` 见 `bin/custom/start_funcs.sh`）。
   - **`AGENT_DEBUG=1` → opencode 调用单独记 `opencode.log`**（统一调试总开关，原 `AGENT_SERVE_DEBUG` 已并入）：每次 opencode 调用记一条摘要（`transport=http|cli` / model / 耗时 / prompt+reply 长度 / reply 预览 / 成败），**并把每个 serve 请求/响应的完整 body（含发给模型的 prompt 与模型返回）写到同一文件**，长 body（图片 data_url 等）自动截断头尾。想确认"回复到底走 HTTP 还是 CLI 回退"或"到底发了什么 prompt / serve 返回了什么"都看这个文件。错误恒记（不受开关影响）。路径可用 `AGENT_OPENCODE_LOG` 覆盖。
 
