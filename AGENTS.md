@@ -118,6 +118,7 @@ bash tests/custom/test_event_freshness_watchdog.sh   # 事件流看门狗单测�
 | `tests/core/unit_test.sh` | @core | (脚本本身，含 dws-connect 订阅选择) | shell 单测 |
 | `tests/custom/test_dws_event_bridge.py` | @custom | `TestToConnectLine`（@我/群/单聊 convType 映射） | Python 单测 |
 | `tests/custom/test_ack_capability.py` | @custom | `TestShouldAck` / `TestLifecycleWorker` / `TestDispatchReplySent`（回执：已读+状态表情） | Python 单测 |
+| `tests/custom/test_subagent_watchdog.py` | @custom | `TestFingerprintChildTracking` / `TestWatchdogE2E` / `TestSseSuppressCapability`（Task 委派子会话保活，#125） | Python 单测 |
 | `tests/custom/e2e_test.sh` | @custom | (脚本本身) | 端到端测试（FDE 改这里） |
 | `tests/custom/e2e_at_test.sh` | @custom | (脚本本身) | @我(AT) 订阅+处理 端到端测试 |
 | `tests/custom/e2e_ack_test.sh` | @custom | (脚本本身) | 回执（已读+状态表情）端到端测试 |
@@ -191,6 +192,7 @@ systemctl --user start dingtalk-agent.service     # 启动
 13. **macOS keychain 锁定会让 `dws profile list` 返回空**（#71）——e2e 冒烟的发送方自动探测会因此 SKIP，容易误判为"没登录"。解锁：`security unlock-keychain ~/Library/Keychains/login.keychain-db`；或显式 `E2E_SENDER_PROFILE="<corpId>:<真人userId>"` 绕过探测。`start.sh` 启动时已做 keychain 预检并打印提示。
 14. **e2e 冒烟别依赖硬编码免费模型**（#71）——`opencode/deepseek-v4-flash-free` 等免费模型会失效/超时，未 source 配置时 e2e 会 HTTP 90s + CLI 90s = 180s 慢失败，易误判为链路问题。`e2e_text_http_test.sh` 约定：未显式设 `AGENT_OPENCODE_MODEL` 时先 source `config/constants.local.sh` 取真实可用模型，且起临时 serve 后**轮询 /session 就绪探测**（最多 30s）再发请求，不裸 sleep。
 15. **进程活着 + 连接活着 ≠ 流活着**（2026-09-18 事故）——`dws event consume` 长连接静默失活时进程全活，healthcheck 27 轮全绿 2h15m 无告警无自愈：`check_connect` 只 `verify_pid` 查进程存活；`check_log_activity` 的 WARN **三重静默**（不算硬失败 / 输出被 monitor 丢弃不进日志 / 无通知通道）；`check_brain` 只探测「调了但失败」，没消息进来 = 没失败记录 = 恒 OK。判定投递停滞的唯一确凿证据是 **DWS 侧独立拉取交叉验证**（服务端有新消息而本地没收到）。已由 `bin/custom/event_freshness_watchdog.sh`（dws-connect 拉起的子进程）兜底：本地 inbound 超 45min → DWS 拉取过滤「自己发的 + msgId 已入站的」→ 确凿才告警 + reboot 自愈（防抖 30min / 上限 3 次，状态文件 `.event-stall.state`）。诊断捷径：connect log 里最后一条「收到」与 DWS 拉到的最新消息时间戳错位 = 停滞实锤。另注意 bash 管道的 env 前缀陷阱：`VAR=x cmd | python3` 的 VAR 只进 cmd 不进 python，过滤变量全空不报错、只是静默失效（单测能抓到）。
+16. **Task 委派期间主会话指纹静止 ≠ 卡死**（#125，2026-09-19 wx post 408 事故）——主模型把重活委派给 flash-worker 子代理（#123）后，子代理全程跑在独立 child session，主会话最后一条消息只剩一个静止的 `task` tool part，`_activity_fingerprint` 的四维指纹全不变 → 长委派（>900s 浏览器自动化）被活动感知超时误杀。修复：watchdog 发现 in-flight task part（state.status=pending/running）时从 `state.metadata.sessionId` **递归跟踪子会话指纹**（限深 2 层，子会话活动拼进父指纹第 5 维；子会话指纹全取不到时按保活哲学视为仍在产出，MAX 兜底）。同时把子会话 sid 登记进 textreply 注册表 + `sse_suppress` 能力按 parentID 吞掉子会话的 busy/idle SSE 业务通知——本部署 `AGENT_ROBOT_CODE` 是占位值，send-by-bot 通道 0 成功/30 失败（`business error: success=false`），不抑制就每次委派刷两条 FAIL，极易被误读成「兜底提示没发出去」（实际兜底走 `AGENT_REPLY_MODE=user` 通道，看 `reply user OK` 才是判据；`send FAIL title=✅ 会话完成` 是 SSE 通知噪音）。
 
 ## 测试约定
 

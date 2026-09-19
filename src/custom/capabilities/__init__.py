@@ -34,6 +34,7 @@ from custom.capabilities import file        # noqa: F401  文档/文件处理（
 from custom.capabilities import stats       # noqa: F401  会话统计查询（/stats 命令）
 from custom.capabilities import stock_watch  # noqa: F401  行情快照异动监控（数据推送告警）
 from custom.capabilities import task_stats  # noqa: F401  任务完成后推送本次统计（#76，默认关）
+from custom.capabilities import sse_suppress  # noqa: F401  内部会话 SSE 业务通知抑制（#125）
 from custom.capabilities import startup_report  # noqa: F401  服务启动报告
 
-__all__ = ["trace", "cancel", "ack", "text_reply", "forward", "image", "audio", "file", "question", "permission", "aggregation", "stats", "stock_watch", "task_stats", "startup_report"]
+__all__ = ["trace", "cancel", "ack", "text_reply", "forward", "image", "audio", "file", "question", "permission", "aggregation", "stats", "stock_watch", "task_stats", "sse_suppress", "startup_report"]

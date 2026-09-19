@@ -952,7 +952,26 @@ def _describe_step(msgs):
     return ""
 
 
-def _activity_fingerprint(port, pwd, sid):
+def _running_task_child_sids(parts):
+    """从 parts 里找出「正在跑的 Task 委派」子会话 sid 列表（#125）。
+
+    Task 工具 part 在子代理运行期间 state.status 为 pending/running，
+    state.metadata.sessionId 即子会话。子代理跑完（completed/error）后不再返回。
+    """
+    sids = []
+    for p in parts:
+        if not isinstance(p, dict) or p.get("tool") != "task":
+            continue
+        st = p.get("state", {}) or {}
+        if (st.get("status") or "") not in ("pending", "running"):
+            continue
+        csid = ((st.get("metadata") or {}).get("sessionId")) or ""
+        if csid and csid not in sids:
+            sids.append(csid)
+    return sids
+
+
+def _activity_fingerprint(port, pwd, sid, _depth=0):
     """探测 session 当前活动指纹；变化=agent 仍在产出。
 
     读 GET /session/{sid}/message，取最后一条（进行中的 assistant）消息的
@@ -967,6 +986,16 @@ def _activity_fingerprint(port, pwd, sid):
     可长达数百秒）。watchdog 见到该标记即视为仍在产出，不空转 idle。
     step_desc 是同一份 msgs 派生出的「当前步骤」短语（#121 进度心跳），给 ack 展示
     用；不参与活动判定。
+
+    子代理委派跟踪（#125）：主模型用 Task 把重活委派给 flash-worker 时，子代理
+    全程跑在**独立 child session** 里，主会话最后一条消息只有一个静止的 task tool
+    part——四维指纹全不变，长委派（如 wx post 浏览器自动化 >900s）会被误判 idle
+    abort。故发现 in-flight task part 时递归取子会话指纹拼进第 5 维（限深 2 层，
+    子代理再委派也能跟上）；子会话的未完结 reasoning 同样向上传播。子会话指纹
+    全部取不到（GET 失败）时按保活哲学视为仍在产出（MAX 超时仍兜底）。
+    顺带把子会话 sid 登记进 textreply 注册表：它是 brain 内部派生会话，其
+    busy/idle SSE 事件不该触发业务通知（本部署 send-by-bot 未配 robot-code，
+    不抑制就是一条委派刷两条常态失败的 send FAIL，见 #125）。
     """
     try:
         msgs = _serve_request("GET", port, pwd, f"/session/{sid}/message", timeout=6)
@@ -984,7 +1013,26 @@ def _activity_fingerprint(port, pwd, sid):
         isinstance(p, dict) and p.get("type") == "reasoning"
         and ((p.get("time") or {}).get("start") and not (p.get("time") or {}).get("end"))
         for p in parts)
-    return (len(msgs), len(parts), textlen, updated), reasoning_in_progress, _describe_step(msgs)
+    fp = (len(msgs), len(parts), textlen, updated)
+    if _depth < 2:
+        child_sids = _running_task_child_sids(parts)
+        if child_sids:
+            child_fps = []
+            probed = 0
+            for csid in child_sids:
+                _register_textreply_sid(csid)   # 抑制子会话的 SSE 业务通知（#125）
+                cfp = _activity_fingerprint(port, pwd, csid, _depth + 1)
+                if cfp is None:
+                    continue
+                probed += 1
+                child_fps.append(cfp[0])
+                reasoning_in_progress = reasoning_in_progress or cfp[1]
+            if probed == 0:
+                # 有在跑的子代理但一个指纹都取不到：偏保活，视为仍在产出
+                reasoning_in_progress = True
+            elif child_fps:
+                fp = fp + (tuple(child_fps),)
+    return fp, reasoning_in_progress, _describe_step(msgs)
 
 
 def _message_errored(port, pwd, sid):
