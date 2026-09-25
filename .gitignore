@@ -251,6 +251,10 @@ start-digital-employee.sh
 # healthcheck brain 跨窗口累计的未消失败计数（运行时状态，勿提交）
 .brain-fail.pending
 
+# 看门狗运行时状态（事件流新鲜度 / brain serve 停滞，勿提交）
+.event-stall.state
+.brain-serve-stall.state
+
 # 内容生产 / 抓取的中间产物（勿提交）
 runs/
 topgs/

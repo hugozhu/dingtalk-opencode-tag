@@ -785,6 +785,9 @@ def _brain_opencode(user, text, ctx, raw=False):
         # CLI 也挂了（超时 / rc!=0 / opencode 不存在）→ 彻底失败，给用户兜底
         log(f"brain(opencode): CLI 回退失败：{e}")
         return "", STATUS_FAILED
+    # 无条件标记（与「CLI 回退失败」对称）：CLI 全新进程连上了网关而 serve 没有——
+    # brain_watchdog.sh 的差分判据（serve 连接池毒化自动重启）依赖这行
+    log("brain(opencode): CLI 回退成功")
     return cli_reply, (STATUS_OK if cli_reply else STATUS_EMPTY)
 
 

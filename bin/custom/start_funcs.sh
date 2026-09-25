@@ -141,3 +141,30 @@ notify_alert_handler() {
         --profile "$AGENT_PROFILE" -y >/dev/null 2>&1 || true
     return 0
 }
+
+# ---------------------------------------------------------------------------
+# brain_watchdog 组件：大脑 serve 连接看门狗（零 token 差分检测 + 自愈）
+#
+# 背景（2026-09-21 事故）：模型网关闪断期间常驻 serve 的出站连接池被毒化（半开
+# 死连接复用），网关恢复后 serve 也不自愈——大脑对每条消息「serve 失败→CLI 回退」。
+# 判据/动作/防抖详见 bin/custom/brain_watchdog.sh 头注释。
+#
+# 注册为第 5 个组件（monitor start_all / 兜底拉起 / stop_all / is_running 全自动
+# 接管）。守卫防重复注册：本文件可能被同一进程多次 source（如 watchdog 自身的
+# _bw_restart_serve → setup_components）。
+# BRAIN_SERVE_WATCHDOG=0 关闭（no-op 组件会被 monitor 识别并跳过兜底）。
+# ---------------------------------------------------------------------------
+if [[ "${COMP_NAMES[*]:-}" != *"brain_watchdog"* ]]; then
+    COMP_NAMES+=("brain_watchdog")
+    COMP_PATTERNS+=("custom/brain_watchdog.sh")
+    COMP_PID_FILES+=("$SCRIPT_DIR/.brain-watchdog.pid")
+fi
+
+start_brain_watchdog() {
+    case "$(printf '%s' "${BRAIN_SERVE_WATCHDOG:-1}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) ;;
+        *) log "  brain_watchdog 已禁用（BRAIN_SERVE_WATCHDOG=0），跳过"; return 0 ;;
+    esac
+    _spawn "$SCRIPT_DIR/.brain-watchdog.pid" "${MONITOR_LOG:-$SCRIPT_DIR/monitor.log}" \
+        bash "$SCRIPT_DIR/bin/custom/brain_watchdog.sh"
+}

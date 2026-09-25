@@ -190,12 +190,20 @@ _wd_send_alert() {
 # 派生 reboot（单测覆盖此函数 mock）。start_new_session 脱离本进程树：
 # reboot 的 stop 阶段 kill_tree connect，不脱离会把 reboot 自身连带杀掉
 # （与 event_watcher.py 派生 /reboot 同款做法）。
+# env 带 AGENT_DEBUG=1，等价于人工自愈命令 `AGENT_DEBUG=1 bash ./bin/core/reboot.sh`：
+# 停滞事故自愈后 opencode.log 持续记全量 serve 请求/响应 body，可事后取证。
+# 注意（坑#12）：reboot.sh 内部 env -i 会洗掉这里的 AGENT_DEBUG，真正让重启后
+# debug 生效的是 config/constants.local.sh 的 export AGENT_DEBUG=1（env 唯一来源，
+# 已配置）；此处前缀保证与人工命令字面一致，config 缺省时兜底传给 reboot.sh 自身。
 _wd_spawn_reboot() {
     python3 - "$SCRIPT_DIR" <<'PYEOF' >/dev/null 2>&1 || true
-import subprocess, sys
+import os, subprocess, sys
 root = sys.argv[1]
+env = dict(os.environ)
+env["AGENT_DEBUG"] = "1"
 subprocess.Popen(
     ["bash", root + "/bin/core/reboot.sh"],
+    env=env,
     stdin=subprocess.DEVNULL,
     stdout=open(root + "/monitor.log", "a"),
     stderr=subprocess.STDOUT,
